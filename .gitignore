@@ -1,0 +1,22 @@
+# 密钥 / 本地配置
+.env
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 运行时数据
+*.db
+*.sqlite3
+logs/
+run/
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
