@@ -7,6 +7,7 @@ from typing import Optional
 
 from . import descgen, verify
 from .agents import build_agent, build_fix_prompt
+from .agents.base import AgentCancelledError
 from .config import Config, RepoConfig, WorkspaceConfig
 from .models import AgentResult, Bug, dumps, truncate
 from .p4util import P4Client
@@ -26,6 +27,7 @@ class Worker:
         self._thread: Optional[threading.Thread] = None
         self._stop_thread = threading.Event()
         self._wake = threading.Event()
+        self._cancel = threading.Event()  # 暂停/关闭时置位，中断当前 agent 运行
         self._clients: dict[str, TapdClient] = {}
         self._last_fetch = 0.0
         self._last_fetch_result: Optional[list[Bug]] = None
@@ -34,20 +36,23 @@ class Worker:
     # 控制 API（web 调用）
     # ------------------------------------------------------------------
     def start(self) -> str:
+        self._cancel.clear()
         self.store.set_control("running")
         self.store.add_event("已开启自动处理")
         self._wake.set()
         return self.state
 
     def pause(self) -> str:
+        self._cancel.set()  # 中断正在跑的 agent（若有），下轮循环停在 paused
         self.store.set_control("paused")
-        self.store.add_event("已暂停（当前 bug 处理完后停下）")
+        self.store.add_event("已暂停（当前 bug 处理被中断，恢复后回到队列）")
         return self.state
 
     def resume(self) -> str:
         return self.start()
 
     def stop(self) -> str:
+        self._cancel.set()  # 中断正在跑的 agent（若有）
         self.store.set_control("stopped")
         self.store.add_event("已关闭自动处理")
         self._wake.set()
@@ -223,6 +228,11 @@ class Worker:
             if not repo:
                 raise RuntimeError("未配置该 bug 对应的仓库映射（workspaces[].repos[]）")
 
+            # 处理开始时就把 agent / 模型写进 job，web 列表与详情可实时看到
+            settings = self.config.agents.get(repo.agent)
+            model = (settings.model if settings else None) or ""
+            self.store.update_job(bug.id, agent=repo.agent, model=model)
+
             p4 = P4Client(repo.path, self.config.p4)
             p4.sync()
             self.store.add_event("p4 sync 完成", bug_id=bug.id)
@@ -230,7 +240,15 @@ class Worker:
             agent = build_agent(repo.agent, self.config)
             prompt = build_fix_prompt(bug, repo.name, repo.path, repo.test_cmd)
             self.store.add_event(f"调用编码 Agent（{repo.agent}）", bug_id=bug.id)
-            result = agent.run(prompt, repo.path, timeout_s=self.config.agent_timeout_s)
+            result = agent.run(
+                prompt,
+                repo.path,
+                timeout_s=self.config.agent_timeout_s,
+                on_progress=lambda msg: self.store.add_event(
+                    msg, level="debug", bug_id=bug.id
+                ),
+                cancel_event=self._cancel,
+            )
             if result.manual_assets:
                 self.store.add_event(
                     f"识别到需人工处理资源 {len(result.manual_assets)} 项", bug_id=bug.id
@@ -287,6 +305,17 @@ class Worker:
             self._notify_tapd(bug, state, cl, result)
             self.store.add_event(
                 f"完成（{state}）" + (f"，changelist {cl}" if cl else ""), bug_id=bug.id
+            )
+        except AgentCancelledError:
+            # 人工暂停/关闭：回到待处理队列（可重试），不算失败，不回写 Tapd
+            self.store.update_job(
+                bug.id,
+                agent_state="pending",
+                failure_reason=None,
+                finished_at=None,
+            )
+            self.store.add_event(
+                "处理被人工中断（暂停/关闭），bug 回到待处理队列", "warn", bug.id
             )
         except Exception as exc:
             self._handle_failure(bug, exc)
@@ -349,12 +378,105 @@ class Worker:
             self.store.add_event(f"回写 Tapd 失败评论出错: {exc2}", "error", bug.id)
 
     # ------------------------------------------------------------------
+    # Web 展示（合并 Tapd 实时 bug 与本地处理状态）
+    # ------------------------------------------------------------------
+    def _job_row(self, bug: Bug, include_desc: bool = False) -> dict:
+        """把 Tapd bug 与本地 job 合并成管理台列表行（未处理 bug 也列出）。"""
+        job = self.store.get_job(bug.id) or {}
+        item = {
+            "bug_id": str(bug.id),  # 大整数（>2^53）跨 JSON 会丢精度，必须字符串传输
+            "workspace_id": bug.workspace_id,
+            "title": bug.title,
+            "priority": bug.priority,
+            "priority_label": bug.priority_label,
+            "severity": bug.severity,
+            "module": bug.module,
+            "tapd_status": bug.status,
+            "created_at": bug.created,
+            "url": bug.url,
+            "agent_state": job.get("agent_state"),
+            "changelist": job.get("changelist"),
+            "agent": job.get("agent"),
+            "model": job.get("model"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "failure_reason": job.get("failure_reason"),
+            "attempts": job.get("attempts") or 0,
+            "has_local": bool(job),
+        }
+        if include_desc:
+            item["description"] = bug.description
+        return item
+
+    def list_bugs_for_web(self) -> list[dict]:
+        """管理台列表：Tapd 上分配给我的有效 bug + 本地处理状态，按优先级排序。
+
+        排除 exclude_status（resolved/closed/rejected）；未处理（无本地记录）的
+        bug 也列出，agent_state 为空，供前端显示为「未处理」。
+        """
+        ranked = []
+        for b in self._fetch_my_bugs():
+            if b.status in self.config.exclude_status:
+                continue
+            row = self._job_row(b)
+            row["_rank"] = self.config.priority_rank(b)
+            ranked.append(row)
+        ranked.sort(key=lambda r: (r["_rank"], r["created_at"] or ""))
+        for r in ranked:
+            r.pop("_rank", None)
+        return ranked
+
+    def bug_detail_for_web(self, bug_id: int) -> Optional[dict]:
+        """管理台详情：合并 Tapd 实时字段与本地处理记录；未处理也能查看。
+
+        返回 None 表示 Tapd 与本地都没有该 bug。
+        """
+        bug = self._fetch_bug_for_manual(bug_id)
+        job = self.store.get_job(bug_id)
+        if bug is None and job is None:
+            return None
+        detail = self._job_row(bug, include_desc=True) if bug else {}
+        if job:
+            detail.update(job)  # 本地处理字段优先（files 等保持 JSON 字符串，前端自行 parse）
+            # 拆分：debug 级是 Agent 实时进度（stream-json 逐行动作），单独给前端做醒目的进度区
+            all_events = self.store.list_events(bug_id, limit=300)
+            detail["progress"] = [e for e in all_events if e["level"] == "debug"]
+            detail["events"] = [e for e in all_events if e["level"] != "debug"]
+        else:
+            detail["files"] = "[]"
+            detail["manual_assets"] = "[]"
+            detail["events"] = []
+            detail["progress"] = []
+            detail["generated_description"] = ""
+        detail["bug_id"] = str(detail.get("bug_id"))  # 保证字符串（job 覆盖后可能是 int）
+        return detail
+
+    # ------------------------------------------------------------------
     # 人工操作（web）
     # ------------------------------------------------------------------
+    def _fetch_bug_for_manual(self, bug_id: int) -> Optional[Bug]:
+        """人工操作按 id 取 bug：先在「分配给我」列表找，再按 id 直拉。
+
+        未处理 bug 在管理台也能查看/跳过，但这些操作需要 bug 的标题等
+        字段才能落本地记录，所以没有本地 job 时要能从 Tapd 拿到它。
+        """
+        bug = next((b for b in self._fetch_my_bugs() if b.id == bug_id), None)
+        if bug is None:
+            try:
+                ws = self.config.workspaces[0]
+                bug = self._tapd(ws).get_bug(bug_id)
+            except Exception:
+                bug = None
+        return bug
+
     def retry_bug(self, bug_id: int) -> bool:
         job = self.store.get_job(bug_id)
         if not job:
-            return False
+            # 未处理 bug「重试」= 确保可被处理（它本来就在队列里），幂等成功
+            if self._fetch_bug_for_manual(bug_id) is None:
+                return False
+            self.store.add_event(f"人工触发处理 bug {bug_id}", bug_id=bug_id)
+            return True
         self.store.update_job(
             bug_id,
             agent_state="pending",
@@ -372,7 +494,13 @@ class Worker:
     def skip_bug(self, bug_id: int) -> bool:
         job = self.store.get_job(bug_id)
         if not job:
-            return False
+            # 未处理 bug：建一条 skipped 记录，worker 就不会再抓它
+            bug = self._fetch_bug_for_manual(bug_id)
+            if bug is None:
+                return False
+            self.store.upsert_job(bug, agent_state="skipped", finished_at=_now())
+            self.store.add_event(f"人工跳过 bug {bug_id}（未处理，不再自动处理）", bug_id=bug_id)
+            return True
         self.store.update_job(bug_id, agent_state="skipped", finished_at=_now())
         self.store.add_event(f"人工跳过 bug {bug_id}", bug_id=bug_id)
         return True

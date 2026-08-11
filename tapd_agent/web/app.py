@@ -55,16 +55,15 @@ def create_app(config: Config, store: StateStore, worker: Worker) -> FastAPI:
     async def list_bugs(
         state: str = Query(default="all"), q: str = Query(default="")
     ):
-        return {"items": store.list_jobs(state, q or None)}
+        # 返回 Tapd 实时 bug + 本地处理状态合并后的列表（含未处理）
+        return {"items": worker.list_bugs_for_web()}
 
     @app.get("/api/bugs/{bug_id}", dependencies=[Depends(auth)])
     async def bug_detail(bug_id: int):
-        job = store.get_job(bug_id)
-        if not job:
+        detail = worker.bug_detail_for_web(bug_id)
+        if detail is None:
             raise HTTPException(status_code=404, detail="未找到该 bug")
-        job = dict(job)
-        job["events"] = store.list_events(bug_id, limit=100)
-        return job
+        return detail
 
     @app.post("/api/bugs/{bug_id}/retry", dependencies=[Depends(auth)])
     async def retry(bug_id: int):
@@ -84,7 +83,7 @@ def create_app(config: Config, store: StateStore, worker: Worker) -> FastAPI:
             while True:
                 payload = {
                     "status": worker.status(),
-                    "items": store.list_jobs("all"),
+                    "items": worker.list_bugs_for_web(),
                 }
                 yield (
                     "event: snapshot\n"

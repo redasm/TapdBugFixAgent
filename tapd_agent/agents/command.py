@@ -6,18 +6,28 @@
 """
 from __future__ import annotations
 
+import threading
+from typing import Optional
+
 from ..models import AgentResult
-from .base import result_from_output, run_cli
+from .base import AgentCancelledError, result_from_output, run_cli
 
 
 class CommandAgent:
     def __init__(self, template: str):
         self.template = template
 
-    def run(self, prompt: str, repo_dir: str, timeout_s: int = 900) -> AgentResult:
+    def run(
+        self, prompt: str, repo_dir: str, timeout_s: int = 900,
+        on_progress: Optional[callable] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> AgentResult:
         cmd = self.template.format(prompt=prompt, repo=repo_dir)
         try:
-            proc = run_cli([cmd], cwd=repo_dir, timeout_s=timeout_s)
+            proc = run_cli([cmd], cwd=repo_dir, timeout_s=timeout_s,
+                           cancel_event=cancel_event)
+        except AgentCancelledError:
+            raise  # 人工取消：交给 worker 特殊处理，不当作失败
         except Exception as exc:
             ar = AgentResult.from_failure(-1, str(exc))
             ar.log = str(exc)

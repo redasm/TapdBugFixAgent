@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -79,8 +80,24 @@ class P4Client:
         return proc.stdout
 
     # ---------- 只读 ----------
-    def sync(self, timeout: int = 600) -> str:
-        return self.run(["sync"], timeout=timeout)
+    def sync(self, timeout: int = 600, retries: int = 3, retry_delay: float = 5.0) -> str:
+        """同步 workspace 到最新。
+
+        Windows 上文件可能被其他进程瞬时占用（杀毒扫描、编辑器缓存等），
+        p4 自身会重试 10 次仍失败时抛出 rename 错误；这里在命令层再重试几次，
+        瞬时锁通常几秒内即释放。持久占用（如从 agent workspace 启动了编辑器）
+        会完整保留最后一次错误信息向上抛，方便定位。
+        """
+        last_err: Optional[P4Error] = None
+        for attempt in range(retries):
+            try:
+                return self.run(["sync"], timeout=timeout)
+            except P4Error as exc:
+                last_err = exc
+                if attempt < retries - 1:
+                    time.sleep(retry_delay)
+        assert last_err is not None
+        raise last_err
 
     def opened(self) -> list[dict]:
         """返回打开的文件列表：[{depot, action, changelist, type}]"""

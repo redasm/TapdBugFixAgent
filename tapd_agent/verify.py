@@ -17,12 +17,17 @@ class VerificationError(RuntimeError):
 
 
 def check_and_prepare_p4(p4: P4Client) -> list[dict]:
-    """确保 Agent 的改动都在 p4 中打开，返回 opened 列表。"""
+    """确保 Agent 的改动都在 p4 中打开，返回 opened 列表。
+
+    顺序：先看 opened，再看 reconcile 预览。Agent 常改完文件却忘了 p4 edit，
+    此时 opened 为空但磁盘有差异——必须先 reconcile 兜底打开，不能直接判失败。
+    """
     opened = p4.opened()
-    if not opened:
+    preview = p4.reconcile_preview()
+
+    if not opened and not preview.strip():
         raise VerificationError("Agent 未打开任何文件（未产生改动，或遗漏 p4 edit）")
 
-    preview = p4.reconcile_preview()
     if preview.strip():
         p4.reconcile()
         opened = p4.opened()
