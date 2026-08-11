@@ -8,7 +8,7 @@ mode: review
 poll_interval_min: 30          # 预留：外部定时任务用
 max_bugs_per_run: 10           # 单轮最多处理数量
 max_attempts: 1                # 单个 bug 自动重试次数（资源类改动不强制重试）
-agent_timeout_s: 900           # 每个编码 Agent 调用的超时（秒）
+agent_timeout_s: 3600          # 每个编码 Agent 调用的超时（秒）。真实 bug 在大型仓库里定位+修改常超过 15 分钟
 llm_review: false              # 是否在生成 changelist 前用 LLM 复核 diff（额外一次 claude 调用）
 
 # 过滤条件

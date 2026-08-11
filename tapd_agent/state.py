@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     manual_assets TEXT,
     failure_reason TEXT,
     agent TEXT,
+    model TEXT,
     attempts INTEGER DEFAULT 0,
     started_at TEXT,
     finished_at TEXT
@@ -55,6 +56,11 @@ class StateStore:
         self.conn.row_factory = sqlite3.Row
         with self._lock, self.conn:
             self.conn.executescript(_SCHEMA)
+            # 迁移：旧库补 model 列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）
+            try:
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN model TEXT")
+            except sqlite3.OperationalError:
+                pass  # 已存在
             self.conn.execute(
                 "INSERT OR IGNORE INTO control(id, state, updated_at) VALUES (1, 'stopped', ?)",
                 (_now(),),
@@ -117,7 +123,7 @@ class StateStore:
         allowed = {
             "title", "priority", "priority_label", "tapd_status", "agent_state",
             "changelist", "generated_description", "files", "manual_assets",
-            "failure_reason", "agent", "attempts", "started_at", "finished_at",
+            "failure_reason", "agent", "model", "attempts", "started_at", "finished_at",
         }
         cols, vals = [], []
         for key, value in fields.items():

@@ -23,6 +23,7 @@
   .badge.partial { background: rgba(245,158,11,.15); color: var(--amber); }
   .badge.manual_only { background: rgba(56,189,248,.15); color: var(--blue); }
   .badge.in_progress, .badge.pending { background: rgba(59,130,246,.15); color: var(--blue); }
+  .badge.unprocessed { background: rgba(148,163,184,.18); color: var(--muted); }
   .badge.skipped { background: rgba(107,114,128,.15); color: var(--gray); }
   button { background: var(--accent2); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; }
   button:hover { filter: brightness(1.1); }
@@ -57,6 +58,11 @@
   .reason { color: var(--amber); }
   .events { font-size: 12px; color: var(--muted); }
   .events li { padding: 2px 0; border-bottom: 1px dashed var(--border); }
+  .progress { font-size: 12px; color: var(--muted); max-height: 200px; overflow-y: auto; list-style: none; padding: 0; }
+  .progress li { padding: 2px 0; border-bottom: 1px dashed var(--border); font-family: Consolas, "Courier New", monospace; }
+  .now-line { font-size: 13px; color: var(--blue); font-weight: 600; margin: 4px 0 6px; word-break: break-all; }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .empty { color: var(--muted); text-align: center; padding: 40px 0; }
   .actions { display: flex; gap: 8px; }
   .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
@@ -87,6 +93,7 @@
     <div class="card toolbar">
       <select id="fState">
         <option value="all">全部状态</option>
+        <option value="unprocessed">未处理</option>
         <option value="pending">待处理</option>
         <option value="in_progress">处理中</option>
         <option value="resolved">已解决</option>
@@ -101,7 +108,7 @@
     <div class="list-scroll">
       <table>
         <thead><tr>
-          <th>Bug ID</th><th>标题</th><th>优先级</th><th>状态</th><th>CL#</th><th>Agent</th><th>完成时间</th>
+          <th>Bug ID</th><th>标题</th><th>优先级</th><th>状态</th><th title="Agent 生成的 Perforce pending changelist 编号">CL#</th><th>Agent</th><th>完成时间</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -148,6 +155,22 @@ function escapeHtml(s) {
 }
 function fmtTime(t) { return t ? t.slice(5, 16) : '-'; }
 
+function progressHTML(job) {
+  const prog = job.progress || [];
+  if (!prog.length) {
+    const busy = job.agent_state === 'in_progress' || job.agent_state === 'pending';
+    return `<div class="section"><h4>处理进度</h4><div class="muted">${busy ? 'Agent 正在运行，尚无进度输出…' : '(无进度记录)'}</div></div>`;
+  }
+  const now = prog[0];               // list_events 按 id DESC：最新一条在最前
+  const rest = prog.slice(1, 60);
+  const spinning = job.agent_state === 'in_progress';
+  return `<div class="section">
+    <h4>处理进度 <span class="muted" style="text-transform:none">· 共 ${prog.length} 条</span></h4>
+    <div class="now-line">${spinning ? '<span class="spin">⟳</span> ' : '▸ '}${escapeHtml(now.msg)}</div>
+    <ul class="progress">${rest.map(e => `<li>${escapeHtml(String(e.ts||'').slice(11,19))} ${escapeHtml(e.msg)}</li>`).join('')}</ul>
+  </div>`;
+}
+
 function renderStatus() {
   const st = SNAPSHOT.status || {};
   const c = st.control || 'stopped';
@@ -172,7 +195,10 @@ function filtered() {
   const state = $('fState').value;
   const q = $('fSearch').value.trim().toLowerCase();
   return (SNAPSHOT.items || []).filter(it => {
-    if (state !== 'all' && it.agent_state !== state) return false;
+    if (state !== 'all') {
+      if (state === 'unprocessed') { if (it.agent_state) return false; }
+      else if (it.agent_state !== state) return false;
+    }
     if (q && !(String(it.bug_id).includes(q) || String(it.title||'').toLowerCase().includes(q))) return false;
     return true;
   });
@@ -185,23 +211,23 @@ function renderTable() {
   $('listEmpty').style.display = items.length ? 'none' : '';
   for (const it of items) {
     const tr = document.createElement('tr');
-    tr.dataset.id = it.bug_id;
-    if (it.bug_id === SELECTED_ID) tr.style.background = 'var(--panel2)';
+    tr.dataset.id = String(it.bug_id);   // bug_id 是字符串（后端已保证），大整数不丢精度
+    if (String(it.bug_id) === SELECTED_ID) tr.style.background = 'var(--panel2)';
     tr.innerHTML = `
       <td class="mono">${it.bug_id}</td>
       <td>${escapeHtml(it.title)}</td>
       <td>${escapeHtml(it.priority_label || it.priority || '-')}</td>
-      <td><span class="badge ${it.agent_state}">${STATE_LABEL[it.agent_state] || it.agent_state}</span></td>
+      <td><span class="badge ${it.agent_state || 'unprocessed'}">${it.agent_state ? (STATE_LABEL[it.agent_state] || it.agent_state) : '未处理'}</span></td>
       <td class="mono">${it.changelist ?? '-'}</td>
-      <td>${escapeHtml(it.agent || '-')}</td>
+      <td>${escapeHtml(it.agent || '-')}${it.model ? `<span class="muted"> · ${escapeHtml(it.model)}</span>` : ''}</td>
       <td>${fmtTime(it.finished_at)}</td>`;
-    tr.onclick = () => selectBug(it.bug_id);
+    tr.onclick = () => selectBug(String(it.bug_id));
     tbody.appendChild(tr);
   }
 }
 
 function renderDetail(job) {
-  SELECTED_ID = job.bug_id;
+  SELECTED_ID = String(job.bug_id);
   $('detailEmpty').style.display = 'none';
   $('detailCard').style.display = '';
   const assets = JSON.parse(job.manual_assets || '[]');
@@ -210,14 +236,21 @@ function renderDetail(job) {
     <div class="kv">
       <dt>Bug ID</dt><dd class="mono">${job.bug_id}</dd>
       <dt>标题</dt><dd>${escapeHtml(job.title)}</dd>
-      <dt>状态</dt><dd><span class="badge ${job.agent_state}">${STATE_LABEL[job.agent_state] || job.agent_state}</span></dd>
+      <dt>状态</dt><dd><span class="badge ${job.agent_state || 'unprocessed'}">${job.agent_state ? (STATE_LABEL[job.agent_state] || job.agent_state) : '未处理'}</span></dd>
       <dt>优先级</dt><dd>${escapeHtml(job.priority_label || job.priority || '-')}</dd>
       <dt>Changelist</dt><dd class="mono">${job.changelist ?? '-'}</dd>
       <dt>Agent</dt><dd>${escapeHtml(job.agent || '-')}</dd>
+      <dt>模型</dt><dd>${job.model ? escapeHtml(job.model) : '<span class="muted">(CLI 默认)</span>'}</dd>
       <dt>Tapd 状态</dt><dd>${escapeHtml(job.tapd_status || '-')}</dd>
+      <dt>Tapd 链接</dt><dd><a href="${escapeHtml(job.url || '')}" target="_blank" rel="noopener">在 Tapd 打开 ↗</a></dd>
       <dt>开始/完成</dt><dd>${escapeHtml(job.started_at || '-')} → ${escapeHtml(job.finished_at || '-')}</dd>
       ${job.failure_reason ? `<dt class="reason">失败原因</dt><dd class="reason">${escapeHtml(job.failure_reason)}</dd>` : ''}
     </div>
+    ${progressHTML(job)}
+    ${job.description ? `<div class="section">
+      <h4>Tapd 原始描述</h4>
+      <pre>${escapeHtml(job.description)}</pre>
+    </div>` : ''}
     <div class="section">
       <h4>生成的 pending 描述</h4>
       <pre>${escapeHtml(job.generated_description || '(未生成)')}</pre>
@@ -230,13 +263,18 @@ function renderDetail(job) {
       <h4>需人工处理的资源</h4>
       <ul>${assets.length ? assets.map(a => `<li class="mono">${escapeHtml(a.path)} <span class="reason">— ${escapeHtml(a.reason || '')}</span></li>`).join('') : '<li class="muted">(无)</li>'}</ul>
     </div>
-    <div class="section">
+    ${job.has_local ? `<div class="section">
       <h4>操作</h4>
       <div class="actions">
         <button onclick="actRetry(${job.bug_id})">↻ 重试</button>
         <button class="ghost" onclick="actSkip(${job.bug_id})">⏭ 跳过</button>
       </div>
-    </div>
+    </div>` : `<div class="section">
+      <h4>操作</h4>
+      <div class="actions">
+        <button class="ghost" onclick="actSkip(${job.bug_id})">⏭ 跳过（不处理）</button>
+      </div>
+    </div>`}
     <div class="section">
       <h4>操作日志</h4>
       <ul class="events">${(job.events || []).map(e => `<li>${escapeHtml(e.ts)} [${escapeHtml(e.level)}] ${escapeHtml(e.msg)}</li>`).join('') || '<li>无</li>'}</ul>
@@ -282,6 +320,10 @@ function connectSSE() {
       SNAPSHOT.items = data.items;
       renderStatus();
       renderTable();
+      // 实时刷新选中 bug 详情（含 Agent 进度事件）
+      if (SELECTED_ID) {
+        api('/api/bugs/' + SELECTED_ID).then(j => { if (j) renderDetail(j); });
+      }
     } catch (err) { console.error(err); }
   });
   es.onerror = () => { es.close(); setTimeout(connectSSE, 3000); };

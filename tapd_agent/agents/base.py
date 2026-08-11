@@ -6,6 +6,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from typing import Any, Optional
 
 from ..models import AgentResult, Bug, truncate
@@ -15,35 +17,168 @@ class AgentRuntimeError(RuntimeError):
     pass
 
 
+class AgentCancelledError(AgentRuntimeError):
+    """agent 运行被人工取消（web 暂停/关闭）——不是失败，需要特殊处理。"""
+    pass
+
+
 FINAL_MARKER = "FINAL_RESULT:"
 
 
 # ---------------------------------------------------------------------------
 # 子进程执行（Windows 上用 shell=True 以支持 claude.cmd / codex.cmd 等 shim）
 # ---------------------------------------------------------------------------
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """超时后杀掉整棵进程树。
+
+    Windows + shell=True 时直接 proc.kill() 只会杀掉 cmd.exe 壳，真正的
+    编码 Agent（node/claude）会变孤儿进程继续运行，持续占用 p4 文件锁、
+    拖慢机器。必须用 taskkill /T 递归杀。
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def run_cli(
     cmd: list[str],
     cwd: str,
-    timeout_s: int = 900,
+    timeout_s: int = 3600,
     input_text: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> subprocess.CompletedProcess:
     kwargs: dict[str, Any] = {
         "cwd": cwd,
-        "capture_output": True,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "text": True,
-        "timeout": timeout_s,
-        "input": input_text,
     }
     if os.name == "nt":
         kwargs["shell"] = True  # Windows: 由 cmd.exe 解析，才能执行 .cmd/.bat shim
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         kwargs["shell"] = False
     try:
-        return subprocess.run(cmd, **kwargs)
-    except subprocess.TimeoutExpired as exc:
-        raise AgentRuntimeError(f"Agent 调用超时({timeout_s}s): {cmd[0]}") from exc
+        proc = subprocess.Popen(cmd, **kwargs)
     except OSError as exc:
         raise AgentRuntimeError(f"无法执行 {cmd[0]}: {exc}") from exc
+    if cancel_event is not None:
+        # 看门狗线程：cancel 置位时立刻杀进程树（communicate 会被打断返回）。
+        def _watchdog() -> None:
+            while proc.poll() is None:
+                if cancel_event.is_set():
+                    _kill_process_tree(proc)
+                    return
+                time.sleep(0.2)
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        raise AgentRuntimeError(f"Agent 调用超时({timeout_s}s): {cmd[0]}") from None
+    if cancel_event is not None and cancel_event.is_set():
+        raise AgentCancelledError(f"Agent 调用被人工取消: {cmd[0]}")
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def run_cli_streaming(
+    cmd: list[str],
+    cwd: str,
+    timeout_s: int = 3600,
+    input_text: Optional[str] = None,
+    on_progress: Optional[Any] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> subprocess.CompletedProcess:
+    """流式执行：stdout 逐行回调 on_progress(line) 用于实时进度展示。
+
+    与 run_cli 的差异：不等到进程结束才拿输出，而是边跑边把每行交给回调
+    （Agent 的 stream-json 模式用它把"正在读哪个文件/搜索什么"实时报出去），
+    同时仍累计完整 stdout/stderr。超时同样杀整棵进程树防孤儿；
+    cancel_event 置位时立即取消（web 暂停/关闭）。
+    """
+    import threading
+
+    kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "nt":
+        kwargs["shell"] = True
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["shell"] = False
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except OSError as exc:
+        raise AgentRuntimeError(f"无法执行 {cmd[0]}: {exc}") from exc
+
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+
+    def _drain(pipe: Any, sink: list[str], progress: Optional[Any]) -> None:
+        assert pipe is not None
+        for line in pipe:
+            sink.append(line)
+            if progress is not None:
+                try:
+                    progress(line)
+                except Exception:
+                    pass  # 进度回调失败不影响主流程
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+    threads = [
+        threading.Thread(target=_drain, args=(proc.stdout, out_chunks, on_progress), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err_chunks, None), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(input_text or "")
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _kill_process_tree(proc)
+            raise AgentCancelledError(f"Agent 调用被人工取消: {cmd[0]}") from None
+        if proc.poll() is not None:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_process_tree(proc)
+            raise AgentRuntimeError(f"Agent 调用超时({timeout_s}s): {cmd[0]}") from None
+        try:
+            proc.wait(timeout=min(0.2, remaining))
+        except subprocess.TimeoutExpired:
+            continue  # 每 0.2s 回来检查一次 cancel/超时
+    for t in threads:
+        t.join(timeout=5)
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode, "".join(out_chunks), "".join(err_chunks)
+    )
 
 
 # ---------------------------------------------------------------------------
