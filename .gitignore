@@ -1,13 +1,12 @@
 # 密钥 / 本地配置
 .env
 config.yaml
+overrides.yaml          # web 设置页写入的运行时覆盖配置（含密钥）
 
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
 
 # 运行时数据
 *.db
