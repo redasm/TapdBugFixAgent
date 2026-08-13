@@ -4,12 +4,16 @@
 #   dry-run     - 只读：仅列出待处理 bug，不做任何修改
 mode: review
 
+# 注：web 管理台顶部的「⚙ 设置」可编辑 pi/p4/tapd 连接配置，保存写入同目录 overrides.yaml
+# （启动时合并、优先级最高），不必改本文件。本文件保留 workspaces / 优先级等复杂结构。
+
 # 修复流程参数
 poll_interval_min: 30          # 预留：外部定时任务用
 max_bugs_per_run: 10           # 单轮最多处理数量
-max_attempts: 1                # 单个 bug 自动重试次数（资源类改动不强制重试）
+max_attempts: 2                # 单个 bug 自动重试次数：失败后自动回到队列重试（带上次失败证据），
+                               # 重试耗尽才标记 failed 并回写 Tapd 失败评论。设为 1 = 不自动重试
 agent_timeout_s: 3600          # 每个编码 Agent 调用的超时（秒）。真实 bug 在大型仓库里定位+修改常超过 15 分钟
-llm_review: false              # 是否在生成 changelist 前用 LLM 复核 diff（额外一次 claude 调用）
+llm_review: false              # 是否在生成 changelist 前用 LLM 复核 diff（额外一次 pi 调用）
 
 # 过滤条件
 filters:
@@ -35,26 +39,36 @@ workspaces:
       - name: "product"
         path: "C:\\repos\\product"   # 该目录需已配置好 p4 client 映射
         test_cmd: "pytest tests"     # 修复后运行的测试命令（留空则跳过）
-        agent: claude                # 用哪个编码 Agent：claude / codex / command
 
-# 编码 Agent 配置 —— 这里选的是【编码 Agent 的 CLI】，不是裸模型。
-#   claude  = 调用 Claude CLI（claude -p ...）—— 完整保留编码 Agent 特性：自主编辑循环、工具调用、权限模式、上下文管理
-#   codex   = 调用 Codex CLI（codex exec ...）
-#   command = 任意自定义 Agent CLI（自定命令模板）
-# 每个仓库用哪个，看 workspaces[].repos[].agent: claude | codex | command
-# model 只是【可选】的模型覆盖：不填则用该 CLI 自身的默认模型，编码 Agent 特性与模型名无关。
-agents:
-  claude:
-    model: ""                          # 可选：覆盖 CLI 用的模型（claude --model），例如 "claude-sonnet-5"；留空用 CLI 默认
-    allowed_tools: ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
-    permission_mode: acceptEdits       # claude --permission-mode
-  codex:
-    # 对应命令: codex exec --dangerously-bypass-approvals-and-sandbox "<prompt>"
-    approval: auto
-  command:
-    # 任意 Agent 的命令模板，{prompt} / {repo} 会被替换；shell=True 执行
-    # 例如: "my-agent --repo {repo} --task \"{prompt}\""
-    template: null
+# 编码 Agent：pi（https://github.com/earendil-works/pi）
+#   以子进程方式调用 `pi --mode json "<prompt>"`（npm 全局安装 @earendil-works/pi-coding-agent）。
+#
+#   pi 0.74.2 鉴权注意：
+#     - 读 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN（或 `pi /login` 做 OAuth 登录，token 存
+#       ~/.pi/agent/auth.json）；**不读** ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN。
+#     - URL 只能通过 ~/.pi/agent/models.json 的自定义 provider 指定，pi 没有 --base-url 参数。
+#
+#   两种配法：
+#   【方式一：只用默认鉴权】不配 provider，pi 段留空：
+#     pi: {}
+#     鉴权靠 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN / `pi /login`，模型用 pi 默认。
+#
+#   【方式二：走中转/代理（url+key 全放 config.yaml，推荐）】
+#     填了 provider 段后，本工具会在 spawn pi 前自动把该段合并写入 ~/.pi/agent/models.json
+#     （只覆盖 providers.<id>，保留你已有其它 provider）。api_key_env 填环境变量**名**，
+#     运行期由 pi 解析，密钥不落盘。model_id 必填，构造 `--model <provider>/<model_id>`。
+pi:
+  provider:
+    id: "kuro"                                        # provider id（--model 前缀）
+    base_url: "https://ai-gateway.kurogames.com"      # 网关/中转地址
+    api_key_env: "ANTHROPIC_AUTH_TOKEN"               # 从环境变量读 key（推荐，不落盘）
+    # api_key: "sk-..."                               # 或直接写 key（不推荐，落盘明文）
+    auth_header: true                                 # true=Authorization: Bearer（本司网关协议）；false=默认 x-api-key
+    model_id: "claude-opus-4-8"                       # 模型 id，构造 `--model kuro/claude-opus-4-8`
+    # reasoning: true                                 # 可选，默认 true
+    # context_window: 200000                          # 可选，默认 200000
+    # max_tokens: 32000                               # 可选，默认 32000
+    # 说明：删掉 provider 段不会自动清掉 models.json 里已写入的项，想还原请手动删 ~/.pi/agent/models.json 对应条目。
 
 # Perforce（环境变量 P4PORT/P4CLIENT/P4USER/P4PASSWD 优先级更高，也可直接填这里）
 p4:
