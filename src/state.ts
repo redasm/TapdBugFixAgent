@@ -215,6 +215,19 @@ export class StateStore {
     return Number(row.n);
   }
 
+  /** 清空全部 job 记录与事件（web「清除并重新同步」用）。
+   *  控制态（control 表）保留；changelist 等历史一并删除——p4 上已生成的
+   *  pending changelist 不受影响（那是 p4 服务器侧的对象）。 */
+  deleteAllJobs(): number {
+    const n = this.jobCount();
+    const tx = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM jobs").run();
+      this.db.prepare("DELETE FROM events").run();
+    });
+    tx();
+    return n;
+  }
+
   // ---------- events ----------
   addEvent(msg: string, level = "info", bugId?: string): void {
     this.db

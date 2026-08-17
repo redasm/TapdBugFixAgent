@@ -1275,6 +1275,46 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     stubTapd(w, new FakeTapd([a, b]));
     expect((await w.fetchActionable()).length).toBe(2);
   });
+
+  it("resyncFromTapd 清空全部本地记录并按最新 Tapd 列表重建待处理队列", async () => {
+    const w = makeWorker();
+    const live1 = makeBug({ id: "1152729922001254287" }); // Tapd 上还在
+    const live2 = makeBug({ id: "1152729922001254288", status: "resolved" }); // Tapd 终态 → 不同步
+    const gone = makeBug({ id: "1152729922001254290" }); // 只有本地有（Tapd 列表外）→ 应被清掉
+    stubMyBugs(w, [live1, live2]);
+    w.store.upsertJob(live1, { agent_state: "resolved", changelist: 777 }); // 历史被清
+    w.store.upsertJob(gone, { agent_state: "failed" });
+    w.store.addEvent("旧事件", "info", live1.id);
+    expect(w.store.jobCount()).toBe(2);
+
+    const r = await w.resyncFromTapd();
+    expect(r.cleared).toBe(2);
+    expect(r.synced).toBe(1); // resolved 的不同步
+    expect(w.store.jobCount()).toBe(1);
+    const job = w.store.getJob(live1.id);
+    expect(job?.agent_state).toBe("pending");
+    expect(job?.changelist).toBeNull(); // 历史关联已清
+    expect(w.store.getJob(gone.id)).toBeUndefined(); // Tapd 外的本地残留已清
+    // 队列 = 同步进来的那一单（resolved 的被排除）
+    const actionable = await w.fetchActionable();
+    expect(actionable.map((b) => b.id)).toEqual([live1.id]);
+    // 事件表也清了，只剩本次同步的记录
+    const evs = w.store.listEvents(undefined, 10);
+    expect(evs.some((e) => String(e.msg).includes("重新同步"))).toBe(true);
+    expect(evs.some((e) => String(e.msg) === "旧事件")).toBe(false);
+  });
+
+  it("resyncFromTapd 中断正在处理的 bug 并换新取消令牌", async () => {
+    const w = makeWorker();
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, [bug]);
+    const oldEvt = w.cancelEvent;
+    w.currentBugId = bug.id;
+    await w.resyncFromTapd();
+    w.currentBugId = null;
+    expect(oldEvt.cancelled).toBe(true); // 旧令牌置位 = 中断在跑的尝试
+    expect(w.cancelEvent).not.toBe(oldEvt); // 换新令牌，后续 bug 不受影响
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1872,6 +1912,13 @@ describe("web 前端 bug_id 内插引号", () => {
   it("顶部有「重试全部失败」按钮并调 retry-failed 接口", () => {
     expect(html).toContain('id="btnRetryFailed"');
     expect(html).toContain("/api/retry-failed");
+  });
+
+  it("顶部有「清除并重新同步」按钮并调 resync 接口（含确认弹窗与进行中状态）", () => {
+    expect(html).toContain('id="btnResync"');
+    expect(html).toContain("/api/resync");
+    expect(html).toMatch(/btnResync[\s\S]{0,600}confirm\(/); // 破坏性操作必须有确认
+    expect(html).toContain("同步中"); // 防重复点击的禁用态文案
   });
 
   it("api() 捕获网络错误并给出可见提示（回归：服务器重启窗口期点击毫无反馈）", () => {
