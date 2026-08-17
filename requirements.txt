@@ -1,9 +1,0 @@
-requests>=2.28
-PyYAML>=6.0
-fastapi>=0.110
-uvicorn>=0.29
-websockets>=14.0   # uvicorn 裸装无 WebSocket 库，外来升级请求(如 Wwise WAAPI 探测)会刷警告
-mcp>=2.0
-
-# 测试
-pytest>=7.0

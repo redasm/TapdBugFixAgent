@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TapdBugFixAgent 管理台</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171d24; --panel2: #1e2731; --border: #2a3440;
+    --text: #d8e1ea; --muted: #8b98a5; --accent: #3b82f6; --accent2: #2563eb;
+    --green: #22c55e; --amber: #f59e0b; --red: #ef4444; --blue: #38bdf8; --gray: #6b7280;
+    --term-bg: #0a0e13; --agent-h: 250px;   /* Agent 输出区高度，分割线拖动调整 */
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .badge.running { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge.paused { background: rgba(245,158,11,.15); color: var(--amber); }
+  .badge.stopped { background: rgba(107,114,128,.15); color: var(--gray); }
+  .badge.failed { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge.resolved { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge.partial { background: rgba(245,158,11,.15); color: var(--amber); }
+  .badge.manual_only { background: rgba(56,189,248,.15); color: var(--blue); }
+  .badge.in_progress, .badge.pending { background: rgba(59,130,246,.15); color: var(--blue); }
+  .badge.unprocessed { background: rgba(148,163,184,.18); color: var(--muted); }
+  .badge.skipped { background: rgba(107,114,128,.15); color: var(--gray); }
+  button { background: var(--accent2); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  button.danger { background: var(--red); }
+  .stats { display: flex; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+  .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; font-size: 12px; color: var(--muted); }
+  .stat b { color: var(--text); }
+
+  /* 上下结构：上行 = 分组 bug 列表 + 右侧抽屉；下行 = Agent 输出区（固定底部全宽） */
+  main.layout { display: flex; flex-direction: column; gap: 12px; padding: 14px 20px; height: calc(100vh - 58px); }
+  .top-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
+  .list-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; }
+  select, input[type=text] { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+  input[type=text] { flex: 1; }
+  .list-scroll { overflow-y: auto; min-height: 0; flex: 1; border-radius: 10px; border: 1px solid var(--border); background: var(--panel); }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+
+  /* 分组列表 */
+  .group-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--muted); background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border); }
+  .group-head .count { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; font-size: 11px; }
+  .row { display: grid; grid-template-columns: 155px minmax(0,1fr) 70px 100px 70px 120px; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--border); cursor: pointer; align-items: center; font-size: 13px; }
+  .row:hover { background: var(--panel2); }
+  .row.selected { background: rgba(59,130,246,.10); box-shadow: inset 2px 0 0 var(--accent); }
+  .row.busy { background: rgba(59,130,246,.05); }
+  .row .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row.busy .title { color: var(--blue); }
+
+  /* 右侧详情抽屉（推挤式：开 = 460px，关 = 0；不遮挡底部 Agent 区） */
+  .drawer { flex: 0 0 auto; width: 460px; max-width: 460px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; transition: max-width .25s ease, opacity .2s ease; }
+  .drawer.closed { max-width: 0; opacity: 0; border-color: transparent; }
+  .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+  .drawer-head h3 { font-size: 14px; }
+  .drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px; }
+  @media (max-width: 900px) {
+    .drawer { position: fixed; right: 0; top: 58px; bottom: calc(var(--agent-h) + 32px); z-index: 20; border-radius: 0 0 0 10px; }
+  }
+
+  /* 底部 Agent 输出区（终端形式，高度由分割线拖动调整） */
+  .agent-pane { flex: 0 0 auto; height: var(--agent-h); background: var(--term-bg); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
+  /* 上下分割线：拖拽调整上下占比（向上拖 = 列表变大）。::before 扩大点击热区，::after 视觉细线 */
+  #divider { flex: 0 0 auto; height: 14px; cursor: row-resize; position: relative; z-index: 5; }
+  #divider::before { content: ''; position: absolute; top: -14px; bottom: -14px; left: 0; right: 0; }
+  #divider::after { content: ''; position: absolute; left: 0; right: 0; top: 5px; height: 4px; border-radius: 2px; background: transparent; }
+  #divider:hover::after, #divider.dragging::after { background: var(--accent); }
+  .agent-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); flex: 0 0 auto; font-size: 13px; min-width: 0; }
+  .agent-head .a-title { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agent-head .a-pin { margin-left: auto; padding: 2px 10px; font-size: 11px; flex: 0 0 auto; }
+  /* 终端形式输出：黑底等宽，时间戳置灰，输出自动往下划 */
+  .agent-progress { flex: 1; min-height: 0; overflow-y: auto; list-style: none; padding: 6px 14px 10px; font-size: 12px; color: var(--muted); font-family: Consolas, "Courier New", monospace; background: transparent; scrollbar-width: thin; }
+  .agent-progress li { padding: 1px 0; font-family: Consolas, "Courier New", monospace; white-space: pre-wrap; word-break: break-all; }
+  .agent-progress li .ts { color: #5b6b7d; margin-right: 8px; }
+  .agent-progress li .spin { color: var(--blue); }
+  .agent-progress::-webkit-scrollbar { width: 8px; }
+  .agent-progress::-webkit-scrollbar-thumb { background: #2a3440; border-radius: 4px; }
+
+  h3 { font-size: 14px; margin-bottom: 10px; color: var(--text); }
+  .kv { display: grid; grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 13px; margin-bottom: 10px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { word-break: break-all; }
+  .section { margin-bottom: 14px; }
+  .section h4 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+  pre { background: #0b0f14; border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto; }
+  ul { list-style: none; font-size: 13px; }
+  ul li { padding: 3px 0; word-break: break-all; }
+  .reason { color: var(--amber); }
+  .retry-entry { font-size: 12px; padding: 6px 0; border-bottom: 1px dashed var(--border); }
+  .retry-entry .r-file { font-family: Consolas, "Courier New", monospace; word-break: break-all; color: var(--muted); }
+  .retry-entry .r-reason { color: var(--amber); }
+  .events { font-size: 12px; color: var(--muted); }
+  .events li { padding: 2px 0; border-bottom: 1px dashed var(--border); }
+  .progress { font-size: 12px; color: var(--muted); max-height: 200px; overflow-y: auto; list-style: none; padding: 0; }
+  .progress li { padding: 2px 0; border-bottom: 1px dashed var(--border); font-family: Consolas, "Courier New", monospace; }
+  .now-line { font-size: 13px; color: var(--blue); font-weight: 600; margin: 4px 0 6px; word-break: break-all; }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .actions { display: flex; gap: 8px; }
+  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  /* 设置弹窗 */
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: flex-start; justify-content: center; z-index: 50; padding: 40px 16px; }
+  .modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; width: 600px; max-width: 100%; max-height: 90vh; display: flex; flex-direction: column; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .modal-head h2 { font-size: 15px; }
+  .modal-body { overflow-y: auto; padding: 14px 18px; }
+  .modal-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--border); }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field.full { grid-column: 1 / -1; }
+  .field label { font-size: 12px; color: var(--muted); }
+  .field input, .field select { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 13px; width: 100%; }
+  .field input[type=password] { font-family: inherit; }
+  .field.check { flex-direction: row; align-items: center; gap: 8px; }
+  .field.check input { width: auto; }
+  #settingsMsg { font-size: 12px; color: var(--green); }
+  #settingsMsg.err { color: var(--red); }
+  .settings-note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+  /* 顶部浮动提示：操作结果 / 连接错误（此前网络失败完全静默，点重试像没反应） */
+  #toast { position: fixed; top: 66px; left: 50%; transform: translateX(-50%) translateY(-8px); background: var(--panel2); color: var(--green); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 100; max-width: 80vw; }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.err { color: var(--red); }
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<header>
+  <h1>🛠 TapdBugFixAgent</h1>
+  <span id="controlBadge" class="badge stopped">stopped</span>
+  <div class="stats">
+    <span class="stat">待处理 <b id="stQueued">0</b></span>
+    <span class="stat">已解决 <b id="stResolved">0</b></span>
+    <span class="stat">部分完成 <b id="stPartial">0</b></span>
+    <span class="stat">资源待人工 <b id="stManual">0</b></span>
+    <span class="stat">失败 <b id="stFailed">0</b></span>
+  </div>
+  <div class="actions">
+    <button id="btnSettings" class="ghost">⚙ 设置</button>
+    <button id="btnStart" data-act="start">▶ 开启</button>
+    <button id="btnPause" data-act="pause" class="ghost">⏸ 暂停</button>
+    <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
+    <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
+    <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 上行：分组 bug 列表 + 右侧详情抽屉 -->
+  <div class="top-row">
+    <div class="list-col">
+      <div class="toolbar">
+        <select id="fState">
+          <option value="all">全部状态</option>
+          <option value="unprocessed">未处理</option>
+          <option value="pending">待处理</option>
+          <option value="in_progress">处理中</option>
+          <option value="resolved">已解决</option>
+          <option value="partial">部分完成</option>
+          <option value="manual_only">资源待人工</option>
+          <option value="failed">失败</option>
+          <option value="skipped">跳过</option>
+        </select>
+        <input type="text" id="fSearch" placeholder="搜索 bug id / 标题…">
+        <button id="btnRefresh" class="ghost">刷新</button>
+      </div>
+      <div class="list-scroll" id="groupList"></div>
+      <div id="listEmpty" class="empty">暂无记录</div>
+    </div>
+
+    <aside class="drawer closed" id="drawer" aria-label="Bug 详情">
+      <div class="drawer-head">
+        <h3>Bug 详情</h3>
+        <button id="btnDrawerClose" class="ghost">✕</button>
+      </div>
+      <div class="drawer-body" id="detailBody">
+        <div class="empty">点击列表行查看详情</div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 上下分割线：可拖拽调整 Agent 输出区高度 -->
+  <div id="divider" title="拖动调整 Agent 输出区高度"></div>
+
+  <!-- 下行：Agent 输出区（终端形式，固定底部全宽，跟随当前处理中的 bug） -->
+  <div class="agent-pane" id="agentPane">
+    <div class="agent-head" id="agentHead">
+      <span class="badge stopped">等待中</span>
+      <span class="a-title">worker 空闲，等待领取下一条 bug…</span>
+      <button id="btnAgentPin" class="ghost a-pin" title="跳到最新输出并恢复自动跟随">⤓ 最新</button>
+    </div>
+    <ul class="agent-progress" id="agentProg"></ul>
+  </div>
+</main>
+
+<!-- 设置弹窗：直接填配置，无需改 config.yaml。保存写入 overrides.yaml，启动时合并（优先级最高）。 -->
+<div id="settingsModal" class="modal" style="display:none">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2>⚙ 设置</h2>
+      <button id="settingsClose" class="ghost">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="section">
+        <h4>pi 编码 Agent（走中转/代理时填；留空则用 pi 默认鉴权）</h4>
+        <div class="settings-grid">
+          <div class="field">
+            <label>provider id（--model 前缀）</label>
+            <input id="sPiId" type="text" placeholder="kuro">
+          </div>
+          <div class="field">
+            <label>模型 id（model_id）</label>
+            <input id="sPiModel" type="text" placeholder="claude-opus-4-8">
+          </div>
+          <div class="field full">
+            <label>网关地址 base_url</label>
+            <input id="sPiUrl" type="text" placeholder="https://ai-gateway.kurogames.com">
+          </div>
+          <div class="field">
+            <label>API Key 环境变量名（推荐）</label>
+            <input id="sPiKeyEnv" type="text" placeholder="ANTHROPIC_AUTH_TOKEN">
+          </div>
+          <div class="field">
+            <label>API Key（明文，不推荐）</label>
+            <input id="sPiKey" type="password">
+          </div>
+          <div class="field check"><input id="sAuthHeader" type="checkbox"><label>Authorization: Bearer（本司网关协议）</label></div>
+          <div class="field check"><input id="sPiReasoning" type="checkbox"><label>reasoning（默认开）</label></div>
+          <div class="settings-note">有效模型: <span id="sEffectiveModel" class="mono">-</span></div>
+        </div>
+      </div>
+      <div class="section">
+        <h4>Perforce</h4>
+        <div class="settings-grid">
+          <div class="field full"><label>P4PORT</label><input id="sP4Port" type="text" placeholder="p4.example.com:1666"></div>
+          <div class="field"><label>P4CLIENT</label><input id="sP4Client" type="text"></div>
+          <div class="field"><label>P4USER</label><input id="sP4User" type="text"></div>
+          <div class="field full"><label>P4PASSWD（留空保持不变）</label><input id="sP4Password" type="password"></div>
+        </div>
+      </div>
+      <div class="section">
+        <h4>Tapd</h4>
+        <div class="settings-grid">
+          <div class="field">
+            <label>后端 backend</label>
+            <select id="sTapdBackend">
+              <option value="mcp">mcp（推荐，个人访问令牌）</option>
+              <option value="rest">rest（API 账号）</option>
+            </select>
+          </div>
+          <div class="field"><label>API 账号 user</label><input id="sTapdApiUser" type="text"></div>
+          <div class="field full"><label>个人访问令牌 / API 密码（留空保持不变）</label><input id="sTapdToken" type="password"></div>
+          <div class="field full"><label>API 密码（rest 后端；留空保持不变）</label><input id="sTapdApiPw" type="password"></div>
+        </div>
+      </div>
+      <div class="settings-note">留空的密钥字段 = 保持原值不覆盖。保存后对后续 bug 立即生效；workspaces 等复杂结构请改 config.yaml。</div>
+    </div>
+    <div class="modal-foot">
+      <span id="settingsMsg"></span>
+      <div class="actions">
+        <button id="settingsSave">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('tapd_token') || '';
+let SNAPSHOT = { status: { control:'stopped', counts:{} }, items: [], current_detail: null };
+let SELECTED_ID = null;
+let AGENT_PIN = true;   // Agent 输出区是否跟随最新输出（用户手动上翻时暂停跟随）
+
+function authHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
+  return h;
+}
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.className = ''; }, 4500);
+}
+async function api(path, method='GET', body) {
+  const opts = { method, headers: authHeaders() };
+  if (body) opts.body = JSON.stringify(body);
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch (e) {
+    // 服务器不可达（重启窗口期/进程挂了）：必须给出可见反馈，否则点按钮毫无反应
+    toast('无法连接服务器：' + (e.message || e), true);
+    return null;
+  }
+  if (r.status === 401) { alert('未授权：token 不正确'); return null; }
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    toast(`请求失败(${r.status})：` + t.slice(0, 140), true);
+    return null;
+  }
+  return r.json();
+}
+
+// ---------- 渲染 ----------
+const STATE_LABEL = { pending:'待处理', in_progress:'处理中', resolved:'已解决', partial:'部分完成', manual_only:'资源待人工', failed:'失败', skipped:'跳过' };
+// 分组顺序：处理中置顶 → 待处理/未处理 → 失败/资源待人工/跳过 → 已完成沉底（单 worker 现状）
+const GROUP_ORDER = [
+  ['in_progress', '处理中'],
+  ['pending', '待处理'],
+  ['unprocessed', '未处理'],
+  ['failed', '失败'],
+  ['manual_only', '资源待人工'],
+  ['skipped', '跳过'],
+  ['resolved', '已解决'],
+  ['partial', '部分完成'],
+];
+const GROUP_LABEL = Object.fromEntries(GROUP_ORDER);
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTime(t) { return t ? t.slice(5, 16) : '-'; }
+
+function progressHTML(job) {
+  const prog = job.progress || [];
+  if (!prog.length) {
+    const busy = job.agent_state === 'in_progress' || job.agent_state === 'pending';
+    return `<div class="section"><h4>处理进度</h4><div class="muted">${busy ? 'Agent 正在运行，尚无进度输出…' : '(无进度记录)'}</div></div>`;
+  }
+  const now = prog[0];               // list_events 按 id DESC：最新一条在最前
+  const rest = prog.slice(1, 60);
+  const spinning = job.agent_state === 'in_progress';
+  return `<div class="section">
+    <h4>处理进度 <span class="muted" style="text-transform:none">· 共 ${prog.length} 条</span></h4>
+    <div class="now-line">${spinning ? '<span class="spin">⟳</span> ' : '▸ '}${escapeHtml(now.msg)}</div>
+    <ul class="progress">${rest.map(e => `<li>${escapeHtml(String(e.ts||'').slice(11,19))} ${escapeHtml(e.msg)}</li>`).join('')}</ul>
+  </div>`;
+}
+
+function renderStatus() {
+  const st = SNAPSHOT.status || {};
+  const c = st.control || 'stopped';
+  const badge = $('controlBadge');
+  badge.textContent = c;
+  badge.className = 'badge ' + c;
+  const counts = st.counts || {};
+  $('stQueued').textContent = (counts.pending||0) + (counts.in_progress||0);
+  $('stResolved').textContent = counts.resolved||0;
+  $('stPartial').textContent = counts.partial||0;
+  $('stManual').textContent = counts.manual_only||0;
+  $('stFailed').textContent = counts.failed||0;
+  const failedN = counts.failed || 0;
+  const bf = $('btnRetryFailed');
+  bf.disabled = !failedN;
+  bf.textContent = failedN ? `↻ 重试全部失败 (${failedN})` : '↻ 重试全部失败';
+  const running = c === 'running';
+  $('btnStart').disabled = running;
+  $('btnPause').disabled = !running;
+  $('btnResume').disabled = running;
+  $('btnStop').disabled = !running;
+}
+
+function filtered() {
+  const state = $('fState').value;
+  const q = $('fSearch').value.trim().toLowerCase();
+  return (SNAPSHOT.items || []).filter(it => {
+    if (state !== 'all') {
+      if (state === 'unprocessed') { if (it.agent_state) return false; }
+      else if (it.agent_state !== state) return false;
+    }
+    if (q && !(String(it.bug_id).includes(q) || String(it.title||'').toLowerCase().includes(q))) return false;
+    return true;
+  });
+}
+
+/** 分组渲染 bug 列表（去 Agent 列；组顺序见 GROUP_ORDER，处理中置顶醒目）。 */
+function renderList() {
+  const items = filtered();
+  const wrap = $('groupList');
+  wrap.innerHTML = '';
+  $('listEmpty').style.display = items.length ? 'none' : '';
+  const groups = new Map();
+  for (const it of items) {
+    const g = it.agent_state || 'unprocessed';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(it);
+  }
+  for (const [g, label] of GROUP_ORDER) {
+    const arr = groups.get(g);
+    if (!arr || !arr.length) continue;
+    const div = document.createElement('div');
+    div.className = 'group';
+    const head = document.createElement('div');
+    head.className = 'group-head';
+    head.innerHTML = (g === 'in_progress' ? '🔵 ' : '') + escapeHtml(label) + ` <span class="count">${arr.length}</span>`;
+    div.appendChild(head);
+    for (const it of arr) {
+      const row = document.createElement('div');
+      row.className = 'row'
+        + (String(it.bug_id) === SELECTED_ID ? ' selected' : '')
+        + (it.agent_state === 'in_progress' ? ' busy' : '');
+      row.dataset.id = String(it.bug_id);   // bug_id 是字符串（后端已保证），大整数不丢精度
+      row.innerHTML = `
+        <div class="mono">${it.bug_id}</div>
+        <div class="title" title="${escapeHtml(it.title)}">${it.tapd_missing ? '<span class="muted" title="该 bug 已不在 Tapd「分配给我」列表（可能已改派/流转），显示为本地记录；重试仍可处理">⚠不在Tapd列表 </span>' : ''}${escapeHtml(it.title)}</div>
+        <div>${escapeHtml(it.priority_label || it.priority || '-')}</div>
+        <div><span class="badge ${it.agent_state || 'unprocessed'}">${it.agent_state ? (STATE_LABEL[it.agent_state] || it.agent_state) : '未处理'}</span></div>
+        <div class="mono">${it.changelist ?? '-'}</div>
+        <div class="muted">${fmtTime(it.finished_at)}${it.attempts > 1 ? ` · ${it.attempts} 次` : ''}</div>`;
+      row.onclick = () => selectBug(String(it.bug_id));
+      div.appendChild(row);
+    }
+    wrap.appendChild(div);
+  }
+}
+
+/** 底部 Agent 输出区（终端形式）：跟随当前处理中的 bug（SSE current_detail）。
+ *  新输出追加在底部并自动往下划；用户手动上翻时暂停跟随，点「⤓ 最新」恢复。 */
+function renderAgentPane() {
+  const d = SNAPSHOT.current_detail;
+  const head = $('agentHead');
+  const prog = $('agentProg');
+  // 渲染前判断是否贴底（基于旧内容），贴底则保持自动跟随
+  if (prog.scrollHeight - prog.scrollTop - prog.clientHeight < 40) AGENT_PIN = true;
+  const pinBtn = '<button id="btnAgentPin" class="ghost a-pin" title="跳到最新输出并恢复自动跟随">⤓ 最新</button>';
+  if (!d) {
+    head.innerHTML = '<span class="badge stopped">等待中</span> <span class="a-title">worker 空闲，等待领取下一条 bug…</span>' + pinBtn;
+    prog.innerHTML = '';
+    return;
+  }
+  const busy = d.agent_state === 'in_progress';
+  const stLabel = d.agent_state ? (STATE_LABEL[d.agent_state] || d.agent_state) : '未处理';
+  head.innerHTML =
+    `<span class="badge ${d.agent_state || 'unprocessed'}">${escapeHtml(stLabel)}</span>` +
+    ` <b class="mono">${d.bug_id}</b>` +
+    ` <span class="a-title">${escapeHtml(d.title)}</span>` +
+    (d.model ? ` <span class="a-title">· 模型 <b class="mono">${escapeHtml(d.model)}</b></span>` : '') +
+    (d.started_at ? ` <span class="a-title">· ${escapeHtml(d.started_at.slice(5, 16))} 开始</span>` : '') +
+    pinBtn;
+  const progArr = d.progress || [];
+  if (!progArr.length) {
+    prog.innerHTML = '<li>' + (busy ? '<span class="spin">⟳</span> Agent 正在运行，尚无进度输出…' : '(无进度记录)') + '</li>';
+    return;
+  }
+  // 终端习惯：最新在底部。list_events 最新在最前 → 反转后新行追加在底，输出时自动下划。
+  prog.innerHTML = progArr.slice(0, 200).reverse().map(e =>
+    `<li><span class="ts">${escapeHtml(String(e.ts||'').slice(11,19))}</span>${escapeHtml(e.msg)}</li>`).join('');
+  if (AGENT_PIN) prog.scrollTop = prog.scrollHeight;
+}
+
+function renderDetail(job) {
+  SELECTED_ID = String(job.bug_id);
+  // 容错解析：历史脏数据里可能存字面字符串 "null"（JSON.parse 得 null），
+  // 或任意 JSON；一律兜底为空数组，避免 .length 崩溃。
+  const parseArr = (raw, def = []) => { try { const v = JSON.parse(raw || '[]'); return Array.isArray(v) ? v : def; } catch (e) { return def; } };
+  const assets = parseArr(job.manual_assets);
+  const files = parseArr(job.files);
+  const retries = parseArr(job.retry_evidence);
+  const retryHTML = retries.length ? `<div class="section">
+    <h4>自动重试记录（失败 ${retries.length} 次）</h4>
+    ${retries.map(r => `<div class="retry-entry">
+      <div><b>第 ${escapeHtml(r.attempt)} 次</b> · ${escapeHtml(r.at || '')}
+        <span class="r-reason">— ${escapeHtml((r.failure_reason || '').slice(0, 300))}</span></div>
+      ${r.agent_summary ? `<div class="muted">Agent 说明: ${escapeHtml(r.agent_summary)}</div>` : ''}
+      ${r.opened_files && r.opened_files.length ? `<div class="r-file">当时打开文件: ${escapeHtml(r.opened_files.join(', '))}</div>` : ''}
+      ${r.manual_assets && r.manual_assets.length ? `<div class="r-file">当时需人工资源: ${escapeHtml(r.manual_assets.join(', '))}</div>` : ''}
+    </div>`).join('')}
+  </div>` : '';
+  const html = `
+    <div class="kv">
+      <dt>Bug ID</dt><dd class="mono">${job.bug_id}</dd>
+      <dt>标题</dt><dd>${escapeHtml(job.title)}</dd>
+      <dt>状态</dt><dd><span class="badge ${job.agent_state || 'unprocessed'}">${job.agent_state ? (STATE_LABEL[job.agent_state] || job.agent_state) : '未处理'}</span></dd>
+      <dt>优先级</dt><dd>${escapeHtml(job.priority_label || job.priority || '-')}</dd>
+      <dt>Changelist</dt><dd class="mono">${job.changelist ?? '-'}</dd>
+      <dt>Agent</dt><dd>${escapeHtml(job.agent || '-')}</dd>
+      <dt>模型</dt><dd>${job.model ? escapeHtml(job.model) : '<span class="muted">(CLI 默认)</span>'}</dd>
+      <dt>Tapd 状态</dt><dd>${escapeHtml(job.tapd_status || '-')}</dd>
+      <dt>Tapd 链接</dt><dd><a href="${escapeHtml(job.url || '')}" target="_blank" rel="noopener">在 Tapd 打开 ↗</a></dd>
+      <dt>开始/完成</dt><dd>${escapeHtml(job.started_at || '-')} → ${escapeHtml(job.finished_at || '-')}</dd>
+      ${job.failure_reason ? `<dt class="reason">${job.agent_state === 'skipped' ? '跳过原因' : '失败原因'}</dt><dd class="reason">${escapeHtml(job.failure_reason)}</dd>` : ''}
+    </div>
+    ${progressHTML(job)}
+    ${retryHTML}
+    ${job.description ? `<div class="section">
+      <h4>Tapd 原始描述</h4>
+      <pre>${escapeHtml(job.description)}</pre>
+    </div>` : ''}
+    <div class="section">
+      <h4>生成的 pending 描述</h4>
+      <pre>${escapeHtml(job.generated_description || '(未生成)')}</pre>
+    </div>
+    <div class="section">
+      <h4>修改文件</h4>
+      <ul>${files.length ? files.map(f => `<li class="mono">${escapeHtml(f)}</li>`).join('') : '<li class="muted">(无代码改动)</li>'}</ul>
+    </div>
+    <div class="section">
+      <h4>需人工处理的资源</h4>
+      <ul>${assets.length ? assets.map(a => `<li class="mono">${escapeHtml(a.path)} <span class="reason">— ${escapeHtml(a.reason || '')}</span></li>`).join('') : '<li class="muted">(无)</li>'}</ul>
+    </div>
+    ${job.has_local ? `<div class="section">
+      <h4>操作</h4>
+      <div class="actions">
+        <button onclick="actRetry('${job.bug_id}')">↻ 重试</button>
+        <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过</button>
+      </div>
+    </div>` : `<div class="section">
+      <h4>操作</h4>
+      <div class="actions">
+        <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过（不处理）</button>
+      </div>
+    </div>`}
+    <div class="section">
+      <h4>操作日志</h4>
+      <ul class="events">${(job.events || []).map(e => `<li>${escapeHtml(e.ts)} [${escapeHtml(e.level)}] ${escapeHtml(e.msg)}</li>`).join('') || '<li>无</li>'}</ul>
+    </div>`;
+  $('detailBody').innerHTML = html;
+  openDrawer();
+  renderList();
+}
+
+// ---------- 抽屉 ----------
+function openDrawer() { $('drawer').classList.remove('closed'); }
+function closeDrawer() { $('drawer').classList.add('closed'); SELECTED_ID = null; renderList(); }
+
+async function selectBug(id) {
+  const job = await api('/api/bugs/' + id);
+  if (job) renderDetail(job);
+}
+
+// ---------- 操作 ----------
+document.querySelectorAll('header button[data-act]').forEach(btn => {
+  btn.onclick = async () => {
+    const r = await api('/api/control', 'POST', { action: btn.dataset.act });
+    if (r) renderStatus();
+  };
+});
+$('btnRefresh').onclick = refresh;
+$('btnDrawerClose').onclick = closeDrawer;
+$('fSearch').oninput = renderList;
+$('fState').onchange = renderList;
+
+// ---------- Agent 输出区：贴底跟随 + 分割线拖拽调高度 ----------
+$('agentProg').addEventListener('scroll', () => {
+  const p = $('agentProg');
+  AGENT_PIN = p.scrollHeight - p.scrollTop - p.clientHeight < 40;
+});
+// 按钮在 renderAgentPane 重建 head 时会替换 DOM，用事件委托绑定（监听不随重建失效）
+$('agentHead').addEventListener('click', (e) => {
+  const t = e.target;
+  if (t && t.id === 'btnAgentPin') { AGENT_PIN = true; $('agentProg').scrollTop = $('agentProg').scrollHeight; }
+});
+(function initDivider() {
+  const divider = $('divider');
+  divider.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    divider.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    const startY = e.clientY;
+    const startH = $('agentPane').offsetHeight;
+    const onMove = (ev) => {
+      // 跟手：分隔线随鼠标移动。鼠标上移 → 终端变大、列表变小。
+      // 上限收紧：top-row 至少保留 180px（= vh-58 顶栏-28 边距-38 布局间隙），终端不会把列表挤没/盖住。
+      const maxH = Math.max(120, window.innerHeight - 304);
+      const h = Math.min(Math.max(startH + (startY - ev.clientY), 120), maxH);
+      document.documentElement.style.setProperty('--agent-h', h + 'px');
+    };
+    const onUp = () => {
+      divider.classList.remove('dragging');
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+})();
+
+async function actRetry(id) {
+  const r = await api('/api/bugs/' + id + '/retry', 'POST', {});
+  if (r) {
+    toast('已重置为待处理；开启状态下会按优先级自动重新处理');
+    // 若正盯着「失败」筛选，切回全部，否则该行移组后直接消失、看起来像没生效
+    if ($('fState').value === 'failed') { $('fState').value = 'all'; }
+  }
+  refresh(); selectBug(id);
+}
+async function actSkip(id) {
+  const r = await api('/api/bugs/' + id + '/skip', 'POST', {});
+  if (r) {
+    toast('已跳过（不再自动处理）');
+    if ($('fState').value !== 'all' && $('fState').value !== 'skipped') { $('fState').value = 'all'; }
+  }
+  refresh(); selectBug(id);
+}
+
+// 重试全部失败任务（顶部按钮）：重置所有 failed -> 待处理并入队
+$('btnRetryFailed').onclick = async () => {
+  const n = (SNAPSHOT.status && SNAPSHOT.status.counts && SNAPSHOT.status.counts.failed) || 0;
+  if (!n) { toast('当前没有失败任务', true); return; }
+  if (!confirm(`确定把 ${n} 个失败任务全部重置为待处理？\n开启状态下 worker 会按优先级依次重新处理；已暂停/关闭则等开启后处理。`)) return;
+  const r = await api('/api/retry-failed', 'POST', {});
+  if (r) {
+    toast(`已重置 ${r.retried} 个失败任务为待处理`);
+    if ($('fState').value === 'failed') { $('fState').value = 'all'; }
+    refresh();
+  }
+};
+
+async function refresh() {
+  const st = await api('/api/status');
+  if (st) { SNAPSHOT.status = st; renderStatus(); }
+  const list = await api('/api/bugs');
+  if (list) { SNAPSHOT.items = list.items; renderList(); }
+  renderAgentPane();
+  if (SELECTED_ID) { const j = await api('/api/bugs/' + SELECTED_ID); if (j) renderDetail(j); }
+}
+
+// ---------- SSE 实时刷新 ----------
+function connectSSE() {
+  const es = new EventSource('/api/events' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : ''));
+  es.addEventListener('snapshot', e => {
+    try {
+      const data = JSON.parse(e.data);
+      SNAPSHOT.status = data.status;
+      SNAPSHOT.items = data.items;
+      SNAPSHOT.current_detail = data.current_detail || null;
+      renderStatus();
+      renderList();
+      renderAgentPane();
+      // 实时刷新选中 bug 详情（含 Agent 进度事件）
+      if (SELECTED_ID) {
+        api('/api/bugs/' + SELECTED_ID).then(j => { if (j) renderDetail(j); });
+      }
+    } catch (err) { console.error(err); }
+  });
+  es.onerror = () => { es.close(); setTimeout(connectSSE, 3000); };
+}
+
+// ---------- 设置弹窗 ----------
+function setVal(id, v) { $(id).value = v ?? ''; }
+
+async function openSettings() {
+  const s = await api('/api/settings');
+  if (!s) return;
+  const p = s.pi?.provider || {};
+  setVal('sPiId', p.id);
+  setVal('sPiModel', p.model_id);
+  setVal('sPiUrl', p.base_url);
+  setVal('sPiKeyEnv', p.api_key_env);
+  setVal('sPiKey', '');
+  setVal('sP4Port', s.p4?.port);
+  setVal('sP4Client', s.p4?.client);
+  setVal('sP4User', s.p4?.user);
+  setVal('sP4Password', '');
+  setVal('sTapdBackend', s.tapd?.backend || 'mcp');
+  setVal('sTapdApiUser', s.tapd?.api_user);
+  setVal('sTapdToken', '');
+  setVal('sTapdApiPw', '');
+  $('sAuthHeader').checked = !!p.auth_header;
+  $('sPiReasoning').checked = p.reasoning !== false;
+  $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
+  $('sPiKey').placeholder = p.has_api_key ? '已设置，留空保持不变' : '（未设置）';
+  $('sP4Password').placeholder = s.p4?.password_set ? '已设置，留空保持不变' : '（未设置）';
+  $('sTapdToken').placeholder = s.tapd?.access_token_set ? '已设置，留空保持不变' : '（未设置）';
+  $('sTapdApiPw').placeholder = s.tapd?.api_password_set ? '已设置，留空保持不变' : '（未设置）';
+  $('settingsMsg').textContent = '';
+  $('settingsMsg').className = '';
+  $('settingsModal').style.display = 'flex';
+}
+
+function closeSettings() { $('settingsModal').style.display = 'none'; }
+
+async function saveSettings() {
+  const body = {
+    pi: { provider: {
+      id: $('sPiId').value,
+      base_url: $('sPiUrl').value,
+      api_key_env: $('sPiKeyEnv').value,
+      api_key: $('sPiKey').value,
+      auth_header: $('sAuthHeader').checked,
+      model_id: $('sPiModel').value,
+      reasoning: $('sPiReasoning').checked,
+    } },
+    p4: {
+      port: $('sP4Port').value, client: $('sP4Client').value,
+      user: $('sP4User').value, password: $('sP4Password').value,
+    },
+    tapd: {
+      backend: $('sTapdBackend').value,
+      access_token: $('sTapdToken').value,
+      api_user: $('sTapdApiUser').value,
+      api_password: $('sTapdApiPw').value,
+    },
+  };
+  const s = await api('/api/settings', 'POST', body);
+  if (s) {
+    $('settingsMsg').textContent = '✓ 已保存，对后续 bug 生效';
+    $('settingsMsg').className = '';
+    $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
+    refresh();
+  } else {
+    $('settingsMsg').textContent = '✗ 保存失败（见控制台）';
+    $('settingsMsg').className = 'err';
+  }
+}
+
+$('btnSettings').onclick = openSettings;
+$('settingsClose').onclick = closeSettings;
+$('settingsSave').onclick = saveSettings;
+$('settingsModal').onclick = e => { if (e.target === $('settingsModal')) closeSettings(); };
+
+refresh();
+connectSSE();
+</script>
+</body>
+</html>
