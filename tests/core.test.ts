@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 
 import { bugFromDict, dumps } from "../src/models.js";
 import type { AgentResult, Bug } from "../src/models.js";
-import { buildDescription } from "../src/descgen.js";
+import { buildDescription, bugShortId } from "../src/descgen.js";
 import {
   DEFAULT_PRIORITY_WEIGHT,
   applySettingsOverrides,
@@ -169,7 +169,7 @@ describe("descgen", () => {
       manual_assets: [{ path: "Assets/login.prefab", reason: "Unity 二进制资源" }],
     });
     const desc = buildDescription(bug, result, "pytest 1 passed");
-    expect(desc).toContain("[TAPD-1152729922001234007]");
+    expect(desc).toContain("【b1234007】登录页偶现崩溃"); // 首行 = swarm 校验格式（短号）
     expect(desc).toContain("登录页偶现崩溃");
     expect(desc).toContain("需人工处理的资源");
     expect(desc).toContain("Unity 二进制资源");
@@ -185,6 +185,31 @@ describe("descgen", () => {
     const desc = buildDescription(bug, result);
     expect(desc).not.toContain("修改文件:");
     expect(desc).toContain("a.xlsx");
+  });
+
+  it("bugShortId：真实 id = 1+workspace+前导零序号 → 去前导零短号", () => {
+    // 真实形态：workspace 52729922，id 1152729922·001257090 → b1257090
+    expect(bugShortId({ id: "1152729922001257090", workspace_id: "52729922" })).toBe("1257090");
+    // 序号无前导零
+    expect(bugShortId({ id: "1152729922001256834", workspace_id: "52729922" })).toBe("1256834");
+  });
+
+  it("bugShortId：前缀不匹配（异常数据）→ 回退末 7 位去前导零", () => {
+    expect(bugShortId({ id: "1152729922001234007", workspace_id: "1152729922" })).toBe("1234007");
+    expect(bugShortId({ id: "99000123", workspace_id: "52729922" })).toBe("9000123"); // 末 7 位无前导零
+    // 全零/空保底：返回完整 id，不产生 b 后空串
+    expect(bugShortId({ id: "0", workspace_id: "52729922" })).toBe("0");
+  });
+
+  it("bugShortId + 标题 = Tapd「复制Bug单信息」的文本格式（真实单验证）", () => {
+    // 真实单：id 1152729922001257090，标题自带【模块】前缀（swarm 校验用）
+    const bug = makeBug({
+      id: "1152729922001257090",
+      workspace_id: "52729922",
+      title: "【爬塔二期】【排行榜】排名显示错误，预期显示13实际显示了9",
+    });
+    const desc = buildDescription(bug, makeResult({ summary: "修复" }));
+    expect(desc.split("\n")[0]).toBe("【b1257090】【爬塔二期】【排行榜】排名显示错误，预期显示13实际显示了9");
   });
 });
 
@@ -250,6 +275,22 @@ priority_weight:
       auth_header: true,
       model_id: "deepseek-v4-flash",
     });
+  });
+
+  it("loadConfig 解析 pi.skill_dirs（团队共享 skill 目录）", () => {
+    const dir = tmpdir();
+    const cfgPath = path.join(dir, "c.yaml");
+    fs.writeFileSync(
+      cfgPath,
+      `pi:
+  skill_dirs:
+    - ".agents/skills"
+    - "D:/shared/skills"
+`,
+      "utf-8",
+    );
+    const cfg = loadConfig(cfgPath);
+    expect(cfg.pi.skill_dirs).toEqual([".agents/skills", "D:/shared/skills"]);
   });
 
   it("validate 报告缺少凭据", () => {
@@ -779,6 +820,53 @@ describe("PiAgent 子进程控制", () => {
     const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
     expect(args).toContain("--print");
     expect(args).toContain("--mode");
+  });
+
+  it("团队共享 skill 目录：仓库下存在 .agents/skills / .agent/skills 时逐个 --skill 挂载", async () => {
+    const d = tmpdir();
+    // 模拟团队仓库：两种拼法各建一个 skills 目录
+    fs.mkdirSync(path.join(d, ".agents", "skills", "team-skill"), { recursive: true });
+    fs.mkdirSync(path.join(d, ".agent", "skills"), { recursive: true });
+    writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
+    const agent = new PiAgent(makeConfig());
+    await withFakePiOnPath(d, async () => {
+      await agent.run({ prompt: "x", repoDir: d, timeoutS: 60 });
+    });
+    const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
+    expect(args).toContain("--skill");
+    expect(args).toContain(path.join(d, ".agents", "skills"));
+    expect(args).toContain(path.join(d, ".agent", "skills"));
+  });
+
+  it("仓库下没有 .agent(s) 目录时不传 --skill（保持现状，不报错）", async () => {
+    const d = tmpdir();
+    writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
+    const agent = new PiAgent(makeConfig());
+    await withFakePiOnPath(d, async () => {
+      await agent.run({ prompt: "x", repoDir: d, timeoutS: 60 });
+    });
+    const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
+    expect(args).not.toContain("--skill");
+  });
+
+  it("pi.skill_dirs 配置覆盖默认目录（含绝对路径；存在的默认目录也被排除）", async () => {
+    const d = tmpdir();
+    const custom = tmpdir();
+    fs.mkdirSync(custom, { recursive: true });
+    // 两个默认拼法目录都建出来；配置只留 .agents/skills → .agent/skills 即使存在也不得被挂载
+    fs.mkdirSync(path.join(d, ".agents", "skills"), { recursive: true });
+    fs.mkdirSync(path.join(d, ".agent", "skills"), { recursive: true });
+    const cfg = makeConfig();
+    cfg.pi.skill_dirs = [custom, ".agents/skills"];
+    writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
+    const agent = new PiAgent(cfg);
+    await withFakePiOnPath(d, async () => {
+      await agent.run({ prompt: "x", repoDir: d, timeoutS: 60 });
+    });
+    const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
+    expect(args).toContain(custom); // 绝对路径原样
+    expect(args).toContain(path.join(d, ".agents", "skills")); // 相对按仓库根解析
+    expect(args).not.toContain(path.join(d, ".agent", "skills")); // 未列入配置 → 被覆盖排除
   });
 
   it("多行 prompt 不被 cmd 拆成碎片（Windows 用 @file 传引用，回归：shell:true 会把含换行的 argv 按换行拆分，pi 只收到第一行碎片、丢失全部 Bug 信息）", async () => {
@@ -1527,7 +1615,7 @@ describe("worker 自动重试", () => {
     expect(revertCalls).toEqual([["//depot/a.cpp"]]); // 重试开始时清理了遗留文件
     // 成功路径：createPending 收到 Bug 单描述 + 只含当前 bug 的文件列表
     expect(createPendingCalls).toHaveLength(1);
-    expect(createPendingCalls[0].desc).toContain("[TAPD-1152729922001234007]");
+    expect(createPendingCalls[0].desc).toContain("【b1234007】登录页偶现崩溃");
     expect(createPendingCalls[0].desc).toContain("登录页偶现崩溃");
     expect(createPendingCalls[0].files).toEqual(["//depot/a.cpp"]);
   });

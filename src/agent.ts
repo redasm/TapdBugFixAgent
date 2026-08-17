@@ -364,8 +364,13 @@ function loadPlaybook(): string | undefined {
   _playbookLoaded = true;
   try {
     const text = fs.readFileSync(_PLAYBOOK_PATH, "utf-8").trim();
-    // 去掉 frontmatter（如有）与首行标题，正文直接进 prompt
-    const body = text.replace(/^---[\s\S]*?---\s*/, "").replace(/^#\s*.*\n/, "").trim();
+    // 先归一化行尾（git autocrlf 往返会把文件变 CRLF，标题剥离正则在 \r\n 下失配、
+    // 标题整行漏进 prompt），再去 frontmatter 与首行标题，正文直接进 prompt
+    const body = text
+      .replace(/\r\n/g, "\n")
+      .replace(/^---[\s\S]*?---\s*/, "")
+      .replace(/^#[^\n]*\n/, "")
+      .trim();
     _playbookCache = body ? body.slice(0, 4000) : undefined;
   } catch {
     // 无守则文件 = 不注入（向后兼容）
@@ -522,6 +527,27 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
 export class PiAgent {
   constructor(private config: Config) {}
 
+  /** 解析要传给 pi `--skill` 的目录（绝对路径，仅仓库里实际存在的）。
+   *  默认尝试团队共享的 .agents/skills 与 .agent/skills（同事两种拼法都有）；
+   *  config.yaml pi.skill_dirs 可覆盖。指向 skills 子目录而非 .agents 根——
+   *  pi 会把根下散置的 .md 也当 skill 加载（如 DSH 风格仓库的 notes/README）。 */
+  private skillDirs(repoDir: string): string[] {
+    const configured =
+      this.config.pi.skill_dirs && this.config.pi.skill_dirs.length
+        ? this.config.pi.skill_dirs
+        : [".agents/skills", ".agent/skills"];
+    const out: string[] = [];
+    for (const dir of configured) {
+      const abs = path.isAbsolute(dir) ? dir : path.resolve(repoDir, dir);
+      try {
+        if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) out.push(abs);
+      } catch {
+        // 无法访问则跳过（不阻断 spawn）
+      }
+    }
+    return out;
+  }
+
   async run(opts: PiRunOptions): Promise<AgentResult> {
     // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）
     try {
@@ -554,6 +580,11 @@ export class PiAgent {
     // 模型覆盖：由 provider 构造 `--model <provider>/<model_id>`；未配置则不传（pi 用默认模型）
     const model = effectivePiModel(this.config.pi);
     if (model) args.push("--model", model);
+    // 团队共享 skill 目录：pi 只认 <cwd>/.pi/skills，团队仓库里大家放的是 .agent(s)/skills，
+    // 用 --skill <目录>（可重复）挂载进去。只传仓库里实际存在的目录（相对路径按仓库根解析）。
+    for (const dir of this.skillDirs(opts.repoDir)) {
+      args.push("--skill", dir);
+    }
 
     const isWin = process.platform === "win32";
     let proc: ChildProcess;

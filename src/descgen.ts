@@ -3,7 +3,19 @@
 import type { AgentResult, Bug } from "./models.js";
 import { truncate } from "./models.js";
 
-/** 生成 p4 pending changelist 的 Description（多行文本）。 */
+/** 提取 bug 短号（swarm 校验用的 b<短号>）。
+ *  Tapd 完整 id 形如 1152729922·001257090 = "1" + workspace_id("52729922") + 前导零序号；
+ *  团队惯用短号 = 序号去前导零（1257090）。前缀不匹配时回退取末 7 位去前导零。 */
+export function bugShortId(bug: Pick<Bug, "id" | "workspace_id">): string {
+  const id = String(bug.id ?? "");
+  const prefix = "1" + String(bug.workspace_id ?? "");
+  let serial = id.startsWith(prefix) ? id.slice(prefix.length) : id.slice(-7);
+  serial = serial.replace(/^0+/, "");
+  return serial || id; // 全零/异常时保底用完整 id
+}
+
+/** 生成 p4 pending changelist 的 Description（多行文本）。
+ *  首行用团队 swarm 校验格式：【b<短号>】<标题>（完整单号保留在「TAPD 单号」行）。 */
 export function buildDescription(
   bug: Bug,
   result: AgentResult,
@@ -11,8 +23,8 @@ export function buildDescription(
   changelistExtra: string[] = [],
 ): string {
   const lines: string[] = [];
-  const title = bug.title.trim() || `修复 TAPD-${bug.id}`;
-  lines.push(`[TAPD-${bug.id}] ${title}`);
+  const title = bug.title.trim() || `修复 Bug ${bug.id}`;
+  lines.push(`【b${bugShortId(bug)}】${title}`);
   lines.push("");
   lines.push(`TAPD 单号: bug_${bug.id}`);
   lines.push(`单子链接: ${bugUrl(bug.workspace_id, bug.id)}`);

@@ -51,6 +51,10 @@ export interface PiProviderConfig {
 
 export interface PiConfig {
   provider?: PiProviderConfig; // 配置了 provider 时自动合并写入 models.json；否则 pi 用默认鉴权/模型
+  /** 额外 skill 目录（相对仓库根或绝对路径）：spawn pi 时逐个 `--skill` 挂载。
+   *  团队仓库共享的 .agents/skills / .agent/skills 默认就会尝试，无需配置；
+   *  此字段用于覆盖默认或追加。 */
+  skill_dirs?: string[];
 }
 
 /** Web 设置页可编辑的配置项，持久化到 overrides.yaml（不重写带注释的 config.yaml）。
@@ -266,6 +270,10 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
       context_window: numOrUndef(pvRaw.context_window),
       max_tokens: numOrUndef(pvRaw.max_tokens),
     };
+  }
+  if (Array.isArray(piRaw.skill_dirs)) {
+    const dirs = piRaw.skill_dirs.map(String).filter((s) => s.trim());
+    if (dirs.length) cfg.pi.skill_dirs = dirs;
   }
 
   cfg.p4 = (raw.p4 ?? {}) as Record<string, string>;
