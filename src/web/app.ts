@@ -1,5 +1,6 @@
 /** Express 管理台：状态/控制/bug 列表与详情/SSE 实时进度。 */
 
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -16,6 +17,16 @@ import type { StateStore } from "../state.js";
 import type { Worker } from "../worker.js";
 
 const STATIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "static");
+/** 构建版本（package.json version）：/api/status 带上，页面一眼可辨是否旧进程在跑
+ *  （src 与 dist 布局一致，../../ 都指向项目根）。 */
+const PKG_VERSION = (() => {
+  try {
+    const p = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../package.json");
+    return String(JSON.parse(fs.readFileSync(p, "utf-8")).version ?? "");
+  } catch {
+    return "";
+  }
+})();
 const _VALID_ACTIONS = new Set(["start", "stop", "pause", "resume"]);
 
 /** GET /api/settings 的脱敏视图：密钥只回传"是否已设置"，绝不回传明文。 */
@@ -114,7 +125,7 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
   });
 
   app.get("/api/status", auth, (_req, res) => {
-    res.json(worker.status());
+    res.json({ ...worker.status(), version: PKG_VERSION });
   });
 
   app.post("/api/control", auth, (req, res) => {

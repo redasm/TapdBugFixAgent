@@ -133,7 +133,7 @@
 <body>
 <div id="toast"></div>
 <header>
-  <h1>🛠 TapdBugFixAgent</h1>
+  <h1>🛠 TapdBugFixAgent <span id="verBadge" class="muted" style="font-size:11px;font-weight:400" title="运行中服务的构建版本（改代码后不重启这里不会变）"></span></h1>
   <span id="controlBadge" class="badge stopped">stopped</span>
   <div class="stats">
     <span class="stat">待处理 <b id="stQueued">0</b></span>
@@ -301,12 +301,24 @@ async function api(path, method='GET', body) {
     toast('无法连接服务器：' + (e.message || e), true);
     return null;
   }
-  if (r.status === 401) { alert('未授权：token 不正确'); return null; }
+  if (r.status === 401) {
+    // token 不对/已变更：给补救入口而不是死胡同。输入后记住并带参重载，
+    // URL 的 ?token= 与 localStorage 从此同步成有效值。
+    const t = prompt('Web 管理台 token 不正确或已变更，请输入 token：');
+    if (t !== null && t.trim()) {
+      TOKEN = t.trim();
+      try { localStorage.setItem('tapd_token', TOKEN); } catch (e) {}
+      location.href = location.pathname + '?token=' + encodeURIComponent(TOKEN);
+    }
+    return null;
+  }
   if (!r.ok) {
     const t = await r.text().catch(() => '');
     toast(`请求失败(${r.status})：` + t.slice(0, 140), true);
     return null;
   }
+  // 请求成功 = 当前 token 有效，记住它（下次无参打开页面也能直接用）
+  if (TOKEN) { try { localStorage.setItem('tapd_token', TOKEN); } catch (e) {} }
   return r.json();
 }
 
@@ -352,6 +364,7 @@ function renderStatus() {
   const badge = $('controlBadge');
   badge.textContent = c;
   badge.className = 'badge ' + c;
+  if (st.version) $('verBadge').textContent = 'v' + st.version;
   const counts = st.counts || {};
   $('stQueued').textContent = (counts.pending||0) + (counts.in_progress||0);
   $('stResolved').textContent = counts.resolved||0;

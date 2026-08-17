@@ -1878,4 +1878,15 @@ describe("web 前端 bug_id 内插引号", () => {
     expect(html).toMatch(/catch \(e\) \{\s*\n?\s*\/\/ 服务器不可达/);
     expect(html).toContain("function toast(");
   });
+
+  it("401 有补救入口：提示输入 token、记住并带参重载（回归：token 不匹配时 alert 死胡同）", () => {
+    expect(html).not.toContain("alert('未授权");
+    expect(html).toMatch(/401[\s\S]{0,400}prompt\('Web 管理台 token/);
+    expect(html).toMatch(/localStorage\.setItem\('tapd_token'/);
+  });
+
+  it("成功请求后持久化 token，页面标题显示运行版本", () => {
+    expect(html).toContain("// 请求成功 = 当前 token 有效，记住它");
+    expect(html).toContain('id="verBadge"');
+  });
 });
