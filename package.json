@@ -1,0 +1,35 @@
+{
+  "name": "tapd-bugfix-agent",
+  "version": "0.2.0",
+  "description": "Tapd Bug 自动修复 Agent（pi 编码 Agent + Perforce pending changelist + Web 管理台）",
+  "type": "module",
+  "bin": {
+    "tapd-bugfix": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc && node -e \"require('fs').cpSync('src/web/static','dist/web/static',{recursive:true}); require('fs').cpSync('prompts','dist/prompts',{recursive:true})\"",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^4.17.21",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
