@@ -69,6 +69,11 @@ pi:
     # context_window: 200000                          # 可选，默认 200000
     # max_tokens: 32000                               # 可选，默认 32000
     # 说明：删掉 provider 段不会自动清掉 models.json 里已写入的项，想还原请手动删 ~/.pi/agent/models.json 对应条目。
+  # 团队共享 skill 目录：pi 默认只认 <仓库>/.pi/skills，这里把仓库里的团队目录也挂给 pi。
+  # 不配置时默认尝试仓库下的 .agents/skills （存在才挂载，--skill 可重复传）。
+  # 想追加/覆盖可显式列出（相对仓库根或绝对路径）：
+  # skill_dirs: [".agents/skills"]
+  # 注意：目录里放 <skill-name>/SKILL.md（frontmatter 需 name + description，文件须无 BOM）。
 
 # Perforce（环境变量 P4PORT/P4CLIENT/P4USER/P4PASSWD 优先级更高，也可直接填这里）
 p4:
