@@ -183,6 +183,16 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
     res.json({ ok: true, retried });
   });
 
+  // 清空全部本地记录并从 Tapd 强制重新同步（会中断当前处理中的 bug）
+  app.post("/api/resync", auth, async (_req, res) => {
+    try {
+      const r = await worker.resyncFromTapd();
+      res.json({ ok: true, ...r });
+    } catch (exc) {
+      res.status(500).json({ detail: `重新同步失败: ${(exc as Error).message}` });
+    }
+  });
+
   app.post("/api/bugs/:id/skip", auth, async (req, res) => {
     if (!(await worker.skipBug(String(req.params.id)))) {
       res.status(404).json({ detail: "未找到该 bug" });

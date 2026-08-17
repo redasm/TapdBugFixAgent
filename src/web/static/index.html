@@ -149,6 +149,7 @@
     <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
     <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
     <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
+    <button id="btnResync" class="danger" title="清空全部本地处理记录（含已解决/跳过/失败历史与事件日志），中断当前处理，并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响">⟳ 清除并重新同步</button>
   </div>
 </header>
 
@@ -626,6 +627,34 @@ $('btnRetryFailed').onclick = async () => {
     toast(`已重置 ${r.retried} 个失败任务为待处理`);
     if ($('fState').value === 'failed') { $('fState').value = 'all'; }
     refresh();
+  }
+};
+
+// 清除并重新同步：本地记录全清（含终态历史与事件日志），从 Tapd 拉最新列表重置为待处理
+$('btnResync').onclick = async () => {
+  const st = SNAPSHOT.status || {};
+  const counts = st.counts || {};
+  const cur = st.current_bug ? `\n· 正在处理的 bug ${st.current_bug} 会被立即中断` : '';
+  if (!confirm(
+    `确定清除全部本地记录并从 Tapd 重新同步？\n` +
+    `· 将清空 ${st.jobs_total ?? '?'} 条本地记录（含已解决 ${counts.resolved ?? 0} / 失败 ${counts.failed ?? 0} / 跳过 ${counts.skipped ?? 0} 的历史与全部事件日志，不可恢复）\n` +
+    `· 清空后立即从 Tapd 拉取最新「分配给我」的 bug 列表，全部重置为待处理，开启状态下会从头按优先级重新处理` +
+    cur + `\n· p4 上已生成的 pending changelist 不受影响，但其关联记录会被清除`
+  )) return;
+  const btn = $('btnResync');
+  btn.disabled = true;
+  btn.textContent = '⟳ 同步中…';
+  try {
+    const r = await api('/api/resync', 'POST', {});
+    if (r) {
+      closeDrawer();
+      $('fState').value = 'all';
+      toast(`已清除 ${r.cleared} 条本地记录，从 Tapd 同步到 ${r.synced} 个 bug（待处理）`);
+      refresh();
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⟳ 清除并重新同步';
   }
 };
 

@@ -798,6 +798,34 @@ export class Worker {
     return failed.length;
   }
 
+  /** 清空全部本地记录并从 Tapd 强制重新同步（web「清除并重新同步」按钮）。
+   *  - 正在处理的 bug 会被中断（换新取消令牌，避免下一单被误取消）
+   *  - 本地 jobs/events 全删；Tapd 缓存作废后立即重拉最新列表
+   *  - 拉到的每个 bug 落一条 pending job（排除 Tapd 侧终态），worker 从头按优先级处理
+   *  返回 (清除的旧记录数, 新同步到的 bug 数)。p4 上已生成的 pending changelist
+   *  是服务器侧对象，不受影响；但本地与之关联的 changelist 号/描述记录会一并清掉。 */
+  async resyncFromTapd(): Promise<{ cleared: number; synced: number }> {
+    if (this.currentBugId !== null) this.cancelCurrentAttempt();
+    const cleared = this.store.deleteAllJobs();
+    this.resetTapdClients(); // 清缓存 + 断开旧 MCP 连接，强制下一次真实拉取
+    this.lastFetch = 0;
+    this.lastFetchResult = null;
+
+    const bugs = await this.fetchMyBugs(); // 缓存已作废，这里是真实重拉
+    let synced = 0;
+    for (const bug of bugs) {
+      if (this.config.exclude_status.includes(bug.status)) continue;
+      this.store.upsertJob(bug, { agent_state: "pending" });
+      synced += 1;
+    }
+    this.store.addEvent(
+      `人工清除并重新同步：清空 ${cleared} 条本地记录，从 Tapd 同步到 ${synced} 个 bug（已重置为待处理）`,
+      "warn",
+    );
+    this.wake(); // 立即唤醒工作循环（若有正在 sleep 的轮询）
+    return { cleared, synced };
+  }
+
   async skipBug(bugId: string): Promise<boolean> {
     const job = this.store.getJob(bugId);
     if (!job) {
