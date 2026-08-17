@@ -1,6 +1,6 @@
 {
   "name": "tapd-bugfix-agent",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Tapd Bug 自动修复 Agent（pi 编码 Agent + Perforce pending changelist + Web 管理台）",
   "type": "module",
   "bin": {

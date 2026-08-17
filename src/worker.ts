@@ -799,13 +799,16 @@ export class Worker {
   }
 
   /** 清空全部本地记录并从 Tapd 强制重新同步（web「清除并重新同步」按钮）。
-   *  - 正在处理的 bug 会被中断（换新取消令牌，避免下一单被误取消）
+   *  - 仅非运行状态可用（web 按钮已按控制态禁用；此处是后端的同一道闸，
+   *    拦住绕过 UI 直调 API 的情况）
    *  - 本地 jobs/events 全删；Tapd 缓存作废后立即重拉最新列表
    *  - 拉到的每个 bug 落一条 pending job（排除 Tapd 侧终态），worker 从头按优先级处理
    *  返回 (清除的旧记录数, 新同步到的 bug 数)。p4 上已生成的 pending changelist
    *  是服务器侧对象，不受影响；但本地与之关联的 changelist 号/描述记录会一并清掉。 */
   async resyncFromTapd(): Promise<{ cleared: number; synced: number }> {
-    if (this.currentBugId !== null) this.cancelCurrentAttempt();
+    if (this.state === "running") {
+      throw new Error("运行中不可清除同步：请先停止自动处理（⏹ 关闭）");
+    }
     const cleared = this.store.deleteAllJobs();
     this.resetTapdClients(); // 清缓存 + 断开旧 MCP 连接，强制下一次真实拉取
     this.lastFetch = 0;

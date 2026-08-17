@@ -381,6 +381,13 @@ function renderStatus() {
   $('btnPause').disabled = !running;
   $('btnResume').disabled = running;
   $('btnStop').disabled = !running;
+  // 清除并重新同步只在非运行状态可用：运行中点了会中断当前 bug 且 worker 立刻
+  // 按新队列重跑，用户来不及看清后果。想用先「⏹ 关闭」（stopped 才是明确的停止意图）。
+  const rs = $('btnResync');
+  rs.disabled = running;
+  rs.title = running
+    ? '运行中不可用：请先「⏹ 关闭」停止自动处理，再清除并重新同步'
+    : '清空全部本地处理记录（含已解决/跳过/失败历史与事件日志），并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响';
 }
 
 function filtered() {
@@ -630,16 +637,21 @@ $('btnRetryFailed').onclick = async () => {
   }
 };
 
-// 清除并重新同步：本地记录全清（含终态历史与事件日志），从 Tapd 拉最新列表重置为待处理
+// 清除并重新同步：本地记录全清（含终态历史与事件日志），从 Tapd 拉最新列表重置为待处理。
+// 仅非运行状态可用（renderStatus 已按控制态禁用；此处再守一道，防 SSE 快照延迟的竞态）
 $('btnResync').onclick = async () => {
+  const st0 = SNAPSHOT.status || {};
+  if (st0.control === 'running') {
+    toast('运行中不可清除同步：请先「⏹ 关闭」停止自动处理', true);
+    return;
+  }
   const st = SNAPSHOT.status || {};
   const counts = st.counts || {};
-  const cur = st.current_bug ? `\n· 正在处理的 bug ${st.current_bug} 会被立即中断` : '';
   if (!confirm(
     `确定清除全部本地记录并从 Tapd 重新同步？\n` +
     `· 将清空 ${st.jobs_total ?? '?'} 条本地记录（含已解决 ${counts.resolved ?? 0} / 失败 ${counts.failed ?? 0} / 跳过 ${counts.skipped ?? 0} 的历史与全部事件日志，不可恢复）\n` +
-    `· 清空后立即从 Tapd 拉取最新「分配给我」的 bug 列表，全部重置为待处理，开启状态下会从头按优先级重新处理` +
-    cur + `\n· p4 上已生成的 pending changelist 不受影响，但其关联记录会被清除`
+    `· 清空后立即从 Tapd 拉取最新「分配给我」的 bug 列表，全部重置为待处理；点「▶ 开启」后会从头按优先级重新处理\n` +
+    `· p4 上已生成的 pending changelist 不受影响，但其关联记录会被清除`
   )) return;
   const btn = $('btnResync');
   btn.disabled = true;
