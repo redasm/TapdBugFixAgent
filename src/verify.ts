@@ -11,18 +11,26 @@ import type { OpenedFile, P4Client } from "./p4.js";
 
 export class VerificationError extends Error {}
 
-/** 确保 Agent 的改动都在 p4 中打开，返回 opened 列表。 */
+/** 确保 Agent 的改动都在 p4 中打开，返回 opened 列表。
+ *  只收集 default changelist 的文件：pending changelist 的 Files 列表只允许
+ *  default 里的文件（p4 change 规范），编号 changelist 是其它 bug 的产物。 */
 export async function checkAndPrepareP4(p4: P4Client): Promise<OpenedFile[]> {
-  const opened = await p4.opened();
+  const opened = await p4.opened("default");
   const preview = await p4.reconcilePreview();
 
   if (!opened.length && !preview.trim()) {
-    throw new VerificationError("Agent 未打开任何文件（未产生改动，或遗漏 p4 edit）");
+    const elsewhere = (await p4.opened()).filter((o) => o.changelist !== "default");
+    const hint = elsewhere.length
+      ? `（另有 ${elsewhere.length} 个文件开在编号 changelist ` +
+        [...new Set(elsewhere.map((o) => o.changelist))].join(", ") +
+        "——那是其它 bug 的 pending changelist，或 Agent 违规使用了 p4 change；本工具只收集 default changelist 的改动）"
+      : "（未产生改动，或遗漏 p4 edit）";
+    throw new VerificationError("Agent 未在 default changelist 打开任何文件" + hint);
   }
 
   if (preview.trim()) {
     await p4.reconcile();
-    const openedAfter = await p4.opened();
+    const openedAfter = await p4.opened("default");
     if (!openedAfter.length) {
       throw new VerificationError("reconcile 后仍无 opened 文件");
     }

@@ -28,6 +28,8 @@ export interface WorkspaceConfig {
   owner: string;
   repos: RepoConfig[];
   default_repo: string;
+  /** @deprecated 已废弃：Tapd 单子状态不再自动修改（人工 review/submit 后自行处理）。
+   *  字段仅为兼容旧 config.yaml 保留解析，运行期不读。 */
   comment_status: string;
 }
 

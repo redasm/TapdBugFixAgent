@@ -173,6 +173,77 @@ export class Worker {
     return ws ?? this.config.workspaces[0];
   }
 
+  /** 从本地 job 行重建 Bug 快照（title/priority 等在 upsertJob 时已落库）。
+   *  用于已不在 Tapd「分配给我」列表里的 bug：它们仍要可见、可重试、可处理，
+   *  否则人工点重试后既看不到行、worker 也永远不领——表现为「重试没生效」。 */
+  private bugFromJobSnapshot(job: Record<string, unknown>): Bug {
+    const id = String(job.bug_id);
+    return {
+      id,
+      workspace_id: String(job.workspace_id ?? this.config.workspaces[0]?.workspace_id ?? ""),
+      title: String(job.title ?? `Bug ${id}`),
+      description: "",
+      status: String(job.tapd_status ?? ""),
+      priority: String(job.priority ?? ""),
+      priority_label: String(job.priority_label ?? ""),
+      severity: "",
+      module: "",
+      current_owner: "",
+      reporter: "",
+      created: String(job.started_at ?? ""),
+      raw: {},
+    };
+  }
+
+  /** 按 id 直拉单个 bug，区分三种结果：
+   *  - found：Tapd 返回真实数据（在「我的」列表或直拉成功且非空壳）
+   *  - missing：Tapd 确认无此单 —— REST/MCP 对不存在的 id 都返回「只有 id 的空壳」
+   *    （无标题无状态），以此与真实单区分（Tapd 真实单必有标题）
+   *  - unknown：接口异常（网络/鉴权波动），无法判断，调用方不得据此丢弃任务 */
+  private async fetchBugVerbose(
+    bugId: string,
+  ): Promise<{ kind: "found"; bug: Bug } | { kind: "missing" } | { kind: "unknown" }> {
+    const inList = (await this.fetchMyBugs()).find((b) => b.id === bugId);
+    if (inList) return { kind: "found", bug: inList };
+    try {
+      const ws = this.config.workspaces[0];
+      const bug = await this.tapd(ws).getBug(bugId);
+      if (!bug.title.trim() && !bug.status.trim()) return { kind: "missing" };
+      return { kind: "found", bug };
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
+  /** 兼容旧签名：拿得到就返回 Bug，否则 null（web 详情 / 人工操作用）。 */
+  private async fetchBugForManual(bugId: string): Promise<Bug | null> {
+    const res = await this.fetchBugVerbose(bugId);
+    return res.kind === "found" ? res.bug : null;
+  }
+
+  /** 本地 job → 可处理的 Bug。Tapd 上已确认不存在时自动转 skipped（留痕）并返回 null。 */
+  private async bugFromJob(job: Record<string, unknown>): Promise<Bug | null> {
+    const snapshot = this.bugFromJobSnapshot(job);
+    const res = await this.fetchBugVerbose(snapshot.id);
+    if (res.kind === "found") return res.bug;
+    if (res.kind === "missing") {
+      // Tapd 已无此单（删除/转移工作区）：没有描述的快照不值得喂给 agent，
+      // 自动跳过并留痕；本地记录保留（changelist/失败证据仍在管理台可见）
+      this.store.updateJob(snapshot.id, {
+        agent_state: "skipped",
+        failure_reason: "Tapd 单已不存在（可能已删除或转移），自动跳过",
+        finished_at: nowStr(),
+      });
+      this.store.addEvent(
+        "Tapd 上已不存在该 bug（可能已删除或转移工作区），自动跳过处理",
+        "warn",
+        snapshot.id,
+      );
+      return null;
+    }
+    return snapshot; // unknown（接口波动）：用快照留在队列，下次轮询再确认
+  }
+
   private async fetchMyBugs(): Promise<Bug[]> {
     const now = Date.now();
     if (this.lastFetchResult !== null && now - this.lastFetch < _FETCH_CACHE_MS) {
@@ -193,16 +264,29 @@ export class Worker {
     return bugs;
   }
 
-  /** 分配给我的、未处理的 bug，按优先级排序（数字小优先，再按创建时间）。 */
+  /** 分配给我的、未处理的 bug，按优先级排序（数字小优先，再按创建时间）。
+   *  除 Tapd「我的」列表外，还并入本地 pending 但已不在该列表的 bug（改派/翻页遗漏/
+   *  接口波动）：人工重试后必须仍会被处理。Tapd 侧已终态（resolved/closed 等）的不复活。 */
   async fetchActionable(): Promise<Bug[]> {
     const bugs = await this.fetchMyBugs();
     const actionable: Bug[] = [];
+    const seen = new Set<string>();
     for (const b of bugs) {
+      seen.add(b.id);
       if (this.config.exclude_status.includes(b.status)) continue;
       const job = this.store.getJob(b.id);
       if (job?.agent_state && _TERMINAL_STATES.has(String(job.agent_state))) continue; // 终态不自动重试
       if (job?.agent_state === "in_progress") continue; // 正在处理（防重入）
       actionable.push(b);
+    }
+    for (const job of this.store.listJobs("pending")) {
+      const id = String(job.bug_id);
+      if (seen.has(id)) continue;
+      if (this.config.exclude_status.includes(String(job.tapd_status ?? ""))) continue; // 快照终态不复活
+      const bug = await this.bugFromJob(job); // Tapd 已确认无此单时这里会自动转 skipped
+      if (!bug) continue;
+      if (this.config.exclude_status.includes(bug.status)) continue; // Tapd 直拉到终态也不复活
+      actionable.push(bug);
     }
     actionable.sort((a, b) => {
       const byPriority = priorityRank(this.config, a) - priorityRank(this.config, b);
@@ -256,12 +340,13 @@ export class Worker {
     return repos[0];
   }
 
-  private async llmReview(p4: P4Client, bug: Bug): Promise<void> {
-    const diff = await p4.diffUnified();
+  private async llmReview(p4: P4Client, bug: Bug, depotFiles: string[]): Promise<void> {
+    const diff = await p4.diffUnified(depotFiles);
     if (!diff.trim()) return;
     const prompt =
       `请审查以下针对 Tapd Bug 的代码改动，判断：1) 是否确实针对该 bug；` +
-      `2) 是否修改了无关范围；3) 是否有明显错误。\n` +
+      `2) 是否修改了无关范围；3) 是否有明显错误；4) 改动涉及的异步/事件/清理路径是否违反常见缺陷模式` +
+      `（超时却退出码0、异步状态当同步用、清理只发信号不等停稳、监听器异常破坏分发链）。\n` +
       `Bug 标题: ${bug.title}\nBug 描述: ${truncate(bug.description, 1000)}\n改动 diff:\n${diff.slice(0, 8000)}\n` +
       `只输出一行: FINAL_RESULT: {"approved": true 或 false, "note": "中文说明"}`;
     const agent = new PiAgent(this.config);
@@ -299,6 +384,17 @@ export class Worker {
       if (stale.length) {
         this.store.addEvent(`已撤销上一次尝试遗留的打开文件 ${stale.length} 项`, "warn", bug.id);
       }
+      // 其它 bug 失败尝试遗留的 default 文件不撤销（那是别人的劳动成果）：它们会被并入
+      // 本次 pending changelist，描述与事件里都有迹可循，人工 review 时可甄别。
+      const debris = (await p4.opened("default")).map((o) => o.depot).filter((f) => !stale.includes(f));
+      if (debris.length) {
+        this.store.addEvent(
+          `default changelist 有 ${debris.length} 个其它失败尝试遗留的打开文件，将并入本次 changelist 供人工 review: ` +
+            debris.join(", ").slice(0, 500),
+          "warn",
+          bug.id,
+        );
+      }
 
       await p4.sync();
       this.store.addEvent("p4 sync 完成", "info", bug.id);
@@ -328,11 +424,30 @@ export class Worker {
       }
 
       // ---- 验证门 ----
-      let opened: OpenedFile[] = [];
+      let opened: OpenedFile[] | null = null;
       let testOut = "";
+      if (!hasCodeChanges(result) && !hasManualAssets(result)) {
+        // 回归：Agent 实际改了代码，但最终输出没按格式给出可解析的 FINAL_RESULT
+        // （网关把原生工具调用协议泄进文本、代码块未闭合等）时，曾被直接判「未产出
+        // 任何改动」而失败，已完成的修复被丢在 default changelist 里无人认领。
+        // 这里按 p4 事实采纳改动，保住已完成的工作。
+        opened = await checkAndPrepareP4(p4).catch(() => null);
+        if (opened && opened.length) {
+          result.changed_files = opened.map((o) => o.depot);
+          result.summary =
+            result.summary || "(Agent 最终输出未解析出结构化结果，改动清单按 p4 打开文件采纳)";
+          this.store.addEvent(
+            "Agent 输出缺少可解析的 FINAL_RESULT，已按 p4 打开文件采纳改动",
+            "warn",
+            bug.id,
+          );
+        }
+      }
       if (hasCodeChanges(result)) {
-        opened = await checkAndPrepareP4(p4);
-        if (this.config.llm_review) await this.llmReview(p4, bug);
+        opened = opened && opened.length ? opened : await checkAndPrepareP4(p4);
+        if (this.config.llm_review) {
+          await this.llmReview(p4, bug, opened.map((o) => o.depot));
+        }
         const test = await runTests(repo.path, repo.test_cmd);
         testOut = test.output;
         if (!test.ok) throw new Error("测试未通过: " + test.output.slice(-400));
@@ -350,14 +465,17 @@ export class Worker {
         : "manual_only";
 
       // ---- 生成 pending changelist ----
-      const files = opened.map((o) => o.depot);
+      // opened 来自 checkAndPrepareP4（只含 default changelist 文件）；pending 的 Files
+      // 列表只允许 default 里的文件，编号 changelist 的文件混进来 p4 change -i 必报
+      // "Can't include file(s) not already opened"
+      const files = [...new Set((opened ?? []).map((o) => o.depot))];
       const desc = buildDescription(bug, result, testOut, [
         "本 changelist 由 TapdBugFixAgent 自动生成，请人工 review 后提交",
       ]);
       let cl: number | null = null;
       if (state === "resolved" || state === "partial") {
-        // 只把当前 bug 的 opened 文件放进新 changelist；default 里其它遗留文件不混入
-        cl = await p4.createPending(desc, opened.map((o) => o.depot));
+        // 只把 default changelist 里本次收集到的文件放进新 changelist
+        cl = await p4.createPending(desc, files);
         this.store.addEvent(`已创建 pending changelist ${cl}`, "info", bug.id);
       }
 
@@ -379,27 +497,36 @@ export class Worker {
       this.store.addEvent(`完成（${state}）` + (cl ? `，changelist ${cl}` : ""), "info", bug.id);
     } catch (exc) {
       if (exc instanceof AgentCancelledError) {
-        // 人工暂停/关闭：回到待处理队列（可重试），不算失败，不回写 Tapd；
-        // 记录遗留的 default 打开文件，恢复/重试时由 cleanupStaleAttempt 撤销
+        // 人工暂停/关闭/重试/跳过中断了本次尝试。只有状态仍是 in_progress（全局暂停/
+        // 关闭）才回退 pending；人工重试/跳过已先把状态改成 pending/skipped，尊重人工
+        // 设置，绝不能覆盖（回归：跳过正在跑的 bug 后，跑完的写回曾把 skipped 盖掉）。
         await this.recordAttemptEnd(bug.id, p4);
-        this.store.updateJob(bug.id, { agent_state: "pending", failure_reason: null, finished_at: null });
-        this.store.addEvent("处理被人工中断（暂停/关闭），bug 回到待处理队列", "warn", bug.id);
+        const st = String(this.store.getJob(bug.id)?.agent_state ?? "");
+        if (st === "in_progress" || st === "") {
+          this.store.updateJob(bug.id, { agent_state: "pending", failure_reason: null, finished_at: null });
+          this.store.addEvent("处理被人工中断（暂停/关闭），bug 回到待处理队列", "warn", bug.id);
+        } else {
+          this.store.addEvent(`处理被人工中断，保留人工设置的状态（${st}）`, "warn", bug.id);
+        }
       } else {
         await this.handleFailure(bug, exc, p4, lastResult);
       }
     }
   }
 
+  /** Tapd 回写：只发评论，**绝不自动修改单子状态**——状态由人工 review 并 submit
+   *  后自行处理（comment_status 配置已废弃，不再生效）。 */
   private async notifyTapd(
     bug: Bug, state: string, cl: number | null, result: AgentResult,
   ): Promise<void> {
     const ws = this.workspaceOf(bug);
     const client = this.tapd(ws);
-    const lines = ["[TapdBugFixAgent] 自动修复完成。"];
-    if (state === "resolved") lines.push("状态: 已解决（代码已修复并验证）");
-    else if (state === "partial") lines.push("状态: 部分完成（代码已修复，部分资源需人工处理）");
-    else if (state === "manual_only") lines.push("状态: 该单为资源类修改，需人工处理（无代码改动）");
-    if (cl) lines.push(`Perforce pending changelist: ${cl}`);
+    const lines = ["[TapdBugFixAgent] 自动修复完成，待人工 review。"];
+    if (state === "resolved") lines.push("结果: 代码已修复并验证（代码在 pending changelist 中，提交由人工执行）");
+    else if (state === "partial") lines.push("结果: 代码已修复，部分资源需人工处理");
+    else if (state === "manual_only") lines.push("结果: 该单为资源类修改，需人工处理（无代码改动）");
+    if (cl) lines.push(`Perforce pending changelist: ${cl}（请 review 后人工 submit）`);
+    lines.push("Tapd 状态未修改：请 review 代码并提交后自行更新单子状态。");
     if (result.manual_assets.length) {
       lines.push("需人工处理的资源:");
       for (const a of result.manual_assets) {
@@ -409,17 +536,7 @@ export class Worker {
     lines.push("修复说明: " + (result.summary || "(无)"));
     try {
       await client.addComment(bug.id, lines.join("\n"));
-      if ((state === "resolved" || state === "partial") && ws.comment_status) {
-        await client.updateBug(bug.id, { status: ws.comment_status });
-      }
-      this.store.addEvent(
-        "已回写 Tapd 评论" +
-        ((state === "resolved" || state === "partial") && ws.comment_status
-          ? `，状态 -> ${ws.comment_status}`
-          : ""),
-        "info",
-        bug.id,
-      );
+      this.store.addEvent("已回写 Tapd 评论（单子状态不自动修改）", "info", bug.id);
     } catch (exc) {
       this.store.addEvent(`回写 Tapd 失败: ${exc}`, "error", bug.id);
     }
@@ -440,18 +557,32 @@ export class Worker {
     return loads<string[]>(job.last_attempt_files as string, []);
   }
 
-  /** 撤销上一次尝试遗留的打开文件，返回撤销列表；成功则清空记录。 */
+  /** 撤销上一次尝试遗留的打开文件，返回撤销列表；成功则清空记录。
+   *  只碰「仍开在 default changelist」的文件：遗留文件可能已被并入某个编号
+   *  pending changelist（其它 bug 的产物），p4 revert 连编号 changelist 里的改动
+   *  也会一并丢弃，必须先对照当前 opened 状态确认，绝不盲撤。 */
   private async cleanupStaleAttempt(bugId: string, p4: P4Client): Promise<string[]> {
     const files = this.lastAttemptFiles(bugId);
     if (!files.length) return [];
+    let inDefault = new Set<string>();
     try {
-      await p4.revert(files);
+      inDefault = new Set((await p4.opened("default")).map((o) => o.depot));
+    } catch {
+      // 查询失败则空集 → 不撤（宁可不清理也不误杀编号 changelist 的改动）
+    }
+    const toRevert = files.filter((f) => inDefault.has(f));
+    if (!toRevert.length) {
+      this.store.updateJob(bugId, { last_attempt_files: null });
+      return [];
+    }
+    try {
+      await p4.revert(toRevert);
     } catch (exc) {
       this.store.addEvent(`撤销上一次尝试的打开文件失败（交由 Agent 处理）: ${exc}`, "warn", bugId);
       return [];
     }
     this.store.updateJob(bugId, { last_attempt_files: null });
-    return files;
+    return toRevert;
   }
 
   /** 记录当前尝试结束后遗留的 default 打开文件（只记 default：Agent 禁止 p4 change，
@@ -460,7 +591,7 @@ export class Worker {
     let files: string[] = [];
     if (p4) {
       try {
-        files = (await p4.opened())
+        files = (await p4.opened("default"))
           .filter((o) => o.changelist === "default")
           .map((o) => o.depot);
       } catch {
@@ -554,13 +685,27 @@ export class Worker {
     return item;
   }
 
-  /** 管理台列表：Tapd 上分配给我的有效 bug + 本地处理状态，按优先级排序。 */
+  /** 管理台列表：Tapd 上分配给我的有效 bug + 本地处理状态，按优先级排序。
+   *  本地有记录但已不在 Tapd「我的」列表的 bug 也展示（标 tapd_missing），
+   *  否则人工重试后该行直接从页面消失，看起来就像「重试没生效」。 */
   async listBugsForWeb(): Promise<Record<string, unknown>[]> {
     const ranked: Array<Record<string, unknown>> = [];
+    const seen = new Set<string>();
     for (const b of await this.fetchMyBugs()) {
       if (this.config.exclude_status.includes(b.status)) continue;
+      seen.add(b.id);
       const row = this.jobRow(b);
-      (row as Record<string, unknown>)._rank = priorityRank(this.config, b);
+      row._rank = priorityRank(this.config, b);
+      ranked.push(row);
+    }
+    for (const job of this.store.listJobs()) {
+      const id = String(job.bug_id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const bug = this.bugFromJobSnapshot(job);
+      const row = this.jobRow(bug);
+      row.tapd_missing = true; // 前端打「不在 Tapd 列表」标
+      row._rank = priorityRank(this.config, bug);
       ranked.push(row);
     }
     ranked.sort((a, b) => {
@@ -602,15 +747,29 @@ export class Worker {
   // ------------------------------------------------------------------
   // 人工操作（web）
   // ------------------------------------------------------------------
-  private async fetchBugForManual(bugId: string): Promise<Bug | null> {
-    const bug = (await this.fetchMyBugs()).find((b) => b.id === bugId);
-    if (bug) return bug;
-    try {
-      const ws = this.config.workspaces[0];
-      return await this.tapd(ws).getBug(bugId);
-    } catch {
-      return null;
-    }
+  /** 重置 job 为全新待处理状态（单 bug 重试与「重试全部失败」共用）。
+   *  last_attempt_files 有意保留：cleanupStaleAttempt 要靠它撤销遗留打开文件。 */
+  private resetJobForRetry(bugId: string): void {
+    this.store.updateJob(bugId, {
+      agent_state: "pending",
+      attempts: 0,
+      failure_reason: null,
+      changelist: null,
+      generated_description: null,
+      files: null,
+      manual_assets: null,
+      finished_at: null,
+      retry_evidence: null,
+    });
+  }
+
+  /** 中断当前正在处理的尝试（如果重试/跳过的恰是正在跑的 bug）。
+   *  注意必须立刻换一个新 CancelEvent：在跑的 agent 持有旧事件引用（set 即取消），
+   *  后续 bug 领的是 this.cancelEvent——不换的话下一个 bug 会被瞬间误取消。 */
+  private cancelCurrentAttempt(): void {
+    if (this.currentBugId === null) return;
+    this.cancelEvent.set();
+    this.cancelEvent = new CancelEvent();
   }
 
   async retryBug(bugId: string): Promise<boolean> {
@@ -621,18 +780,22 @@ export class Worker {
       this.store.addEvent(`人工触发处理 bug ${bugId}`, "info", bugId);
       return true;
     }
-    this.store.updateJob(bugId, {
-      agent_state: "pending",
-      attempts: 0,
-      failure_reason: null,
-      changelist: null,
-      generated_description: null,
-      files: null,
-      manual_assets: null,
-      finished_at: null,
-    });
+    if (this.currentBugId === bugId) this.cancelCurrentAttempt(); // 正在跑：先中断本次尝试
+    this.resetJobForRetry(bugId);
     this.store.addEvent(`人工触发重试 bug ${bugId}`, "info", bugId);
     return true;
+  }
+
+  /** 把所有 failed 任务重置为待处理（web「重试全部失败」按钮）。返回重置数量。 */
+  retryAllFailed(): number {
+    const failed = this.store.listJobs("failed");
+    for (const job of failed) {
+      this.resetJobForRetry(String(job.bug_id));
+    }
+    if (failed.length) {
+      this.store.addEvent(`人工重试全部失败任务（${failed.length} 个，已重置为待处理）`, "info");
+    }
+    return failed.length;
   }
 
   async skipBug(bugId: string): Promise<boolean> {
@@ -645,6 +808,7 @@ export class Worker {
       this.store.addEvent(`人工跳过 bug ${bugId}（未处理，不再自动处理）`, "info", bugId);
       return true;
     }
+    if (this.currentBugId === bugId) this.cancelCurrentAttempt(); // 正在跑：先中断，否则跑完会覆盖 skipped
     this.store.updateJob(bugId, { agent_state: "skipped", finished_at: nowStr() });
     this.store.addEvent(`人工跳过 bug ${bugId}`, "info", bugId);
     return true;

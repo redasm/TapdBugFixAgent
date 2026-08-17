@@ -166,6 +166,12 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
     res.json({ ok: true });
   });
 
+  // 重试全部失败任务：重置为待处理并入队（开启状态下按优先级重新处理）
+  app.post("/api/retry-failed", auth, (_req, res) => {
+    const retried = worker.retryAllFailed();
+    res.json({ ok: true, retried });
+  });
+
   app.post("/api/bugs/:id/skip", auth, async (req, res) => {
     if (!(await worker.skipBug(String(req.params.id)))) {
       res.status(404).json({ detail: "未找到该 bug" });

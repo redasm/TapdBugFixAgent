@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import type { Config, PiConfig } from "./config.js";
 import { p4EnvFromConfig } from "./p4.js";
 import type { AgentResult, Bug, RetryEvidenceEntry } from "./models.js";
@@ -85,16 +86,24 @@ function contentText(content: unknown): string {
   return parts.join("").trim();
 }
 
-/** 把一条 pi JSONL 事件行转成人类可读的进度消息；无关行返回 undefined。
+export type ParsedProgress =
+  | { kind: "text"; text: string }
+  | { kind: "event"; msg: string };
+
+/** 把一条 pi JSONL 事件行解析成进度项；无关行返回 undefined。
  *
- * pi 真实事件形状（pi-agent-core 确认）：
- * - tool_execution_start: { type, toolName, args }
- * - tool_execution_end:   { type, toolName, result }
- * - message_update:       { type, message: { content:[...] },
- *                          assistantMessageEvent: { type:"text_delta", delta } }
- *   文本增量在 assistantMessageEvent.delta，累计全文在 message.content。
+ *  kind="text"：message_update 的文本增量（PiAgent 会把相邻增量合并后再上报，
+ *  避免逐 token 落库把事件表刷爆——实测一次修复曾产生 2 万条 debug 事件）。
+ *  kind="event"：工具调用等自成一条的进度消息。
+ *
+ *  pi 真实事件形状（pi-agent-core 确认）：
+ *  - tool_execution_start: { type, toolName, args }
+ *  - tool_execution_end:   { type, toolName, result }
+ *  - message_update:       { type, message: { content:[...] },
+ *                           assistantMessageEvent: { type:"text_delta", delta } }
+ *    文本增量在 assistantMessageEvent.delta，累计全文在 message.content。
  */
-export function progressFromLine(line: string): string | undefined {
+export function parseProgress(line: string): ParsedProgress | undefined {
   const t = line.trim();
   if (!t) return undefined;
   let d: Record<string, unknown>;
@@ -109,7 +118,7 @@ export function progressFromLine(line: string): string | undefined {
     const args = (d.args ?? {}) as ToolArgs;
     const target =
       args.file_path ?? args.command ?? args.pattern ?? args.path ?? args.query ?? args.cwd ?? "";
-    return `Agent: ${tool} ${String(target).slice(0, 120)}`;
+    return { kind: "event", msg: `Agent: ${tool} ${String(target).slice(0, 120)}` };
   }
   if (type === "tool_execution_end") {
     const tool = String(d.toolName ?? "");
@@ -122,7 +131,7 @@ export function progressFromLine(line: string): string | undefined {
       const content = (result as { content?: unknown }).content;
       summary = contentText(content).slice(0, 60);
     }
-    return `Agent: ${tool} 完成${summary ? ` · ${summary}` : ""}`;
+    return { kind: "event", msg: `Agent: ${tool} 完成${summary ? ` · ${summary}` : ""}` };
   }
   if (type === "message_update") {
     // 只关心文本更新；thinking 增量太吵，跳过
@@ -135,10 +144,21 @@ export function progressFromLine(line: string): string | undefined {
     const full = contentText((d.message as { content?: unknown } | undefined)?.content);
     const delta =
       ev.type === "text_end" ? String(ev.content ?? "") : String(ev.delta ?? "");
-    const show = delta.trim() || full;
-    if (show) return `Agent: ${show.slice(-160)}`;
+    // 保留原文（含换行——PiAgent 靠它判断冲刷时机），清洗放到格式化时做
+    const raw = delta.trim() ? delta : full;
+    if (raw && raw.trim()) return { kind: "text", text: raw };
+    return undefined;
   }
   return undefined;
+}
+
+/** 单行进度的格式化视图（兼容旧用法/测试）：文本增量格式化为 "Agent: <文本>"。 */
+export function progressFromLine(line: string): string | undefined {
+  const p = parseProgress(line);
+  if (!p) return undefined;
+  return p.kind === "text"
+    ? `Agent: ${p.text.replace(/\s+/g, " ").trim().slice(-160)}`
+    : p.msg;
 }
 
 /** 从 agent_end 事件的 messages 里拼出最终 assistant 文本。 */
@@ -189,36 +209,102 @@ export function extractFinalText(lines: string[]): string {
 // ---------------------------------------------------------------------------
 function stripCodeFence(seg: string): string {
   let s = seg.trim();
-  if (s.startsWith("```")) s = s.split("\n", 1)[1] ?? "";
-  if (s.trimEnd().endsWith("```")) s = s.slice(0, s.lastIndexOf("```"));
+  // 回归：这里曾写成 s.split("\n", 1)[1]——JS 的 split 带 limit 时结果数组只有 1 个
+  // 元素，[1] 恒为 undefined，导致 ```json 围栏后的 JSON 整段变空串、解析必败。
+  if (s.startsWith("```")) s = s.slice(s.indexOf("\n") + 1); // 去掉 ```json 开栏行
+  const close = s.lastIndexOf("```");
+  if (close !== -1) s = s.slice(0, close); // 去掉闭栏
   return s.trim();
 }
 
-/** 从 Agent 输出中提取最后的 FINAL_RESULT JSON（或最后一个 json 代码块）。 */
+/** 从 s[start]（须位于 '{'）做括号配平扫描，返回完整 JSON 对象子串。
+ *  字符串/转义感知：字符串里的 '{' '}' '"' 不影响配平；未配平返回 undefined。
+ *  用来容忍模型输出里 JSON 之后拖着的协议标签残渣（如网关泄漏的 </｜｜DSML｜｜...>）。 */
+function balancedJsonAt(s: string, start: number): string | undefined {
+  if (s[start] !== "{") return undefined;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return undefined;
+}
+
+const RESULT_KEYS = ["summary", "changed_files", "manual_assets", "blocked_reasons"];
+
+function looksLikeResult(obj: Record<string, unknown>): boolean {
+  return RESULT_KEYS.some((k) => k in obj);
+}
+
+/** DeepSeek 系网关会把原生工具调用协议泄进文本，JSON 常被整体转义成
+ *  {\"summary\": ...}（此时原文里的引号全被 \ 前置，字符串永不闭合）。 */
+function unescapeJsonIsh(s: string): string {
+  return s.includes('\\"') ? s.replace(/\\"/g, '"').replace(/\\\\/g, "\\") : s;
+}
+
+/** 在一段文本里找首个可解析的结果 JSON：按原文配平→解析；失败再对反转义文本配平→解析。 */
+function resultJsonFromSegment(seg: string): Record<string, unknown> | undefined {
+  for (const candidate of [seg, unescapeJsonIsh(seg)]) {
+    const brace = candidate.indexOf("{");
+    if (brace === -1) continue;
+    const obj = parseResultJson(balancedJsonAt(candidate, brace) ?? "");
+    if (obj) return obj;
+  }
+  return undefined;
+}
+
+/** 解析候选 JSON 串。 */
+function parseResultJson(raw: string): Record<string, unknown> | undefined {
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+      return obj as Record<string, unknown>;
+    }
+  } catch {
+    // 不是合法 JSON
+  }
+  return undefined;
+}
+
+/** 从 Agent 输出中提取最后的 FINAL_RESULT JSON。
+ *  三级回退（都要能扛住输出尾部混入的协议标签/杂项文本）：
+ *  1. FINAL_RESULT: 标记后的首个配平 JSON 对象（stripCodeFence 修好后围栏也认）；
+ *  2. 最后一个 json 代码块里的配平 JSON；
+ *  3. 从文本尾部向前找每个 '{' 的配平 JSON，且必须长得像结果对象（有些网关把
+ *     FINAL_RESULT 标记本身也吞掉，但结果 JSON 总在输出的最后）。 */
 export function extractFinalJson(text: string): Record<string, unknown> | undefined {
   if (!text) return undefined;
   const idx = text.lastIndexOf(FINAL_MARKER);
   if (idx !== -1) {
-    const seg = stripCodeFence(text.slice(idx + FINAL_MARKER.length));
-    try {
-      const obj = JSON.parse(seg);
-      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
-        return obj as Record<string, unknown>;
-      }
-    } catch {
-      // 继续回落
-    }
+    const obj = resultJsonFromSegment(stripCodeFence(text.slice(idx + FINAL_MARKER.length)));
+    if (obj) return obj;
   }
   const blockRe = /```(?:json)?\s*(.*?)```/gs;
   const blocks = [...text.matchAll(blockRe)];
   for (let i = blocks.length - 1; i >= 0; i--) {
-    try {
-      const obj = JSON.parse(blocks[i][1].trim());
-      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
-        return obj as Record<string, unknown>;
-      }
-    } catch {
-      // continue
+    const obj = resultJsonFromSegment(blocks[i][1].trim());
+    if (obj) return obj;
+  }
+  for (const tail of [text.slice(-4000), unescapeJsonIsh(text.slice(-4000))]) {
+    for (let i = tail.length - 1; i >= 0; i--) {
+      if (tail[i] !== "{") continue;
+      const cand = balancedJsonAt(tail, i);
+      if (!cand) continue;
+      const obj = parseResultJson(cand);
+      if (obj && looksLikeResult(obj)) return obj;
     }
   }
   return undefined;
@@ -262,6 +348,31 @@ export function resultFromOutput(text: string, exitCode: number): AgentResult {
 // ---------------------------------------------------------------------------
 // prompt 模板
 // ---------------------------------------------------------------------------
+/** 修复守则（防御性模式）：来自 deepseek-harness 的实际缺陷类别总结，按本仓库场景裁剪。
+ *  文件缺失时静默跳过（不阻断 prompt 构造）；src 与 dist 布局一致（../prompts）。 */
+const _PLAYBOOK_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "prompts",
+  "defensive-patterns.md",
+);
+let _playbookCache: string | undefined;
+let _playbookLoaded = false;
+
+function loadPlaybook(): string | undefined {
+  if (_playbookLoaded) return _playbookCache;
+  _playbookLoaded = true;
+  try {
+    const text = fs.readFileSync(_PLAYBOOK_PATH, "utf-8").trim();
+    // 去掉 frontmatter（如有）与首行标题，正文直接进 prompt
+    const body = text.replace(/^---[\s\S]*?---\s*/, "").replace(/^#\s*.*\n/, "").trim();
+    _playbookCache = body ? body.slice(0, 4000) : undefined;
+  } catch {
+    // 无守则文件 = 不注入（向后兼容）
+  }
+  return _playbookCache;
+}
+
 /** 把失败尝试的证据压缩成提示文本（跨轮只传压缩证据，不传 Agent 轨迹）。
  *  空数组返回 ""。 */
 export function formatRetryEvidence(entries: RetryEvidenceEntry[]): string {
@@ -292,6 +403,10 @@ export function buildFixPrompt(
   const evidenceSection = retryEvidence.trim()
     ? `\n# 上一次尝试的记录（自动重试参考）\n${retryEvidence.trim()}\n`
     : "";
+  const playbook = loadPlaybook();
+  const playbookSection = playbook
+    ? `\n# 修复守则（涉及异步/事件/生命周期/清理代码时必须对照）\n${playbook}\n`
+    : "";
   return `你是自动修复 Tapd Bug 的编码 Agent。请修复下面的 Bug。
 
 # Bug 信息
@@ -309,7 +424,7 @@ ${descText}
 4. 只把改动放进 default changelist。
 5. 涉及 prefab / 场景 / 图集 / 表格(xlsx/csv/bytes) / 其他二进制资源时，不要强行修改；把它们列入「需人工处理资源」清单并说明原因。
 6. 完成后不要提交。
-${evidenceSection}
+${evidenceSection}${playbookSection}
 # 定位要求
 - 如果仅凭标题/模块无法在代码中定位问题，或缺少关键信息（如复现步骤、日志），**不要臆测硬改**；把缺什么写进 blocked_reasons 并停止。
 - 优先在代码里搜索标题/模块相关的关键词来定位。
@@ -465,15 +580,29 @@ export class PiAgent {
     const errChunks: string[] = [];
     proc.stderr?.on("data", (d: Buffer) => (errChunks.push(d.toString())));
 
+    // 文本增量合并：message_update 的 text_delta 每个 token 一条，逐条上报会把事件表
+    // 刷爆（一次修复 2 万条 debug 事件）。攒到换行或 120 字符再发；工具事件直接透传。
+    let textBuf = "";
+    const flushText = () => {
+      const t = textBuf.replace(/\s+/g, " ").trim();
+      textBuf = "";
+      if (t) opts.onProgress?.(`Agent: ${t.slice(-160)}`);
+    };
     const onLine = (line: string) => {
       outLines.push(line);
-      if (opts.onProgress) {
-        try {
-          const msg = progressFromLine(line);
-          if (msg) opts.onProgress(msg);
-        } catch {
-          // 进度回调失败不影响主流程
+      if (!opts.onProgress) return;
+      try {
+        const p = parseProgress(line);
+        if (!p) return;
+        if (p.kind === "text") {
+          textBuf += p.text;
+          if (textBuf.includes("\n") || textBuf.length >= 120) flushText();
+        } else {
+          flushText();
+          opts.onProgress(p.msg);
         }
+      } catch {
+        // 进度回调失败不影响主流程
       }
     };
     const rl = readline.createInterface({ input: proc.stdout! });
@@ -509,6 +638,7 @@ export class PiAgent {
           return;
         }
         try {
+          flushText(); // 收尾：把缓冲里的最后一段文本进度发出去
           rl.close();
         } catch {
           // ignore
