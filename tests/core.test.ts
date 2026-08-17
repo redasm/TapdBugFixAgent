@@ -1304,16 +1304,22 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     expect(evs.some((e) => String(e.msg) === "旧事件")).toBe(false);
   });
 
-  it("resyncFromTapd 中断正在处理的 bug 并换新取消令牌", async () => {
+  it("resyncFromTapd 运行态拒绝（非运行才可用，后端同 UI 一道闸）", async () => {
     const w = makeWorker();
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, [bug]);
-    const oldEvt = w.cancelEvent;
-    w.currentBugId = bug.id;
-    await w.resyncFromTapd();
-    w.currentBugId = null;
-    expect(oldEvt.cancelled).toBe(true); // 旧令牌置位 = 中断在跑的尝试
-    expect(w.cancelEvent).not.toBe(oldEvt); // 换新令牌，后续 bug 不受影响
+    w.store.setControl("running");
+    await expect(w.resyncFromTapd()).rejects.toThrow(/运行中不可清除同步/);
+    // 记录未被清
+    expect(w.store.jobCount()).toBe(0); // 尚未 upsert，仍是 0；改为先建再拒绝验证
+    w.store.upsertJob(bug, { agent_state: "resolved" });
+    await expect(w.resyncFromTapd()).rejects.toThrow();
+    expect(w.store.jobCount()).toBe(1); // 拒绝时不动数据
+    // 停止后可用
+    w.store.setControl("stopped");
+    const r = await w.resyncFromTapd();
+    expect(r.synced).toBe(1);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("pending");
   });
 });
 
@@ -1919,6 +1925,14 @@ describe("web 前端 bug_id 内插引号", () => {
     expect(html).toContain("/api/resync");
     expect(html).toMatch(/btnResync[\s\S]{0,600}confirm\(/); // 破坏性操作必须有确认
     expect(html).toContain("同步中"); // 防重复点击的禁用态文案
+  });
+
+  it("清除并重新同步仅非运行状态可用（运行中禁用 + 点击防线）", () => {
+    // renderStatus 按控制态禁用
+    expect(html).toMatch(/rs\.disabled = running/);
+    // 点击处理器里再守一道（防 SSE 快照延迟竞态）
+    expect(html).toMatch(/st0\.control === 'running'/);
+    expect(html).toContain("请先「⏹ 关闭」停止自动处理");
   });
 
   it("api() 捕获网络错误并给出可见提示（回归：服务器重启窗口期点击毫无反馈）", () => {
