@@ -16,7 +16,7 @@ Tapd bug 单信息自动生成），并通过一个 **Web 管理台** 提供开�
 Tapd ──MCP(个人访问令牌)──> Orchestrator(worker) ──subprocess──> pi 编码 Agent
  Tapd ──REST(API账号)───>   │  │                              │
       ^                    │  └─ p4 edit/add ──────────────▶ Perforce workspace
-      └──── 评论/状态回写    │
+      └──── 评论回写      │
                             │
                   Web 管理台 (Express + SSE)  ←—— 启停/暂停/恢复/查看
 ```
@@ -119,7 +119,16 @@ npm run build && tapd-bugfix serve
 
 - Agent 只允许 `p4 edit / p4 add / p4 delete`，**禁止 `p4 submit / p4 revert / p4 sync / p4 change`**（写入 prompt）
 - 产出永远是 **pending changelist**，本工具**永不自动 submit**（`mode: auto` 目前同样只出 pending，需人工 review 后自行提交再回 Tapd 关单）
+- **Tapd 单子状态永不自动修改**（`comment_status` 已废弃）：修复完成后只发评论，状态由人工 review 代码、submit changelist 后在 Tapd 自行更新
 - `p4 reconcile -n` 兜底检测：若 Agent 改了文件却没 `p4 edit`，自动 `p4 reconcile` 打开，防止改动丢失
+
+## 修复守则（prompt 注入）
+
+`prompts/defensive-patterns.md` 是注入给编码 Agent 的防御性模式守则，整理自
+[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的实际缺陷类别总结（MIT），
+按本仓库场景裁剪为 4 条：正交结果独立上报、异步状态不是同步状态、清理必须完全停稳、分发器中
+隔离回调异常。文件在启动时读取并注入 prompt；删掉该文件即回退到无守则版本，无需改代码。
+构建时自动拷贝到 `dist/prompts/`。
 
 ## 目录结构
 

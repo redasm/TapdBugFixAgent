@@ -146,11 +146,17 @@ export class P4Client {
     throw lastErr;
   }
 
-  /** 返回打开的文件列表。 */
-  async opened(): Promise<OpenedFile[]> {
+  /** 返回打开的文件列表。changelist 传 "default" 只取 default changelist。
+   *  重要：创建 pending changelist 的 Files 列表只允许 default 里的文件——p4 change
+   *  规范明确 "Files: What opened files from the default changelist are to be
+   *  added"。之前不带 -c 把其它 bug 已生成的编号 changelist 里的文件也收进来，
+   *  p4 change -i 必报 "Can't include file(s) not already opened"，且成功越多失败越恒定。 */
+  async opened(changelist?: string): Promise<OpenedFile[]> {
     let out: string;
     try {
-      out = await this.run(["opened"]);
+      out = changelist
+        ? await this.run(["opened", "-c", changelist])
+        : await this.run(["opened"]);
     } catch {
       return [];
     }
@@ -169,10 +175,11 @@ export class P4Client {
     return result;
   }
 
-  /** default changelist 内改动的 unified diff。 */
-  async diffUnified(): Promise<string> {
+  /** 指定文件（不给则全部打开文件）的 unified diff。 */
+  async diffUnified(files?: string[]): Promise<string> {
     try {
-      return await this.run(["diff", "-du"]);
+      const args = files && files.length ? ["diff", "-du", ...files] : ["diff", "-du"];
+      return await this.run(args);
     } catch {
       return "";
     }
@@ -192,9 +199,11 @@ export class P4Client {
     return this.run(["reconcile"]);
   }
 
-  async revert(files: string[]): Promise<string> {
+  /** 撤销打开的文件。默认只撤 default changelist 里的（changelist 可显式指定）：
+   *  编号 changelist 是其它 bug 的成功产物，绝不能误撤（revert 会丢弃其全部改动）。 */
+  async revert(files: string[], changelist = "default"): Promise<string> {
     if (!files.length) return "";
-    return this.run(["revert", ...files]);
+    return this.run(["revert", "-c", changelist, ...files]);
   }
 
   async changeSpec(cl?: number): Promise<string> {

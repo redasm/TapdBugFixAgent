@@ -33,7 +33,7 @@ priority_weight:
 workspaces:
   - workspace_id: "1152729922"      # Tapd workspace_id（用 API 返回的为准）
     owner: "your_tapd_login"        # 你的 Tapd 登录名，用于 current_owner 过滤"分配给我的"
-    comment_status: resolved         # 修复后回写 Tapd 的状态（resolved=已解决·待提交）
+    # comment_status 已废弃：单子状态不自动修改，只发评论；状态由人工 review/submit 后自行处理
     default_repo: "product"          # 默认仓库名（无法按模块匹配时使用）
     repos:                           # bug 所属仓库的本地路径（p4 workspace root）
       - name: "product"

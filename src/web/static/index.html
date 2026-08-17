@@ -124,9 +124,14 @@
   #settingsMsg { font-size: 12px; color: var(--green); }
   #settingsMsg.err { color: var(--red); }
   .settings-note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+  /* 顶部浮动提示：操作结果 / 连接错误（此前网络失败完全静默，点重试像没反应） */
+  #toast { position: fixed; top: 66px; left: 50%; transform: translateX(-50%) translateY(-8px); background: var(--panel2); color: var(--green); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 100; max-width: 80vw; }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.err { color: var(--red); }
 </style>
 </head>
 <body>
+<div id="toast"></div>
 <header>
   <h1>🛠 TapdBugFixAgent</h1>
   <span id="controlBadge" class="badge stopped">stopped</span>
@@ -143,6 +148,7 @@
     <button id="btnPause" data-act="pause" class="ghost">⏸ 暂停</button>
     <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
     <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
+    <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
   </div>
 </header>
 
@@ -277,12 +283,30 @@ function authHeaders() {
   if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
   return h;
 }
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.className = ''; }, 4500);
+}
 async function api(path, method='GET', body) {
   const opts = { method, headers: authHeaders() };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(path, opts);
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch (e) {
+    // 服务器不可达（重启窗口期/进程挂了）：必须给出可见反馈，否则点按钮毫无反应
+    toast('无法连接服务器：' + (e.message || e), true);
+    return null;
+  }
   if (r.status === 401) { alert('未授权：token 不正确'); return null; }
-  if (!r.ok) { const t = await r.text().catch(()=>''); console.error(path, r.status, t); return null; }
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    toast(`请求失败(${r.status})：` + t.slice(0, 140), true);
+    return null;
+  }
   return r.json();
 }
 
@@ -334,6 +358,10 @@ function renderStatus() {
   $('stPartial').textContent = counts.partial||0;
   $('stManual').textContent = counts.manual_only||0;
   $('stFailed').textContent = counts.failed||0;
+  const failedN = counts.failed || 0;
+  const bf = $('btnRetryFailed');
+  bf.disabled = !failedN;
+  bf.textContent = failedN ? `↻ 重试全部失败 (${failedN})` : '↻ 重试全部失败';
   const running = c === 'running';
   $('btnStart').disabled = running;
   $('btnPause').disabled = !running;
@@ -383,7 +411,7 @@ function renderList() {
       row.dataset.id = String(it.bug_id);   // bug_id 是字符串（后端已保证），大整数不丢精度
       row.innerHTML = `
         <div class="mono">${it.bug_id}</div>
-        <div class="title" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</div>
+        <div class="title" title="${escapeHtml(it.title)}">${it.tapd_missing ? '<span class="muted" title="该 bug 已不在 Tapd「分配给我」列表（可能已改派/流转），显示为本地记录；重试仍可处理">⚠不在Tapd列表 </span>' : ''}${escapeHtml(it.title)}</div>
         <div>${escapeHtml(it.priority_label || it.priority || '-')}</div>
         <div><span class="badge ${it.agent_state || 'unprocessed'}">${it.agent_state ? (STATE_LABEL[it.agent_state] || it.agent_state) : '未处理'}</span></div>
         <div class="mono">${it.changelist ?? '-'}</div>
@@ -459,7 +487,7 @@ function renderDetail(job) {
       <dt>Tapd 状态</dt><dd>${escapeHtml(job.tapd_status || '-')}</dd>
       <dt>Tapd 链接</dt><dd><a href="${escapeHtml(job.url || '')}" target="_blank" rel="noopener">在 Tapd 打开 ↗</a></dd>
       <dt>开始/完成</dt><dd>${escapeHtml(job.started_at || '-')} → ${escapeHtml(job.finished_at || '-')}</dd>
-      ${job.failure_reason ? `<dt class="reason">失败原因</dt><dd class="reason">${escapeHtml(job.failure_reason)}</dd>` : ''}
+      ${job.failure_reason ? `<dt class="reason">${job.agent_state === 'skipped' ? '跳过原因' : '失败原因'}</dt><dd class="reason">${escapeHtml(job.failure_reason)}</dd>` : ''}
     </div>
     ${progressHTML(job)}
     ${retryHTML}
@@ -557,8 +585,36 @@ $('agentHead').addEventListener('click', (e) => {
   });
 })();
 
-async function actRetry(id) { await api('/api/bugs/' + id + '/retry', 'POST', {}); refresh(); selectBug(id); }
-async function actSkip(id) { await api('/api/bugs/' + id + '/skip', 'POST', {}); refresh(); selectBug(id); }
+async function actRetry(id) {
+  const r = await api('/api/bugs/' + id + '/retry', 'POST', {});
+  if (r) {
+    toast('已重置为待处理；开启状态下会按优先级自动重新处理');
+    // 若正盯着「失败」筛选，切回全部，否则该行移组后直接消失、看起来像没生效
+    if ($('fState').value === 'failed') { $('fState').value = 'all'; }
+  }
+  refresh(); selectBug(id);
+}
+async function actSkip(id) {
+  const r = await api('/api/bugs/' + id + '/skip', 'POST', {});
+  if (r) {
+    toast('已跳过（不再自动处理）');
+    if ($('fState').value !== 'all' && $('fState').value !== 'skipped') { $('fState').value = 'all'; }
+  }
+  refresh(); selectBug(id);
+}
+
+// 重试全部失败任务（顶部按钮）：重置所有 failed -> 待处理并入队
+$('btnRetryFailed').onclick = async () => {
+  const n = (SNAPSHOT.status && SNAPSHOT.status.counts && SNAPSHOT.status.counts.failed) || 0;
+  if (!n) { toast('当前没有失败任务', true); return; }
+  if (!confirm(`确定把 ${n} 个失败任务全部重置为待处理？\n开启状态下 worker 会按优先级依次重新处理；已暂停/关闭则等开启后处理。`)) return;
+  const r = await api('/api/retry-failed', 'POST', {});
+  if (r) {
+    toast(`已重置 ${r.retried} 个失败任务为待处理`);
+    if ($('fState').value === 'failed') { $('fState').value = 'all'; }
+    refresh();
+  }
+};
 
 async function refresh() {
   const st = await api('/api/status');

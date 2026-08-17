@@ -479,6 +479,32 @@ describe("p4", () => {
     expect(o[2]).toEqual({ depot: "//nami/branch_0.7.0/c.ts", action: "add", changelist: "default", type: "text" });
   });
 
+  it("回归：opened('default') 必须带 -c default（不带会把编号 changelist 的文件混进新 pending，p4 change -i 报 Can't include file(s) not already opened）", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: string[][] = [];
+    (client as unknown as { run: (a: string[]) => Promise<string> }).run = async (args: string[]) => {
+      calls.push(args);
+      return "";
+    };
+    await client.opened("default");
+    await client.opened();
+    expect(calls[0]).toEqual(["opened", "-c", "default"]);
+    expect(calls[1]).toEqual(["opened"]);
+  });
+
+  it("回归：revert 默认带 -c default（绝不误撤编号 changelist 里其它 bug 的改动）", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: string[][] = [];
+    (client as unknown as { run: (a: string[]) => Promise<string> }).run = async (args: string[]) => {
+      calls.push(args);
+      return "";
+    };
+    await client.revert(["//depot/a.ts"]);
+    expect(calls[0]).toEqual(["revert", "-c", "default", "//depot/a.ts"]);
+    expect(await client.revert([])).toBe("");
+    expect(calls).toHaveLength(1);
+  });
+
   it("sync 瞬时错误重试后成功", async () => {
     const client = new P4Client("C:\\tmp", { client: "test-client" });
     const calls = { n: 0 };
@@ -515,8 +541,9 @@ class FakeP4 {
     this._opened = opened;
     this.preview = preview;
   }
-  async opened(): Promise<OpenedFile[]> {
-    return [...this._opened];
+  async opened(cl?: string): Promise<OpenedFile[]> {
+    // 模拟真实 p4 opened -c <cl>：按 changelist 过滤；不传返回全部
+    return [...this._opened].filter((o) => !cl || o.changelist === cl);
   }
   async reconcilePreview(): Promise<string> {
     return this.preview;
@@ -555,6 +582,27 @@ describe("checkAndPrepareP4", () => {
     expect(fake.reconciled).toBe(false);
     expect(opened.length).toBe(1);
   });
+
+  it("回归：只收集 default changelist 的文件，绝不混入编号 changelist（其它 bug 的 pending CL）", async () => {
+    const fake = new FakeP4(
+      [
+        { depot: "//nami/.../mine.ts", action: "edit", changelist: "default", type: "text" },
+        { depot: "//nami/.../other1.ts", action: "edit", changelist: "737633", type: "text" },
+        { depot: "//nami/.../other2.ts", action: "edit", changelist: "737633", type: "text" },
+      ],
+      "",
+    );
+    const opened = await checkAndPrepareP4(fake as unknown as P4Client);
+    expect(opened.map((o) => o.depot)).toEqual(["//nami/.../mine.ts"]);
+  });
+
+  it("回归：default 无改动但编号 changelist 有文件时，报错信息点明编号 changelist", async () => {
+    const fake = new FakeP4(
+      [{ depot: "//nami/.../other.ts", action: "edit", changelist: "737633", type: "text" }],
+      "",
+    );
+    await expect(checkAndPrepareP4(fake as unknown as P4Client)).rejects.toThrow(/737633/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -566,6 +614,42 @@ describe("agent parsing", () => {
     const data = extractFinalJson(text);
     expect(data?.summary).toBe("ok");
     expect(data?.changed_files).toEqual(["a.cpp"]);
+  });
+
+  it("回归：FINAL_RESULT 后的 JSON 拖着网关泄漏的 DSML 协议标签仍可解析（bug 1256834 实例）", () => {
+    const text =
+      'Now I have a good picture. Implement the fix...\n' +
+      'FINAL_RESULT: {"summary": "修复了 AOI 外坐标解析，tsc 0 错误。", "changed_files": ["TypeScript/Src/Game/Module/Map/MapUtil.ts"], "manual_assets": [], "blocked_reasons": []}</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>';
+    const data = extractFinalJson(text);
+    expect(data?.summary).toContain("AOI");
+    expect(data?.changed_files).toEqual(["TypeScript/Src/Game/Module/Map/MapUtil.ts"]);
+  });
+
+  it("回归：JSON 被网关整体转义（\\\"key\\\":）时反转义后解析", () => {
+    const text =
+      'FINAL_RESULT: {\\"summary\\": \\"修复\\", \\"changed_files\\": [\\"a.ts\\"], \\"manual_assets\\": [], \\"blocked_reasons\\": []}尾部残渣';
+    const data = extractFinalJson(text);
+    expect(data?.summary).toBe("修复");
+    expect(data?.changed_files).toEqual(["a.ts"]);
+  });
+
+  it("回归：没有 FINAL_RESULT 标记时，从输出尾部兜底提取结果形状的 JSON", () => {
+    const text = '分析……（网关吞掉了标记）\n{"summary": "s", "changed_files": ["x.ts"], "manual_assets": [], "blocked_reasons": []}';
+    const data = extractFinalJson(text);
+    expect(data?.changed_files).toEqual(["x.ts"]);
+  });
+
+  it("回归：围栏开栏行后直接跟 JSON（stripCodeFence 曾把正文清成空串）", () => {
+    const text = 'FINAL_RESULT:\n```json\n{"summary": "围栏", "changed_files": ["b.ts"]}\n```';
+    const data = extractFinalJson(text);
+    expect(data?.summary).toBe("围栏");
+    expect(data?.changed_files).toEqual(["b.ts"]);
+  });
+
+  it("JSON 字符串值里的花括号不影响配平扫描", () => {
+    const text = 'FINAL_RESULT: {"summary": "改了 if (a) { b } 的判断", "changed_files": ["c.ts"], "manual_assets": [], "blocked_reasons": []}';
+    const data = extractFinalJson(text);
+    expect(data?.summary).toBe("改了 if (a) { b } 的判断");
   });
 
   it("result_from_output 解析结构化结果", () => {
@@ -743,9 +827,18 @@ describe("PiAgent 子进程控制", () => {
     });
   });
 
-  it("逐行回调 onProgress 并累计 stdout", async () => {
+  it("逐行回调 onProgress：文本增量合并上报，工具事件逐条透传", async () => {
     const d = tmpdir();
-    writeFakePi(d, "node -e \"for(let i=0;i<3;i++)console.log(JSON.stringify({type:'message_update',message:{content:[{type:'text',text:'line '+i}]},assistantMessageEvent:{type:'text_delta',delta:'line '+i}}))\"");
+    // 3 个无换行的短文本增量 + 1 个工具事件：增量应合并（不再逐 token 刷事件表），
+    // 工具事件保持逐条且先冲刷缓冲的文本。事件数据写文件读取，避免 cmd shim 双引号转义问题。
+    const lines = [
+      { type: "message_update", message: { content: [{ type: "text", text: "line 0" }] }, assistantMessageEvent: { type: "text_delta", delta: "line 0" } },
+      { type: "message_update", message: { content: [{ type: "text", text: "line 1" }] }, assistantMessageEvent: { type: "text_delta", delta: "line 1" } },
+      { type: "tool_execution_start", toolName: "Bash", args: { command: "p4 edit a.ts" } },
+      { type: "message_update", message: { content: [{ type: "text", text: "line 2" }] }, assistantMessageEvent: { type: "text_delta", delta: "line 2" } },
+    ];
+    fs.writeFileSync(path.join(d, "lines.json"), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    writeFakePi(d, "node -e \"require('fs').readFileSync('lines.json','utf8').trim().split(/\\n/).forEach(l=>console.log(l))\"");
     const agent = new PiAgent(makeConfig());
     const progress: string[] = [];
     await withFakePiOnPath(d, async () => {
@@ -755,10 +848,30 @@ describe("PiAgent 子进程控制", () => {
         timeoutS: 60,
         onProgress: (m) => progress.push(m),
       });
-      expect(progress.length).toBeGreaterThanOrEqual(3);
-      expect(progress[0]).toBe("Agent: line 0");
       expect(ar.ok).toBe(true);
     });
+    // 前 2 个增量合并成一条；工具事件单独一条；末尾增量收尾时冲刷
+    expect(progress).toEqual([
+      "Agent: line 0line 1",
+      "Agent: Bash p4 edit a.ts",
+      "Agent: line 2",
+    ]);
+  });
+
+  it("含换行的文本增量立即冲刷（不积压整段输出）", async () => {
+    const d = tmpdir();
+    const lines = [
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "第一行\n" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "第二行\n" } },
+    ];
+    fs.writeFileSync(path.join(d, "lines.json"), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    writeFakePi(d, "node -e \"require('fs').readFileSync('lines.json','utf8').trim().split(/\\n/).forEach(l=>console.log(l))\"");
+    const agent = new PiAgent(makeConfig());
+    const progress: string[] = [];
+    await withFakePiOnPath(d, async () => {
+      await agent.run({ prompt: "x", repoDir: d, timeoutS: 60, onProgress: (m) => progress.push(m) });
+    });
+    expect(progress).toEqual(["Agent: 第一行", "Agent: 第二行"]);
   });
 });
 
@@ -961,6 +1074,122 @@ describe("worker web 合并", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 本地任务可见可处理（回归：不在 Tapd「我的」列表的 bug 点重试毫无效果）
+// ---------------------------------------------------------------------------
+describe("本地任务（Tapd 列表外）可见可处理", () => {
+  it("fetchActionable 纳入本地 pending（Tapd 直拉补全描述）", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, []); // Tapd「我的」列表拉不到它
+    stubTapd(w, new FakeTapd([bug])); // 但按 id 直拉能拉到
+    w.store.upsertJob(bug, { agent_state: "pending" });
+
+    const actionable = await w.fetchActionable();
+    expect(actionable.map((b) => b.id)).toEqual([bug.id]);
+    expect(actionable[0].description).toBe(bug.description); // 直拉补全了描述
+  });
+
+  it("Tapd 直拉也失败时用本地快照入队（不阻断）", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, []);
+    stubTapd(w, new FakeTapd([])); // 直拉也失败
+    w.store.upsertJob(bug, { agent_state: "pending" });
+
+    const actionable = await w.fetchActionable();
+    expect(actionable.map((b) => b.id)).toEqual([bug.id]);
+    expect(actionable[0].title).toBe(bug.title); // 快照里有标题
+    expect(actionable[0].description).toBe(""); // 描述缺失但仍在队列
+  });
+
+  it("快照 tapd_status 已终态（resolved）的本地 pending 不复活", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287", status: "resolved" });
+    stubMyBugs(w, []);
+    stubTapd(w, new FakeTapd([bug]));
+    w.store.upsertJob(bug, { agent_state: "pending" }); // upsert 落库 tapd_status=resolved
+
+    expect(await w.fetchActionable()).toEqual([]);
+  });
+
+  it("回归：Tapd 确认无此单（直拉返回空壳）→ 本地 pending 自动转 skipped，不入队", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, []);
+    // REST/MCP 对不存在的单返回「只有 id 的空壳」（无标题无状态）
+    stubTapd(w, {
+      getBug: async (id: string) => makeBug({ id, title: "", status: "" }),
+    } as unknown as FakeTapd);
+    w.store.upsertJob(bug, { agent_state: "pending" });
+
+    expect(await w.fetchActionable()).toEqual([]);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("skipped");
+    expect(String(job?.failure_reason)).toContain("Tapd 单已不存在");
+    const events = w.store.listEvents(bug.id);
+    expect(events.some((e) => String(e.msg).includes("自动跳过"))).toBe(true);
+  });
+
+  it("回归：直拉抛错（接口波动）→ 保持 pending 用快照入队，不误杀", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, []);
+    stubTapd(w, {
+      getBug: async () => { throw new Error("tapd 接口波动"); },
+    } as unknown as FakeTapd);
+    w.store.upsertJob(bug, { agent_state: "pending" });
+
+    const actionable = await w.fetchActionable();
+    expect(actionable.map((b) => b.id)).toEqual([bug.id]);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("pending"); // 没被误跳过
+  });
+
+  it("列表显示本地有记录但不在 Tapd 列表的 bug（tapd_missing 标记）", async () => {
+    const w = makeWorker();
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, []);
+    w.store.upsertJob(bug, { agent_state: "failed" });
+
+    const rows = await w.listBugsForWeb();
+    expect(rows.length).toBe(1);
+    expect(rows[0].bug_id).toBe(bug.id);
+    expect(rows[0].agent_state).toBe("failed");
+    expect(rows[0].tapd_missing).toBe(true);
+    expect(rows[0].title).toBe(bug.title);
+  });
+
+  it("retryAllFailed 重置全部失败任务，非失败状态不动", async () => {
+    const w = makeWorker();
+    const a = makeBug({ id: "1152729922001254287" });
+    const b = makeBug({ id: "1152729922001254288" });
+    const ok = makeBug({ id: "1152729922001254289" });
+    w.store.upsertJob(a, { agent_state: "failed" });
+    w.store.upsertJob(b, { agent_state: "failed" });
+    w.store.upsertJob(ok, { agent_state: "resolved" });
+    w.store.updateJob(a.id, {
+      attempts: 2,
+      failure_reason: "旧失败原因",
+      retry_evidence: dumps([{ attempt: 1, at: "2026-08-11 09:00:00", failure_reason: "x", opened_files: [], agent_summary: "", manual_assets: [] }]),
+    });
+
+    const n = w.retryAllFailed();
+    expect(n).toBe(2);
+    for (const job of [w.store.getJob(a.id), w.store.getJob(b.id)]) {
+      expect(job?.agent_state).toBe("pending");
+      expect(job?.attempts).toBe(0);
+      expect(job?.failure_reason).toBeNull();
+      expect(job?.retry_evidence).toBeNull();
+      expect(job?.finished_at).toBeNull();
+    }
+    expect(w.store.getJob(ok.id)?.agent_state).toBe("resolved");
+    // 重置后进入可处理队列
+    stubMyBugs(w, []);
+    stubTapd(w, new FakeTapd([a, b]));
+    expect((await w.fetchActionable()).length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 控制 / 取消
 // ---------------------------------------------------------------------------
 describe("worker 控制与取消", () => {
@@ -1012,6 +1241,7 @@ describe("worker 控制与取消", () => {
       throw new AgentCancelledError("Agent 调用被人工取消");
     });
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
 
     await w.processBug(bug);
 
@@ -1022,6 +1252,57 @@ describe("worker 控制与取消", () => {
     const events = w.store.listEvents(bug.id);
     expect(events.some((e) => String(e.msg).includes("人工中断"))).toBe(true);
     expect(events.some((e) => String(e.msg).includes("失败"))).toBe(false);
+  });
+
+  it("回归：人工跳过正在处理的 bug，中断后不把 skipped 覆盖回 pending", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, [bug]);
+    const oldEvt = w.cancelEvent;
+
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 80)); // 模拟在跑
+      throw new AgentCancelledError("Agent 调用被人工取消");
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+
+    w.currentBugId = bug.id;
+    const processing = w.processBug(bug);
+    await new Promise((r) => setTimeout(r, 20)); // 等 processBug 启动
+    expect(await w.skipBug(bug.id)).toBe(true);
+    await processing;
+    w.currentBugId = null;
+
+    // 旧取消令牌被置位（中断了在跑的尝试），worker 换了新令牌（后续 bug 不受影响）
+    expect(oldEvt.cancelled).toBe(true);
+    expect(w.cancelEvent).not.toBe(oldEvt);
+    expect(w.cancelEvent.cancelled).toBe(false);
+    // 人工设置的 skipped 保留，不被取消路径覆盖
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("skipped");
+    const events = w.store.listEvents(bug.id);
+    expect(events.some((e) => String(e.msg).includes("保留人工设置的状态"))).toBe(true);
+  });
+
+  it("重试正在处理的 bug：中断当前尝试并换新取消令牌", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    w.store.upsertJob(bug, { agent_state: "in_progress" });
+    w.store.updateJob(bug.id, { attempts: 2, failure_reason: "旧失败" });
+
+    const oldEvt = w.cancelEvent;
+    w.currentBugId = bug.id;
+    expect(await w.retryBug(bug.id)).toBe(true);
+    w.currentBugId = null;
+
+    expect(oldEvt.cancelled).toBe(true);
+    expect(w.cancelEvent).not.toBe(oldEvt);
+    expect(w.cancelEvent.cancelled).toBe(false);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("pending");
+    expect(job?.attempts).toBe(0);
+    expect(job?.failure_reason).toBeNull();
+    expect(job?.retry_evidence).toBeNull();
   });
 });
 
@@ -1062,6 +1343,26 @@ describe("buildFixPrompt 重试段", () => {
     expect(p).toContain("证据文本");
     const p2 = buildFixPrompt(bug, "r", "C:\\tmp", "pytest");
     expect(p2).not.toContain("上一次尝试的记录");
+  });
+
+  it("修复守则（defensive-patterns）存在时注入 prompt，缺失时不阻断", () => {
+    const bug = makeBug();
+    const p = buildFixPrompt(bug, "r", "C:\\tmp", "pytest");
+    const playbookPath = path.join(
+      path.dirname(path.dirname(fileURLToPath(import.meta.url))),
+      "prompts",
+      "defensive-patterns.md",
+    );
+    if (fs.existsSync(playbookPath)) {
+      expect(p).toContain("修复守则");
+      expect(p).toContain("正交结果独立上报"); // deepseek-harness 防御模式之一
+      expect(p).toContain("清理必须达到完全停稳");
+      // 只注入正文：文件标题不重复出现在 prompt 里
+      expect(p).not.toContain("来自 deepseek-harness docs");
+    } else {
+      // 文件被删掉的部署场景：prompt 仍能构造，只是没有守则段
+      expect(p).not.toContain("修复守则");
+    }
   });
 });
 
@@ -1150,8 +1451,36 @@ describe("worker 自动重试", () => {
     expect(JSON.parse(String(job?.retry_evidence)).length).toBe(3);
   });
 
-  it("成功后清空重试证据与遗留文件记录", async () => {
+  it("回归：修复成功只发 Tapd 评论，绝不自动修改单子状态（状态由人工 review/submit 后自行处理）", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    const comments: string[] = [];
+    const statusUpdates: Array<Record<string, unknown>> = [];
+    stubTapd(w, {
+      addComment: async (_id: string, text: string) => { comments.push(text); },
+      updateBug: async (_id: string, fields: Record<string, unknown>) => { statusUpdates.push(fields); },
+    } as unknown as FakeTapd);
+
+    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(
+      makeResult({ changed_files: ["a.cpp"], summary: "修好了" }),
+    );
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
+      { depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" },
+    ]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("resolved");
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("pending changelist: 4321");
+    expect(comments[0]).toContain("状态未修改"); // 评文明示状态留给人工
+    expect(statusUpdates).toEqual([]); // 一次 updateBug 都不许有
+  });
+
+  it("成功后清空重试证据与遗留文件记录", async () => {    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -1201,6 +1530,72 @@ describe("worker 自动重试", () => {
     expect(createPendingCalls[0].desc).toContain("[TAPD-1152729922001234007]");
     expect(createPendingCalls[0].desc).toContain("登录页偶现崩溃");
     expect(createPendingCalls[0].files).toEqual(["//depot/a.cpp"]);
+  });
+
+  it("回归：FINAL_RESULT 解析失败但 p4 有打开文件时按事实采纳，不再误判失败（bug 1256834 实例）", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+
+    // Agent 实际改了文件（p4 已打开），但最终输出没有可解析的 FINAL_RESULT
+    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(
+      makeResult({ ok: true, summary: "", raw_output: "一堆没有结构化结果的文本" }),
+    );
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async (cl?: string) => [
+      { depot: "//depot/fixed.ts", action: "edit", changelist: "default", type: "text" },
+      // 编号 changelist 里是别的 bug 的文件，不能混进本次结果
+      { depot: "//depot/other.ts", action: "edit", changelist: "737633", type: "text" },
+    ].filter((o) => !cl || o.changelist === cl));
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    const createPendingCalls: Array<{ desc: string; files?: string[] }> = [];
+    vi.spyOn(P4Client.prototype, "createPending").mockImplementation(
+      async (desc: string, files?: string[]) => {
+        createPendingCalls.push({ desc, files });
+        return 737999;
+      },
+    );
+
+    await w.processBug(bug);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("resolved");
+    expect(job?.changelist).toBe(737999);
+    expect(createPendingCalls).toHaveLength(1);
+    expect(createPendingCalls[0].files).toEqual(["//depot/fixed.ts"]); // 只含 default 文件
+    const events = w.store.listEvents(bug.id);
+    expect(events.some((e) => String(e.msg).includes("FINAL_RESULT"))).toBe(true);
+  });
+
+  it("回归：遗留文件已被并入编号 changelist 时不盲撤（避免误杀其它 bug 的 pending 改动）", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    w.store.upsertJob(bug);
+    // 上次失败遗留记录里的文件，如今只剩编号 changelist 里的一份（default 已空）
+    w.store.updateJob(bug.id, {
+      attempts: 1,
+      last_attempt_files: dumps(["//depot/gone.ts"]),
+      agent_state: "pending",
+    });
+
+    const revertCalls: string[][] = [];
+    vi.spyOn(PiAgent.prototype, "run").mockRejectedValue(new Error("模拟失败"));
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async (cl?: string) => [
+      { depot: "//depot/gone.ts", action: "edit", changelist: "737700", type: "text" },
+    ].filter((o) => !cl || o.changelist === cl));
+    vi.spyOn(P4Client.prototype, "revert").mockImplementation(async (files: string[]) => {
+      revertCalls.push(files);
+      return "";
+    });
+
+    await w.processBug(bug);
+    expect(revertCalls).toEqual([]); // default 里没有它 → 不撤
+    const job = w.store.getJob(bug.id);
+    expect(JSON.parse(String(job?.last_attempt_files))).toEqual([]); // 记录已按 default 实况清空
   });
 });
 
@@ -1384,5 +1779,15 @@ describe("web 前端 bug_id 内插引号", () => {
     // 旧的裸 JSON.parse 必须移除
     expect(html).not.toContain("JSON.parse(job.files");
     expect(html).not.toContain("JSON.parse(job.manual_assets");
+  });
+
+  it("顶部有「重试全部失败」按钮并调 retry-failed 接口", () => {
+    expect(html).toContain('id="btnRetryFailed"');
+    expect(html).toContain("/api/retry-failed");
+  });
+
+  it("api() 捕获网络错误并给出可见提示（回归：服务器重启窗口期点击毫无反馈）", () => {
+    expect(html).toMatch(/catch \(e\) \{\s*\n?\s*\/\/ 服务器不可达/);
+    expect(html).toContain("function toast(");
   });
 });
