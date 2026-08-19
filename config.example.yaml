@@ -60,7 +60,7 @@ workspaces:
 pi:
   provider:
     id: "kuro"                                        # provider id（--model 前缀）
-    base_url: "https://ai-gateway.kurogames.com"      # 网关/中转地址
+    base_url: "https://ai-gateway.com"                # 网关/中转地址
     api_key_env: "ANTHROPIC_AUTH_TOKEN"               # 从环境变量读 key（推荐，不落盘）
     # api_key: "sk-..."                               # 或直接写 key（不推荐，落盘明文）
     auth_header: true                                 # true=Authorization: Bearer（本司网关协议）；false=默认 x-api-key

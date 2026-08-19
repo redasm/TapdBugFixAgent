@@ -1,16 +1,21 @@
 # 密钥 / 本地配置
 .env
 config.yaml
-overrides.yaml          # web 设置页写入的运行时覆盖配置（含密钥）
+# web 设置页写入的运行时覆盖配置（含密钥）
+overrides.yaml
 
 # Node
 node_modules/
 dist/
 *.tsbuildinfo
 
-# 运行时数据
+# 运行时数据（SQLite 主库 + WAL 模式伴随文件）
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 logs/
 run/
 
