@@ -45,6 +45,29 @@ export interface TestResult {
   output: string;
 }
 
+export interface VerificationStep extends TestResult {
+  command: string;
+}
+
+export interface VerificationPipelineResult {
+  configured: boolean;
+  ok: boolean;
+  steps: VerificationStep[];
+  summary: string;
+}
+
+export interface PatchScopeResult {
+  ok: boolean;
+  changed_files: number;
+  changed_lines: number;
+  reasons: string[];
+}
+
+export interface PlannedScopeResult {
+  ok: boolean;
+  unplanned_files: string[];
+}
+
 /** 运行测试命令，返回 (是否通过, 输出尾部)。未配置测试命令视为通过。 */
 export function runTests(repoPath: string, testCmd: string, timeout = 600000): Promise<TestResult> {
   if (!testCmd || !testCmd.trim()) {
@@ -75,4 +98,74 @@ export function runTests(repoPath: string, testCmd: string, timeout = 600000): P
       resolve({ ok: code === 0, output: output.slice(-1500) });
     });
   });
+}
+
+/** 顺序执行机器验证；严格模式下无命令不是成功，而是“未验证”。 */
+export async function runVerificationPipeline(
+  repoPath: string,
+  commands: string[],
+  required: boolean,
+  timeout = 600000,
+): Promise<VerificationPipelineResult> {
+  const normalized = commands.map((command) => command.trim()).filter(Boolean);
+  if (!normalized.length) {
+    return {
+      configured: false,
+      ok: !required,
+      steps: [],
+      summary: required ? "未配置机器验证命令，候选补丁不能标记为已验证" : "未配置验证命令",
+    };
+  }
+
+  const steps: VerificationStep[] = [];
+  for (const command of normalized) {
+    const result = await runTests(repoPath, command, timeout);
+    steps.push({ command, ...result });
+    if (!result.ok) {
+      return {
+        configured: true,
+        ok: false,
+        steps,
+        summary: `验证失败: ${command}\n${result.output}`,
+      };
+    }
+  }
+  return {
+    configured: true,
+    ok: true,
+    steps,
+    summary: steps.map((step) => `[PASS] ${step.command}`).join("\n"),
+  };
+}
+
+/** 限制自动补丁范围；超过阈值转人工评审而不是把大改误标为高置信度修复。 */
+export function assessPatchScope(
+  files: string[],
+  unifiedDiff: string,
+  maxFiles: number,
+  maxDiffLines: number,
+): PatchScopeResult {
+  const changedFiles = new Set(files.filter(Boolean)).size;
+  const changedLines = unifiedDiff.split(/\r?\n/).filter((line) =>
+    (line.startsWith("+") && !line.startsWith("+++"))
+    || (line.startsWith("-") && !line.startsWith("---"))).length;
+  const reasons: string[] = [];
+  if (maxFiles > 0 && changedFiles > maxFiles) {
+    reasons.push(`修改文件数 ${changedFiles} 超过自动修复上限 ${maxFiles}`);
+  }
+  if (maxDiffLines > 0 && changedLines > maxDiffLines) {
+    reasons.push(`diff 改动行数 ${changedLines} 超过自动修复上限 ${maxDiffLines}`);
+  }
+  return { ok: reasons.length === 0, changed_files: changedFiles, changed_lines: changedLines, reasons };
+}
+
+/** 调查阶段的 planned_files 是最小修改白名单；支持 P4 depot 路径以相同相对路径结尾。 */
+export function assessPlannedScope(files: string[], plannedFiles: string[]): PlannedScopeResult {
+  const normalize = (value: string): string => value.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  const planned = plannedFiles.map(normalize).filter(Boolean);
+  const unplanned = files.filter((file) => {
+    const actual = normalize(file);
+    return !planned.some((expected) => actual === expected || actual.endsWith(`/${expected}`));
+  });
+  return { ok: unplanned.length === 0, unplanned_files: unplanned };
 }

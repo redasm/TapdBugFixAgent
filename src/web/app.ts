@@ -123,9 +123,14 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
   app.get("/", (_req, res) => {
     res.sendFile(path.join(STATIC_DIR, "index.html"));
   });
+  app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
   app.get("/api/status", auth, (_req, res) => {
-    res.json({ ...worker.status(), version: PKG_VERSION });
+    res.json({ ...worker.status(), version: PKG_VERSION, quality: store.qualityMetrics() });
+  });
+
+  app.get("/api/quality/metrics", auth, (_req, res) => {
+    res.json(store.qualityMetrics());
   });
 
   app.post("/api/control", auth, (req, res) => {
@@ -183,7 +188,7 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
     res.json({ ok: true, retried });
   });
 
-  // 清空全部本地记录并从 Tapd 强制重新同步（会中断当前处理中的 bug）
+  // 清空任务状态与事件并从 Tapd 强制重新同步；长期人工质量反馈保留。
   app.post("/api/resync", auth, async (_req, res) => {
     try {
       const r = await worker.resyncFromTapd();
@@ -201,6 +206,27 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
     res.json({ ok: true });
   });
 
+  app.post("/api/bugs/:id/feedback", auth, (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      store.recordFeedback(String(req.params.id), {
+        outcome: String(body.outcome ?? "") as never,
+        reason: String(body.reason ?? ""),
+        human_changed_lines: Number(body.human_changed_lines ?? 0),
+        submitted_changelist: body.submitted_changelist === null
+          || body.submitted_changelist === undefined
+          || body.submitted_changelist === ""
+          ? null
+          : Number(body.submitted_changelist),
+      });
+    } catch (exc) {
+      const message = (exc as Error).message;
+      res.status(message.startsWith("未找到") ? 404 : 400).json({ detail: message });
+      return;
+    }
+    res.json({ ok: true, metrics: store.qualityMetrics() });
+  });
+
   app.get("/api/events", auth, (req, res) => {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -212,7 +238,7 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
     const timer = setInterval(() => {
       void (async () => {
         const payload: Record<string, unknown> = {
-          status: worker.status(),
+          status: { ...worker.status(), quality: store.qualityMetrics() },
           items: await worker.listBugsForWeb(),
         };
         // 底部 Agent 输出区：附加当前处理中 bug 的实时详情（含 debug 级进度事件），

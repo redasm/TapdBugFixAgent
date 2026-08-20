@@ -22,6 +22,10 @@
   .badge.failed { background: rgba(239,68,68,.15); color: var(--red); }
   .badge.resolved { background: rgba(34,197,94,.15); color: var(--green); }
   .badge.partial { background: rgba(245,158,11,.15); color: var(--amber); }
+  .badge.candidate, .badge.candidate_partial, .badge.needs_info, .badge.manual_review, .badge.blocked_workspace { background: rgba(245,158,11,.15); color: var(--amber); }
+  .badge.verified, .badge.review_pending { background: rgba(56,189,248,.15); color: var(--blue); }
+  .badge.accepted, .badge.accepted_modified { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge.rejected, .badge.reopened { background: rgba(239,68,68,.15); color: var(--red); }
   .badge.manual_only { background: rgba(56,189,248,.15); color: var(--blue); }
   .badge.in_progress, .badge.pending { background: rgba(59,130,246,.15); color: var(--blue); }
   .badge.unprocessed { background: rgba(148,163,184,.18); color: var(--muted); }
@@ -40,7 +44,7 @@
   .top-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
   .list-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
   .toolbar { display: flex; gap: 8px; align-items: center; }
-  select, input[type=text] { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+  select, input[type=text], input[type=number], textarea { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13px; }
   input[type=text] { flex: 1; }
   .list-scroll { overflow-y: auto; min-height: 0; flex: 1; border-radius: 10px; border: 1px solid var(--border); background: var(--panel); }
   .empty { color: var(--muted); text-align: center; padding: 40px 0; }
@@ -104,6 +108,12 @@
   .spin { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .actions { display: flex; gap: 8px; }
+  .feedback-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .feedback-grid button { min-height: 38px; }
+  .feedback-grid label { color: var(--muted); font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .feedback-grid .full { grid-column: 1 / -1; }
+  .feedback-grid textarea { min-height: 64px; resize: vertical; }
+  .quality-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
   .muted { color: var(--muted); }
   /* 设置弹窗 */
@@ -128,6 +138,25 @@
   #toast { position: fixed; top: 66px; left: 50%; transform: translateX(-50%) translateY(-8px); background: var(--panel2); color: var(--green); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 100; max-width: 80vw; }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   #toast.err { color: var(--red); }
+  @media (max-width: 600px) {
+    body { overflow-x: hidden; }
+    header { padding: 12px; gap: 10px; }
+    header h1 { width: 100%; }
+    .stats { margin-left: 0; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); width: 100%; }
+    .stat { min-width: 0; text-align: center; }
+    header > .actions { width: 100%; flex-wrap: wrap; }
+    header > .actions button { flex: 1 1 104px; min-width: 96px; white-space: nowrap; }
+    main.layout { padding: 10px 12px; height: calc(100vh - 278px); }
+    .toolbar { display: grid; grid-template-columns: 132px minmax(0,1fr); }
+    .toolbar button { grid-column: 1 / -1; }
+    .row { grid-template-columns: minmax(0,1fr) 42px 92px; grid-template-rows: auto auto; padding: 8px 12px; }
+    .row > :nth-child(1) { grid-column: 1; grid-row: 1; }
+    .row > :nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+    .row > :nth-child(3) { grid-column: 2; grid-row: 1; }
+    .row > :nth-child(4) { grid-column: 3; grid-row: 1; }
+    .row > :nth-child(5), .row > :nth-child(6) { display: none; }
+    .drawer { top: 0; bottom: 0; width: min(100vw,460px); max-width: min(100vw,460px); }
+  }
 </style>
 </head>
 <body>
@@ -137,10 +166,12 @@
   <span id="controlBadge" class="badge stopped">stopped</span>
   <div class="stats">
     <span class="stat">待处理 <b id="stQueued">0</b></span>
-    <span class="stat">已解决 <b id="stResolved">0</b></span>
-    <span class="stat">部分完成 <b id="stPartial">0</b></span>
+    <span class="stat">待人工确认 <b id="stReviewPending">0</b></span>
+    <span class="stat">机器验证通过 <b id="stVerified">0</b></span>
     <span class="stat">资源待人工 <b id="stManual">0</b></span>
     <span class="stat">失败 <b id="stFailed">0</b></span>
+    <span class="stat" title="人工原样接受 / 已评审候选"><span>原样接受率</span> <b id="stAcceptance">-</b></span>
+    <span class="stat" title="人工确认方向正确 / 已评审候选"><span>候选精确率</span> <b id="stPrecision">-</b></span>
   </div>
   <div class="actions">
     <button id="btnSettings" class="ghost">⚙ 设置</button>
@@ -149,7 +180,7 @@
     <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
     <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
     <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
-    <button id="btnResync" class="danger" title="清空全部本地处理记录（含已解决/跳过/失败历史与事件日志），中断当前处理，并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响">⟳ 清除并重新同步</button>
+    <button id="btnResync" class="danger" title="清空本地任务状态与事件日志（人工质量反馈保留），中断当前处理，并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响">⟳ 清除并重新同步</button>
   </div>
 </header>
 
@@ -163,8 +194,16 @@
           <option value="unprocessed">未处理</option>
           <option value="pending">待处理</option>
           <option value="in_progress">处理中</option>
-          <option value="resolved">已解决</option>
-          <option value="partial">部分完成</option>
+          <option value="candidate">候选待验证</option>
+          <option value="verified">机器验证通过</option>
+          <option value="review_pending">待人工确认</option>
+          <option value="needs_info">需要补充信息</option>
+          <option value="manual_review">高风险人工评审</option>
+          <option value="blocked_workspace">工作区待清理</option>
+          <option value="accepted">人工原样接受</option>
+          <option value="accepted_modified">人工修改后接受</option>
+          <option value="rejected">人工拒绝</option>
+          <option value="reopened">提交后重开</option>
           <option value="manual_only">资源待人工</option>
           <option value="failed">失败</option>
           <option value="skipped">跳过</option>
@@ -324,17 +363,32 @@ async function api(path, method='GET', body) {
 }
 
 // ---------- 渲染 ----------
-const STATE_LABEL = { pending:'待处理', in_progress:'处理中', resolved:'已解决', partial:'部分完成', manual_only:'资源待人工', failed:'失败', skipped:'跳过' };
+const STATE_LABEL = {
+  pending:'待处理', in_progress:'处理中', candidate:'候选待验证', candidate_partial:'候选（资源待人工）',
+  verified:'机器验证通过', review_pending:'待人工最终确认', needs_info:'需要补充信息', manual_review:'高风险人工评审',
+  blocked_workspace:'工作区待清理',
+  accepted:'人工原样接受', accepted_modified:'人工修改后接受', rejected:'人工拒绝', reopened:'提交后重开',
+  manual_only:'资源待人工', failed:'失败', skipped:'跳过'
+};
 // 分组顺序：处理中置顶 → 待处理/未处理 → 失败/资源待人工/跳过 → 已完成沉底（单 worker 现状）
 const GROUP_ORDER = [
   ['in_progress', '处理中'],
   ['pending', '待处理'],
   ['unprocessed', '未处理'],
+  ['review_pending', '待人工最终确认'],
+  ['verified', '机器验证通过'],
+  ['candidate', '候选待验证'],
+  ['candidate_partial', '候选（资源待人工）'],
+  ['needs_info', '需要补充信息'],
+  ['manual_review', '高风险人工评审'],
+  ['blocked_workspace', '工作区待清理'],
   ['failed', '失败'],
+  ['reopened', '提交后重开'],
+  ['rejected', '人工拒绝'],
   ['manual_only', '资源待人工'],
   ['skipped', '跳过'],
-  ['resolved', '已解决'],
-  ['partial', '部分完成'],
+  ['accepted', '人工原样接受'],
+  ['accepted_modified', '人工修改后接受'],
 ];
 const GROUP_LABEL = Object.fromEntries(GROUP_ORDER);
 
@@ -368,10 +422,14 @@ function renderStatus() {
   if (st.version) $('verBadge').textContent = 'v' + st.version;
   const counts = st.counts || {};
   $('stQueued').textContent = (counts.pending||0) + (counts.in_progress||0);
-  $('stResolved').textContent = counts.resolved||0;
-  $('stPartial').textContent = counts.partial||0;
+  $('stReviewPending').textContent = counts.review_pending||0;
+  $('stVerified').textContent = counts.verified||0;
   $('stManual').textContent = counts.manual_only||0;
   $('stFailed').textContent = counts.failed||0;
+  const quality = st.quality || {};
+  const asPercent = value => Number.isFinite(Number(value)) ? (Number(value) * 100).toFixed(1) + '%' : '-';
+  $('stAcceptance').textContent = quality.reviewed ? asPercent(quality.unchanged_acceptance_rate) : '-';
+  $('stPrecision').textContent = quality.reviewed ? asPercent(quality.candidate_precision) : '-';
   const failedN = counts.failed || 0;
   const bf = $('btnRetryFailed');
   bf.disabled = !failedN;
@@ -387,7 +445,7 @@ function renderStatus() {
   rs.disabled = running;
   rs.title = running
     ? '运行中不可用：请先「⏹ 关闭」停止自动处理，再清除并重新同步'
-    : '清空全部本地处理记录（含已解决/跳过/失败历史与事件日志），并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响';
+    : '清空本地任务状态与事件日志（人工质量反馈保留），并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响';
 }
 
 function filtered() {
@@ -483,9 +541,14 @@ function renderDetail(job) {
   // 容错解析：历史脏数据里可能存字面字符串 "null"（JSON.parse 得 null），
   // 或任意 JSON；一律兜底为空数组，避免 .length 崩溃。
   const parseArr = (raw, def = []) => { try { const v = JSON.parse(raw || '[]'); return Array.isArray(v) ? v : def; } catch (e) { return def; } };
+  const parseObj = (raw, def = {}) => { try { const v = JSON.parse(raw || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : def; } catch (e) { return def; } };
   const assets = parseArr(job.manual_assets);
   const files = parseArr(job.files);
   const retries = parseArr(job.retry_evidence);
+  const investigation = parseObj(job.investigation);
+  const verification = parseObj(job.verification);
+  const review = parseObj(job.review_findings);
+  const findings = Array.isArray(review.findings) ? review.findings : [];
   const retryHTML = retries.length ? `<div class="section">
     <h4>自动重试记录（失败 ${retries.length} 次）</h4>
     ${retries.map(r => `<div class="retry-entry">
@@ -505,6 +568,7 @@ function renderDetail(job) {
       <dt>Changelist</dt><dd class="mono">${job.changelist ?? '-'}</dd>
       <dt>Agent</dt><dd>${escapeHtml(job.agent || '-')}</dd>
       <dt>模型</dt><dd>${job.model ? escapeHtml(job.model) : '<span class="muted">(CLI 默认)</span>'}</dd>
+      <dt>准入评分</dt><dd>${job.admission_score ?? '-'}</dd>
       <dt>Tapd 状态</dt><dd>${escapeHtml(job.tapd_status || '-')}</dd>
       <dt>Tapd 链接</dt><dd><a href="${escapeHtml(job.url || '')}" target="_blank" rel="noopener">在 Tapd 打开 ↗</a></dd>
       <dt>开始/完成</dt><dd>${escapeHtml(job.started_at || '-')} → ${escapeHtml(job.finished_at || '-')}</dd>
@@ -512,6 +576,18 @@ function renderDetail(job) {
     </div>
     ${progressHTML(job)}
     ${retryHTML}
+    ${investigation.root_cause ? `<div class="section">
+      <h4>只读调查结论</h4>
+      <pre>根因: ${escapeHtml(investigation.root_cause)}\n置信度: ${escapeHtml(investigation.confidence)}\n证据:\n${escapeHtml((investigation.evidence || []).join('\n'))}</pre>
+    </div>` : ''}
+    ${verification.summary ? `<div class="section">
+      <h4>机器验证</h4>
+      <pre>${escapeHtml(verification.summary)}</pre>
+    </div>` : ''}
+    ${review.note || findings.length ? `<div class="section">
+      <h4>独立 Reviewer</h4>
+      <pre>${escapeHtml(review.note || '')}${findings.length ? '\n' + escapeHtml(findings.map(f => `[${f.severity}] ${f.file || ''}${f.line ? ':' + f.line : ''} ${f.title}\n${f.required_action}`).join('\n\n')) : ''}</pre>
+    </div>` : ''}
     ${job.description ? `<div class="section">
       <h4>Tapd 原始描述</h4>
       <pre>${escapeHtml(job.description)}</pre>
@@ -540,6 +616,28 @@ function renderDetail(job) {
         <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过（不处理）</button>
       </div>
     </div>`}
+    ${job.has_local && job.changelist ? `<div class="section" data-qa="qa:feedback.form">
+      <h4>人工修复结论</h4>
+      <div class="feedback-grid">
+        <label class="full">结论
+          <select id="feedbackOutcome">
+            <option value="accepted_unchanged">原样接受并提交</option>
+            <option value="accepted_modified">人工修改后接受</option>
+            <option value="rejected_wrong_root_cause">拒绝：根因错误</option>
+            <option value="rejected_wrong_location">拒绝：定位错误</option>
+            <option value="rejected_regression">拒绝：引入回归</option>
+            <option value="rejected_overchange">拒绝：修改范围过大</option>
+            <option value="rejected_no_effect">拒绝：未解决问题</option>
+            <option value="reopened">提交后 Bug 重开</option>
+          </select>
+        </label>
+        <label>人工改动行数<input id="feedbackLines" type="number" min="0" value="0"></label>
+        <label>最终 Changelist<input id="feedbackCl" type="number" min="1" value="${job.changelist}"></label>
+        <label class="full">原因或补充说明<textarea id="feedbackReason" placeholder="例如：原样通过；或说明人工补了哪些边界条件"></textarea></label>
+        <button class="full" data-qa="qa:feedback.submit" onclick="submitFeedback('${job.bug_id}')">记录人工结论</button>
+      </div>
+      <div class="quality-note">该结论用于计算真实准确率和历史 Bug 离线评测，不会自动 submit 或修改 Tapd 状态。</div>
+    </div>` : ''}
     <div class="section">
       <h4>操作日志</h4>
       <ul class="events">${(job.events || []).map(e => `<li>${escapeHtml(e.ts)} [${escapeHtml(e.level)}] ${escapeHtml(e.msg)}</li>`).join('') || '<li>无</li>'}</ul>
@@ -623,6 +721,19 @@ async function actSkip(id) {
   }
   refresh(); selectBug(id);
 }
+async function submitFeedback(id) {
+  const outcome = $('feedbackOutcome').value;
+  const reason = $('feedbackReason').value.trim();
+  const human_changed_lines = Number($('feedbackLines').value || 0);
+  const submitted_changelist = Number($('feedbackCl').value || 0) || null;
+  const r = await api(`/api/bugs/${id}/feedback`, 'POST', {
+    outcome, reason, human_changed_lines, submitted_changelist,
+  });
+  if (!r) return;
+  toast('已记录人工修复结论，质量指标已更新');
+  await refresh();
+  await selectBug(id);
+}
 
 // 重试全部失败任务（顶部按钮）：重置所有 failed -> 待处理并入队
 $('btnRetryFailed').onclick = async () => {
@@ -648,8 +759,9 @@ $('btnResync').onclick = async () => {
   const st = SNAPSHOT.status || {};
   const counts = st.counts || {};
   if (!confirm(
-    `确定清除全部本地记录并从 Tapd 重新同步？\n` +
-    `· 将清空 ${st.jobs_total ?? '?'} 条本地记录（含已解决 ${counts.resolved ?? 0} / 失败 ${counts.failed ?? 0} / 跳过 ${counts.skipped ?? 0} 的历史与全部事件日志，不可恢复）\n` +
+    `确定清除本地任务状态并从 Tapd 重新同步？\n` +
+    `· 将清空 ${st.jobs_total ?? '?'} 条任务记录（含待人工确认 ${counts.review_pending ?? 0} / 失败 ${counts.failed ?? 0} / 跳过 ${counts.skipped ?? 0} 的历史与全部事件日志，不可恢复）\n` +
+    `· 人工质量反馈及其统计指标会保留\n` +
     `· 清空后立即从 Tapd 拉取最新「分配给我」的 bug 列表，全部重置为待处理；点「▶ 开启」后会从头按优先级重新处理\n` +
     `· p4 上已生成的 pending changelist 不受影响，但其关联记录会被清除`
   )) return;
