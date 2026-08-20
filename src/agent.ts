@@ -15,11 +15,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
 import type { Config, PiConfig } from "./config.js";
 import { p4EnvFromConfig } from "./p4.js";
-import type { AgentResult, Bug, RetryEvidenceEntry } from "./models.js";
-import { truncate } from "./models.js";
+import type { AgentResult, RetryEvidenceEntry } from "./models.js";
 
 export class AgentRuntimeError extends Error {}
 
@@ -152,7 +150,7 @@ export function parseProgress(line: string): ParsedProgress | undefined {
   return undefined;
 }
 
-/** 单行进度的格式化视图（兼容旧用法/测试）：文本增量格式化为 "Agent: <文本>"。 */
+/** 把单行 JSONL 事件格式化为管理台进度文本。 */
 export function progressFromLine(line: string): string | undefined {
   const p = parseProgress(line);
   if (!p) return undefined;
@@ -345,39 +343,6 @@ export function resultFromOutput(text: string, exitCode: number): AgentResult {
   return ar;
 }
 
-// ---------------------------------------------------------------------------
-// prompt 模板
-// ---------------------------------------------------------------------------
-/** 修复守则（防御性模式）：来自 deepseek-harness 的实际缺陷类别总结，按本仓库场景裁剪。
- *  文件缺失时静默跳过（不阻断 prompt 构造）；src 与 dist 布局一致（../prompts）。 */
-const _PLAYBOOK_PATH = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "prompts",
-  "defensive-patterns.md",
-);
-let _playbookCache: string | undefined;
-let _playbookLoaded = false;
-
-function loadPlaybook(): string | undefined {
-  if (_playbookLoaded) return _playbookCache;
-  _playbookLoaded = true;
-  try {
-    const text = fs.readFileSync(_PLAYBOOK_PATH, "utf-8").trim();
-    // 先归一化行尾（git autocrlf 往返会把文件变 CRLF，标题剥离正则在 \r\n 下失配、
-    // 标题整行漏进 prompt），再去 frontmatter 与首行标题，正文直接进 prompt
-    const body = text
-      .replace(/\r\n/g, "\n")
-      .replace(/^---[\s\S]*?---\s*/, "")
-      .replace(/^#[^\n]*\n/, "")
-      .trim();
-    _playbookCache = body ? body.slice(0, 4000) : undefined;
-  } catch {
-    // 无守则文件 = 不注入（向后兼容）
-  }
-  return _playbookCache;
-}
-
 /** 把失败尝试的证据压缩成提示文本（跨轮只传压缩证据，不传 Agent 轨迹）。
  *  空数组返回 ""。 */
 export function formatRetryEvidence(entries: RetryEvidenceEntry[]): string {
@@ -396,58 +361,6 @@ export function formatRetryEvidence(entries: RetryEvidenceEntry[]): string {
   return lines.join("\n");
 }
 
-export function buildFixPrompt(
-  bug: Bug,
-  repoName: string,
-  repoPath: string,
-  testCmd: string,
-  retryEvidence = "",
-): string {
-  const desc = truncate(bug.description, 2000).trim();
-  const descText = desc || "（该 Bug 无描述文本）";
-  const evidenceSection = retryEvidence.trim()
-    ? `\n# 上一次尝试的记录（自动重试参考）\n${retryEvidence.trim()}\n`
-    : "";
-  const playbook = loadPlaybook();
-  const playbookSection = playbook
-    ? `\n# 修复守则（涉及异步/事件/生命周期/清理代码时必须对照）\n${playbook}\n`
-    : "";
-  return `你是自动修复 Tapd Bug 的编码 Agent。请修复下面的 Bug。
-
-# Bug 信息
-标题: ${bug.title}
-优先级: ${bug.priority_label || bug.priority}
-模块: ${bug.module}
-TAPD 单号: ${bug.id}
-描述:
-${descText}
-
-# 工作区规则（Perforce）
-1. 修改任何已有文件前，先执行: p4 edit <文件>
-2. 新建文件后执行: p4 add <文件>
-3. 禁止使用: p4 submit / p4 revert / p4 sync / p4 change
-4. 只把改动放进 default changelist。
-5. 涉及 prefab / 场景 / 图集 / 表格(xlsx/csv/bytes) / 其他二进制资源时，不要强行修改；把它们列入「需人工处理资源」清单并说明原因。
-6. 完成后不要提交。
-${evidenceSection}${playbookSection}
-# 定位要求
-- 如果仅凭标题/模块无法在代码中定位问题，或缺少关键信息（如复现步骤、日志），**不要臆测硬改**；把缺什么写进 blocked_reasons 并停止。
-- 优先在代码里搜索标题/模块相关的关键词来定位。
-
-# 仓库
-名称: ${repoName}
-路径: ${repoPath}
-测试命令: ${testCmd || "(无)"}
-修改后请尽量运行测试确认。
-
-# 输出要求（重要）
-结束时，在最后输出一行（可放在 json 代码块里），严格使用以下格式：
-FINAL_RESULT:
-\`\`\`json
-{"summary": "修复说明（中文，简述改动与验证结果）", "changed_files": ["相对仓库路径的文件"], "manual_assets": [{"path": "需人工处理的资源路径", "reason": "原因"}], "blocked_reasons": ["无法完成/缺少信息的原因"]}
-\`\`\``;
-}
-
 // ---------------------------------------------------------------------------
 // pi 适配器
 // ---------------------------------------------------------------------------
@@ -457,6 +370,10 @@ export interface PiRunOptions {
   timeoutS: number;
   onProgress?: (msg: string) => void;
   cancelEvent?: CancelEvent;
+  /** pi 内置工具白名单；用于调查/评审阶段强制只读。 */
+  tools?: string[];
+  /** 可选模型覆盖，供独立 Reviewer 使用。 */
+  model?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -578,8 +495,9 @@ export class PiAgent {
     // 另一个挂起点是 spawn 的 stdin（见下方 stdio: ["ignore","pipe","pipe"]）：
     // 二者缺一都会让 pi 永远等输入，二者同时满足才能让 --print 真正执行。
     // 模型覆盖：由 provider 构造 `--model <provider>/<model_id>`；未配置则不传（pi 用默认模型）
-    const model = effectivePiModel(this.config.pi);
+    const model = opts.model?.trim() || effectivePiModel(this.config.pi);
     if (model) args.push("--model", model);
+    if (opts.tools?.length) args.push("--tools", opts.tools.join(","));
     // 团队共享 skill 目录：pi 只认 <cwd>/.pi/skills，团队仓库里大家放的是 .agent(s)/skills，
     // 用 --skill <目录>（可重复）挂载进去。只传仓库里实际存在的目录（相对路径按仓库根解析）。
     for (const dir of this.skillDirs(opts.repoDir)) {

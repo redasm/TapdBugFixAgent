@@ -1,19 +1,25 @@
-# 运行模式
-#   review      - 修复后生成 pending changelist 并回写 Tapd 评论，人工在 p4 里 review/submit（推荐默认）
-#   auto        - 修复 + 测试通过后直接 p4 submit（高风险，显式开启）
-#   dry-run     - 只读：仅列出待处理 bug，不做任何修改
-mode: review
-
 # 注：web 管理台顶部的「⚙ 设置」可编辑 pi/p4/tapd 连接配置，保存写入同目录 overrides.yaml
 # （启动时合并、优先级最高），不必改本文件。本文件保留 workspaces / 优先级等复杂结构。
 
 # 修复流程参数
-poll_interval_min: 30          # 预留：外部定时任务用
 max_bugs_per_run: 10           # 单轮最多处理数量
 max_attempts: 2                # 单个 bug 自动重试次数：失败后自动回到队列重试（带上次失败证据），
                                # 重试耗尽才标记 failed 并回写 Tapd 失败评论。设为 1 = 不自动重试
 agent_timeout_s: 3600          # 每个编码 Agent 调用的超时（秒）。真实 bug 在大型仓库里定位+修改常超过 15 分钟
-llm_review: false              # 是否在生成 changelist 前用 LLM 复核 diff（额外一次 pi 调用）
+quality:
+  require_verification: true        # 无验证命令时只能生成 candidate，不能标记 verified
+  max_changed_files: 8
+  max_diff_lines: 500
+  admission:
+    min_score: 55
+    require_reproduction_signal: true
+    manual_keywords: [prefab, 场景, 图集, xlsx, csv, bytes, 二进制资源]
+    high_risk_keywords: [支付, 账号, 登录, 鉴权, 存档, 协议, 加密, 隐私]
+
+review:
+  enabled: true                     # 独立只读 Reviewer；high/medium finding 必须修正
+  max_fix_rounds: 1                 # Reviewer 拒绝后最多定向修正一轮
+  model: ""                         # 可指定不同评审模型；空值沿用修复模型
 
 # 过滤条件
 filters:
@@ -33,12 +39,13 @@ priority_weight:
 workspaces:
   - workspace_id: "1152729922"      # Tapd workspace_id（用 API 返回的为准）
     owner: "your_tapd_login"        # 你的 Tapd 登录名，用于 current_owner 过滤"分配给我的"
-    # comment_status 已废弃：单子状态不自动修改，只发评论；状态由人工 review/submit 后自行处理
     default_repo: "product"          # 默认仓库名（无法按模块匹配时使用）
     repos:                           # bug 所属仓库的本地路径（p4 workspace root）
       - name: "product"
         path: "C:\\repos\\product"   # 该目录需已配置好 p4 client 映射
-        test_cmd: "pytest tests"     # 修复后运行的测试命令（留空则跳过）
+        verify_cmds:                  # 按顺序执行；任一失败即停止
+          - "npm run typecheck"
+          - "npm test -- --runInBand"
 
 # 编码 Agent：pi（https://github.com/earendil-works/pi）
 #   以子进程方式调用 `pi --mode json "<prompt>"`（npm 全局安装 @earendil-works/pi-coding-agent）。

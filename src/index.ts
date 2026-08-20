@@ -14,6 +14,7 @@ import { Worker } from "./worker.js";
 import { createTapdClient } from "./tapd.js";
 import { TapdMcpClient } from "./tapdMcp.js";
 import type { Bug } from "./models.js";
+import { evaluateFiles, parseRunSpec } from "./evaluationCli.js";
 
 interface CliArgs {
   cmd: string;
@@ -22,14 +23,17 @@ interface CliArgs {
   once: boolean;
   host?: string;
   port?: number;
+  dataset?: string;
+  results: Array<{ name: string; path: string }>;
 }
 
 function parseArgs(argv: string[]): CliArgs {
   const args: CliArgs = {
     cmd: "",
     config: "config.yaml",
-    db: "tapd_agent.db",
+    db: "tapd_agent_v2.db",
     once: false,
+    results: [],
   };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -44,6 +48,10 @@ function parseArgs(argv: string[]): CliArgs {
       args.host = argv[++i];
     } else if (a === "--port") {
       args.port = Number(argv[++i]);
+    } else if (a === "--dataset") {
+      args.dataset = argv[++i];
+    } else if (a === "--result") {
+      args.results.push(parseRunSpec(argv[++i] ?? ""));
     } else if (a.startsWith("-")) {
       throw new Error(`未知参数: ${a}`);
     } else {
@@ -101,7 +109,9 @@ async function cmdRun(args: CliArgs): Promise<number> {
   console.log(`处理完成 ${count} 个 bug`);
   const jobs = store.listJobs("all").slice(0, limit);
   for (const it of jobs) {
-    const mark = it.agent_state === "resolved" || it.agent_state === "partial" ? "✓" : "✗";
+    const mark = ["candidate", "candidate_partial", "verified", "review_pending"].includes(
+      String(it.agent_state),
+    ) ? "✓" : "✗";
     console.log(`  ${mark} ${it.bug_id}  [${it.agent_state}]  changelist=${it.changelist}  ${String(it.title ?? "").slice(0, 40)}`);
   }
   return 0;
@@ -162,6 +172,29 @@ async function cmdMcpTools(args: CliArgs): Promise<number> {
   return 0;
 }
 
+function percent(value: number): string {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+async function cmdEval(args: CliArgs): Promise<number> {
+  if (!args.dataset || !args.results.length) {
+    console.error("eval 需要 --dataset <cases.jsonl> 和至少一个 --result <name=path>");
+    return 1;
+  }
+  const reports = evaluateFiles(args.dataset, args.results);
+  console.log("模型/Prompt             综合分  覆盖率  有效修复  验证通过  范围精确  评审通过  原样接受");
+  console.log("-".repeat(100));
+  for (const report of reports) {
+    console.log(
+      `${report.name.padEnd(22)} ${report.score.toFixed(3).padStart(6)}  `
+      + `${percent(report.coverage).padStart(6)}  ${percent(report.effective_fix_rate).padStart(8)}  `
+      + `${percent(report.verified_rate).padStart(8)}  ${percent(report.scope_precision).padStart(8)}  `
+      + `${percent(report.review_pass_rate).padStart(8)}  ${percent(report.unchanged_acceptance_rate).padStart(8)}`,
+    );
+  }
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   let args: CliArgs;
   try {
@@ -180,6 +213,8 @@ async function main(argv: string[]): Promise<number> {
       return cmdServe(args);
     case "mcp-tools":
       return cmdMcpTools(args);
+    case "eval":
+      return cmdEval(args);
     default:
       printHelp();
       return 1;
@@ -193,11 +228,14 @@ function printHelp(): void {
   run              无界面：处理一批
   serve            启动 Web 管理台 + 工作线程
   mcp-tools        调试：连上 Tapd MCP 并打印发现的工具清单
+  eval             离线比较历史 Bug 的不同模型/Prompt 结果
 选项:
   --config <path>  配置文件路径（默认 config.yaml）
-  --db <path>      状态库路径（默认 tapd_agent.db）
+  --db <path>      状态库路径（默认 tapd_agent_v2.db）
   --host <ip>      监听地址（serve，默认取配置）
-  --port <n>       端口（serve，默认取配置）`);
+  --port <n>       端口（serve，默认取配置）
+  --dataset <path> eval 的历史 Bug JSONL 数据集
+  --result <n=p>   eval 的结果 JSONL，可重复，例如 --result model-a=a.jsonl`);
 }
 
 const code = await main(process.argv.slice(2));

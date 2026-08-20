@@ -28,7 +28,6 @@ import {
   AgentRuntimeError,
   CancelEvent,
   PiAgent,
-  buildFixPrompt,
   effectivePiModel,
   ensurePiModels,
   extractFinalJson,
@@ -99,14 +98,29 @@ function makeResult(over: Partial<AgentResult> = {}): AgentResult {
   };
 }
 
+function makeInvestigation(file: string): AgentResult {
+  return makeResult({
+    raw_output: `FINAL_RESULT: {"root_cause":"测试根因","evidence":["${file}:1"],"reproduction":{"command":"","before":"复现失败"},"planned_files":["${file}"],"confidence":0.9,"blocked_reasons":[]}`,
+  });
+}
+
 function makeConfig(): Config {
   return {
-    mode: "review",
-    poll_interval_min: 30,
     max_bugs_per_run: 10,
     max_attempts: 1,
     agent_timeout_s: 900,
-    llm_review: false,
+    quality: {
+      admission: {
+        min_score: 0,
+        require_reproduction_signal: false,
+        manual_keywords: [],
+        high_risk_keywords: [],
+      },
+      require_verification: false,
+      max_changed_files: 8,
+      max_diff_lines: 500,
+    },
+    review: { enabled: false, max_fix_rounds: 0, model: "" },
     exclude_status: ["resolved", "closed", "rejected"],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -123,11 +137,16 @@ function tmpdir(): string {
 }
 
 /** 建一个带一个 workspace（repos 可注入）的 worker。 */
-function makeWorker(repos: Array<{ name: string; path: string; test_cmd: string }> = []): Worker {
+function makeWorker(repos: Array<{ name: string; path: string; verify_cmds: string[] }> = []): Worker {
   const store = new StateStore(":memory:");
   const cfg = makeConfig();
   cfg.workspaces = [
-    { workspace_id: "111", owner: "me", repos, default_repo: "", comment_status: "resolved" },
+    {
+      workspace_id: "111",
+      owner: "me",
+      repos,
+      default_repo: "",
+    },
   ];
   return new Worker(cfg, store);
 }
@@ -230,14 +249,13 @@ describe("config", () => {
     const cfgPath = path.join(d, "config.yaml");
     fs.writeFileSync(
       cfgPath,
-      `mode: review
-workspaces:
+      `workspaces:
   - workspace_id: "111"
     owner: me
     repos:
       - name: p
         path: "."
-        test_cmd: "echo ok"
+        verify_cmds: ["echo ok"]
 priority_weight:
   高: 0
   低: 1
@@ -250,13 +268,13 @@ priority_weight:
     expect(cfg.priority_weight["低"]).toBe(1);
   });
 
-  it("loadConfig 解析 pi.provider；pi.model 旧字段被忽略", () => {
+  it("loadConfig 拒绝旧 pi.model 字段", () => {
     const dir = tmpdir();
     const cfgPath = path.join(dir, "c.yaml");
     fs.writeFileSync(
       cfgPath,
       `pi:
-  model: "kuro/legacy"           # 旧字段，已废弃，应被忽略
+  model: "kuro/legacy"
   provider:
     id: "kuro"
     base_url: "https://ai-gateway.kurogames.com"
@@ -266,15 +284,7 @@ priority_weight:
 `,
       "utf-8",
     );
-    const cfg = loadConfig(cfgPath);
-    expect((cfg.pi as Record<string, unknown>).model).toBeUndefined();
-    expect(cfg.pi.provider).toMatchObject({
-      id: "kuro",
-      base_url: "https://ai-gateway.kurogames.com",
-      api_key_env: "ANTHROPIC_AUTH_TOKEN",
-      auth_header: true,
-      model_id: "deepseek-v4-flash",
-    });
+    expect(() => loadConfig(cfgPath)).toThrow(/不再支持的配置字段.*pi\.model/);
   });
 
   it("loadConfig 解析 pi.skill_dirs（团队共享 skill 目录）", () => {
@@ -401,16 +411,16 @@ describe("state", () => {
 
       const bug = makeBug();
       store.upsertJob(bug, { agent_state: "in_progress" });
-      store.updateJob(bug.id, { agent_state: "resolved", changelist: 42 });
+      store.updateJob(bug.id, { agent_state: "review_pending", changelist: 42 });
       const job = store.getJob(bug.id);
       expect(job?.changelist).toBe(42);
-      expect(job?.agent_state).toBe("resolved");
+      expect(job?.agent_state).toBe("review_pending");
 
       store.addEvent("test", "info", bug.id);
       const events = store.listEvents(bug.id);
       expect(events.length).toBe(1);
       expect(store.jobCount()).toBe(1);
-      expect(store.jobStateCounts()["resolved"]).toBe(1);
+      expect(store.jobStateCounts()["review_pending"]).toBe(1);
     } finally {
       store.close();
     }
@@ -462,7 +472,7 @@ describe("state", () => {
     }
   });
 
-  it("旧库无 model 列时自动补列", () => {
+  it("旧数据库 schema 直接报错，开发阶段不做自动迁移", () => {
     const d = tmpdir();
     const p = path.join(d, "old.db");
     const conn = new Database(p);
@@ -478,15 +488,67 @@ describe("state", () => {
                CREATE INDEX idx_jobs_state ON jobs(agent_state);
                CREATE INDEX idx_events_bug ON events(bug_id);`);
     conn.close();
-    const store = new StateStore(p);
-    try {
-      const cols = (store as unknown as { db: Database.Database }).db
-        .prepare("PRAGMA table_info(jobs)")
-        .all() as { name: string }[];
-      expect(cols.some((c) => c.name === "model")).toBe(true);
-    } finally {
-      store.close();
-    }
+    expect(() => new StateStore(p)).toThrow(/数据库 schema 不匹配.*删除.*重建/);
+  });
+
+  it("记录人工接受、修改、拒绝和 reopen，并计算真实准确率指标", () => {
+    const store = new StateStore(":memory:");
+    const accepted = makeBug({ id: "1152729922001234001" });
+    const modified = makeBug({ id: "1152729922001234002" });
+    const rejected = makeBug({ id: "1152729922001234003" });
+    store.upsertJob(accepted, { agent_state: "review_pending", changelist: 101 });
+    store.upsertJob(modified, { agent_state: "review_pending", changelist: 102 });
+    store.upsertJob(rejected, { agent_state: "review_pending", changelist: 103 });
+
+    store.recordFeedback(accepted.id, {
+      outcome: "accepted_unchanged",
+      reason: "原样提交",
+      human_changed_lines: 0,
+      submitted_changelist: 101,
+    });
+    store.recordFeedback(modified.id, {
+      outcome: "accepted_modified",
+      reason: "补了一个边界判断",
+      human_changed_lines: 4,
+      submitted_changelist: 202,
+    });
+    store.recordFeedback(rejected.id, {
+      outcome: "rejected_wrong_root_cause",
+      reason: "根因判断错误",
+      human_changed_lines: 0,
+      submitted_changelist: null,
+    });
+    store.recordFeedback(accepted.id, {
+      outcome: "reopened",
+      reason: "线上再次复现",
+      human_changed_lines: 0,
+      submitted_changelist: 101,
+    });
+
+    expect(store.getJob(accepted.id)?.agent_state).toBe("reopened");
+    expect(store.getJob(modified.id)?.agent_state).toBe("accepted_modified");
+    expect(store.getJob(rejected.id)?.agent_state).toBe("rejected");
+    const metrics = store.qualityMetrics();
+    expect(metrics.reviewed).toBe(3);
+    expect(metrics.accepted_unchanged).toBe(1);
+    expect(metrics.accepted_modified).toBe(1);
+    expect(metrics.rejected).toBe(1);
+    expect(metrics.reopened).toBe(1);
+    expect(metrics.candidate_precision).toBeCloseTo(2 / 3);
+    expect(metrics.unchanged_acceptance_rate).toBeCloseTo(1 / 3);
+  });
+
+  it("拒绝未知反馈结果，避免污染评测标签", () => {
+    const store = new StateStore(":memory:");
+    const bug = makeBug();
+    store.upsertJob(bug, { agent_state: "review_pending" });
+
+    expect(() => store.recordFeedback(bug.id, {
+      outcome: "looks_good" as never,
+      reason: "",
+      human_changed_lines: 0,
+      submitted_changelist: null,
+    })).toThrow("未知反馈结果");
   });
 });
 
@@ -767,6 +829,27 @@ function withFakePiOnPath(dir: string, fn: () => Promise<void>): Promise<void> {
 }
 
 describe("PiAgent 子进程控制", () => {
+  it("只读阶段通过 --tools 限制为代码浏览工具，并可覆盖评审模型", async () => {
+    const d = tmpdir();
+    writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
+    const agent = new PiAgent(makeConfig());
+    await withFakePiOnPath(d, async () => {
+      await agent.run({
+        prompt: "x",
+        repoDir: d,
+        timeoutS: 60,
+        tools: ["read", "grep", "find", "ls"],
+        model: "kuro/reviewer-model",
+      });
+    });
+
+    const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
+    expect(args).toContain("--tools");
+    expect(args).toContain("read,grep,find,ls");
+    expect(args).toContain("--model");
+    expect(args).toContain("kuro/reviewer-model");
+  });
+
   it("超时杀进程树并抛 AgentRuntimeError", async () => {
     const d = tmpdir();
     writeFakePi(d, 'node -e "setTimeout(()=>{},120000)"');
@@ -1166,7 +1249,7 @@ describe("worker web 合并", () => {
 // ---------------------------------------------------------------------------
 describe("本地任务（Tapd 列表外）可见可处理", () => {
   it("fetchActionable 纳入本地 pending（Tapd 直拉补全描述）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, []); // Tapd「我的」列表拉不到它
     stubTapd(w, new FakeTapd([bug])); // 但按 id 直拉能拉到
@@ -1178,7 +1261,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("Tapd 直拉也失败时用本地快照入队（不阻断）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, []);
     stubTapd(w, new FakeTapd([])); // 直拉也失败
@@ -1191,7 +1274,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("快照 tapd_status 已终态（resolved）的本地 pending 不复活", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287", status: "resolved" });
     stubMyBugs(w, []);
     stubTapd(w, new FakeTapd([bug]));
@@ -1201,7 +1284,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("回归：Tapd 确认无此单（直拉返回空壳）→ 本地 pending 自动转 skipped，不入队", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, []);
     // REST/MCP 对不存在的单返回「只有 id 的空壳」（无标题无状态）
@@ -1219,7 +1302,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("回归：直拉抛错（接口波动）→ 保持 pending 用快照入队，不误杀", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, []);
     stubTapd(w, {
@@ -1253,11 +1336,15 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     const ok = makeBug({ id: "1152729922001254289" });
     w.store.upsertJob(a, { agent_state: "failed" });
     w.store.upsertJob(b, { agent_state: "failed" });
-    w.store.upsertJob(ok, { agent_state: "resolved" });
+    w.store.upsertJob(ok, { agent_state: "accepted" });
     w.store.updateJob(a.id, {
       attempts: 2,
       failure_reason: "旧失败原因",
       retry_evidence: dumps([{ attempt: 1, at: "2026-08-11 09:00:00", failure_reason: "x", opened_files: [], agent_summary: "", manual_assets: [] }]),
+      admission_score: 88,
+      investigation: { root_cause: "旧根因" },
+      verification: { verified: true },
+      review_findings: { approved: true },
     });
 
     const n = w.retryAllFailed();
@@ -1267,9 +1354,13 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
       expect(job?.attempts).toBe(0);
       expect(job?.failure_reason).toBeNull();
       expect(job?.retry_evidence).toBeNull();
+      expect(job?.admission_score).toBeNull();
+      expect(job?.investigation).toBeNull();
+      expect(job?.verification).toBeNull();
+      expect(job?.review_findings).toBeNull();
       expect(job?.finished_at).toBeNull();
     }
-    expect(w.store.getJob(ok.id)?.agent_state).toBe("resolved");
+    expect(w.store.getJob(ok.id)?.agent_state).toBe("accepted");
     // 重置后进入可处理队列
     stubMyBugs(w, []);
     stubTapd(w, new FakeTapd([a, b]));
@@ -1282,8 +1373,14 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     const live2 = makeBug({ id: "1152729922001254288", status: "resolved" }); // Tapd 终态 → 不同步
     const gone = makeBug({ id: "1152729922001254290" }); // 只有本地有（Tapd 列表外）→ 应被清掉
     stubMyBugs(w, [live1, live2]);
-    w.store.upsertJob(live1, { agent_state: "resolved", changelist: 777 }); // 历史被清
+    w.store.upsertJob(live1, { agent_state: "accepted", changelist: 777 }); // 历史被清
     w.store.upsertJob(gone, { agent_state: "failed" });
+    w.store.recordFeedback(live1.id, {
+      outcome: "accepted_unchanged",
+      reason: "人工确认正确",
+      human_changed_lines: 0,
+      submitted_changelist: 777,
+    });
     w.store.addEvent("旧事件", "info", live1.id);
     expect(w.store.jobCount()).toBe(2);
 
@@ -1302,6 +1399,8 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     const evs = w.store.listEvents(undefined, 10);
     expect(evs.some((e) => String(e.msg).includes("重新同步"))).toBe(true);
     expect(evs.some((e) => String(e.msg) === "旧事件")).toBe(false);
+    expect(w.store.listFeedback(live1.id)).toHaveLength(1); // 质量标签不是队列缓存，必须长期保留
+    expect(w.store.qualityMetrics().accepted_unchanged).toBe(1);
   });
 
   it("resyncFromTapd 运行态拒绝（非运行才可用，后端同 UI 一道闸）", async () => {
@@ -1312,7 +1411,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     await expect(w.resyncFromTapd()).rejects.toThrow(/运行中不可清除同步/);
     // 记录未被清
     expect(w.store.jobCount()).toBe(0); // 尚未 upsert，仍是 0；改为先建再拒绝验证
-    w.store.upsertJob(bug, { agent_state: "resolved" });
+    w.store.upsertJob(bug, { agent_state: "accepted" });
     await expect(w.resyncFromTapd()).rejects.toThrow();
     expect(w.store.jobCount()).toBe(1); // 拒绝时不动数据
     // 停止后可用
@@ -1362,7 +1461,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("agent 被取消时 bug 回到 pending，不算失败", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, [bug]);
 
@@ -1389,7 +1488,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("回归：人工跳过正在处理的 bug，中断后不把 skipped 覆盖回 pending", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, [bug]);
     const oldEvt = w.cancelEvent;
@@ -1419,7 +1518,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("重试正在处理的 bug：中断当前尝试并换新取消令牌", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1152729922001254287" });
     w.store.upsertJob(bug, { agent_state: "in_progress" });
     w.store.updateJob(bug.id, { attempts: 2, failure_reason: "旧失败" });
@@ -1469,40 +1568,216 @@ describe("formatRetryEvidence", () => {
   });
 });
 
-describe("buildFixPrompt 重试段", () => {
-  it("有证据时注入重试段，无证据不注入", () => {
+describe("worker 两阶段修复协议", () => {
+  it("default changelist 存在无法归属的遗留文件时停止，绝不混入当前 Bug", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
-    const p = buildFixPrompt(bug, "r", "C:\\tmp", "pytest", "证据文本");
-    expect(p).toContain("上一次尝试的记录");
-    expect(p).toContain("证据文本");
-    const p2 = buildFixPrompt(bug, "r", "C:\\tmp", "pytest");
-    expect(p2).not.toContain("上一次尝试的记录");
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
+      { depot: "//depot/OtherBug.ts", action: "edit", changelist: "default", type: "text" },
+    ]);
+
+    await w.processBug(bug);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
+    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("default changelist 不干净");
   });
 
-  it("修复守则（defensive-patterns）存在时注入 prompt，缺失时不阻断", () => {
+  it("存在未 p4 edit 的本地改动时停止，避免 reconcile 后混入当前 Bug", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
-    const p = buildFixPrompt(bug, "r", "C:\\tmp", "pytest");
-    const playbookPath = path.join(
-      path.dirname(path.dirname(fileURLToPath(import.meta.url))),
-      "prompts",
-      "defensive-patterns.md",
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue(
+      "//depot/OtherBug.ts - edit C:\\tmp\\OtherBug.ts",
     );
-    if (fs.existsSync(playbookPath)) {
-      expect(p).toContain("修复守则");
-      expect(p).toContain("正交结果独立上报"); // deepseek-harness 防御模式之一
-      expect(p).toContain("清理必须达到完全停稳");
-      // 只注入正文：文件标题不重复出现在 prompt 里
-      expect(p).not.toContain("来自 deepseek-harness docs");
-    } else {
-      // 文件被删掉的部署场景：prompt 仍能构造，只是没有守则段
-      expect(p).not.toContain("修复守则");
-    }
+
+    await w.processBug(bug);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("未登记的本地改动");
+  });
+
+  it("先以只读工具调查，再把根因证据交给写入阶段", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) {
+        return makeResult({
+          raw_output: 'FINAL_RESULT: {"root_cause":"空引用来自缓存失效","evidence":["Login.ts:42"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+        });
+      }
+      return makeResult({ changed_files: ["Login.ts"], summary: "修复缓存失效" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        { depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" },
+      ]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue(
+      "--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed",
+    );
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(String(calls[1].prompt)).toContain("空引用来自缓存失效");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("仅在机器验证实际通过后调用 Reviewer 并标记评审通过", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.review.enabled = true;
+    w.config.workspaces[0].repos[0].verify_cmds = ["   "];
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) {
+        return makeResult({
+          raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["Login.ts:42"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+        });
+      }
+      return makeResult({ changed_files: ["Login.ts"], summary: "修复空引用" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        { depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" },
+      ]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue(
+      "--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed",
+    );
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(2);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("Agent 修改 planned_files 之外的文件时拒绝生成 changelist", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeResult({
+        raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["Login.ts:42"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+      }))
+      .mockResolvedValueOnce(makeResult({ changed_files: ["Login.ts"], summary: "修复空引用" }));
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        { depot: "//depot/Unrelated.ts", action: "edit", changelist: "default", type: "text" },
+      ]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    const createPending = vi.spyOn(P4Client.prototype, "createPending");
+
+    await w.processBug(bug);
+
+    expect(createPending).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("failed");
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("超出调查阶段计划范围");
+  });
+
+  it("Reviewer 拒绝后把结构化 finding 交回 Fixer，修正并复审通过", async () => {
+    const w = makeWorker([{
+      name: "r",
+      path: "C:\\tmp",
+      verify_cmds: ['node -e "process.exit(0)"'],
+    }]);
+    w.config.review.enabled = true;
+    w.config.review.max_fix_rounds = 1;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) {
+        return makeResult({
+          raw_output: 'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["Settings.ts:42"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
+        });
+      }
+      if (calls.length === 2) {
+        return makeResult({
+          changed_files: ["Settings.ts"],
+          manual_assets: [{ path: "Assets/Settings.prefab", reason: "需在 Unity 中调整绑定" }],
+          summary: "首次修复",
+        });
+      }
+      if (calls.length === 3) {
+        return makeResult({
+          raw_output: 'FINAL_RESULT: {"approved":false,"note":"错误路径遗漏","findings":[{"severity":"high","title":"失败时仍显示成功","file":"Settings.ts","line":50,"evidence":"catch 分支仍调用 showSuccess","required_action":"失败分支必须显示错误并返回"}]}',
+        });
+      }
+      if (calls.length === 4) return makeResult({ changed_files: ["Settings.ts"], summary: "补齐失败路径" });
+      return makeResult({ raw_output: 'FINAL_RESULT: {"approved":true,"note":"问题已修复","findings":[]}' });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        { depot: "//depot/Settings.ts", action: "edit", changelist: "default", type: "text" },
+      ]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue(
+      "--- a/Settings.ts\n+++ b/Settings.ts\n-old\n+fixed",
+    );
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(5);
+    expect(calls[2].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(String(calls[3].prompt)).toContain("失败分支必须显示错误并返回");
+    expect(calls[4].tools).toEqual(["read", "grep", "find", "ls"]);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("candidate_partial");
+    expect(String(job?.manual_assets)).toContain("Assets/Settings.prefab");
+  }, 10000);
+
+  it("准入不通过时不调用 Agent，并记录需要补充的信息", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.quality.admission.min_score = 55;
+    w.config.quality.admission.require_reproduction_signal = true;
+    const bug = makeBug({ name: "功能异常", description: "不对", module: "" });
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run");
+
+    await w.processBug(bug);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("needs_info");
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("复现");
   });
 });
 
 describe("worker 自动重试", () => {
   it("未耗尽重试次数回 pending，耗尽才 failed；重试前撤销遗留 default 文件", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug({ id: "1152729922001254287" });
     stubMyBugs(w, [bug]);
@@ -1510,10 +1785,13 @@ describe("worker 自动重试", () => {
 
     vi.spyOn(PiAgent.prototype, "run").mockRejectedValue(new Error("测试未通过"));
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
-    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
-      { depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" },
-      { depot: "//depot/b.prefab", action: "edit", changelist: "888", type: "binary" }, // 编号 changelist 应被忽略
-    ]);
+    const openedA = [{ depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" }];
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([]) // 首次开始前工作区干净
+      .mockResolvedValueOnce(openedA) // 首次 Agent 失败后留下 default 文件
+      .mockResolvedValueOnce(openedA) // 第二次开始时定位并撤销遗留文件
+      .mockResolvedValueOnce([]) // 撤销后工作区恢复干净
+      .mockResolvedValueOnce([]); // 第二次失败未留下新文件
     const revertCalls: string[][] = [];
     vi.spyOn(P4Client.prototype, "revert").mockImplementation(async function (
       this: unknown,
@@ -1545,7 +1823,7 @@ describe("worker 自动重试", () => {
   });
 
   it("max_attempts=1（默认）首次失败即 failed，不重试", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -1560,7 +1838,7 @@ describe("worker 自动重试", () => {
   });
 
   it("Tapd 失败评论只在最后一次失败回写，含总尝试次数", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.max_attempts = 3;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -1586,7 +1864,7 @@ describe("worker 自动重试", () => {
   });
 
   it("回归：修复成功只发 Tapd 评论，绝不自动修改单子状态（状态由人工 review/submit 后自行处理）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     const comments: string[] = [];
@@ -1596,25 +1874,27 @@ describe("worker 自动重试", () => {
       updateBug: async (_id: string, fields: Record<string, unknown>) => { statusUpdates.push(fields); },
     } as unknown as FakeTapd);
 
-    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(
-      makeResult({ changed_files: ["a.cpp"], summary: "修好了" }),
-    );
+    vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeInvestigation("a.cpp"))
+      .mockResolvedValueOnce(makeResult({ changed_files: ["a.cpp"], summary: "修好了" }));
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
-    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
-      { depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" },
-    ]);
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        { depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" },
+      ]);
     vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
 
     await w.processBug(bug);
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("resolved");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("pending changelist: 4321");
     expect(comments[0]).toContain("状态未修改"); // 评文明示状态留给人工
     expect(statusUpdates).toEqual([]); // 一次 updateBug 都不许有
   });
 
-  it("成功后清空重试证据与遗留文件记录", async () => {    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+  it("成功后清空重试证据与遗留文件记录", async () => {    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -1630,9 +1910,9 @@ describe("worker 自动重试", () => {
 
     const revertCalls: string[][] = [];
     const createPendingCalls: Array<{ desc: string; files?: string[] }> = [];
-    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(
-      makeResult({ changed_files: ["a.cpp"], summary: "修好了" }),
-    );
+    vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeInvestigation("a.cpp"))
+      .mockResolvedValueOnce(makeResult({ changed_files: ["a.cpp"], summary: "修好了" }));
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
       { depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" },
@@ -1654,7 +1934,7 @@ describe("worker 自动重试", () => {
 
     await w.processBug(bug);
     const job = w.store.getJob(bug.id);
-    expect(job?.agent_state).toBe("resolved");
+    expect(job?.agent_state).toBe("candidate");
     expect(job?.retry_evidence).toBeNull();
     expect(job?.last_attempt_files).toBeNull();
     expect(job?.attempts).toBe(1);
@@ -1667,21 +1947,28 @@ describe("worker 自动重试", () => {
   });
 
   it("回归：FINAL_RESULT 解析失败但 p4 有打开文件时按事实采纳，不再误判失败（bug 1256834 实例）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
 
     // Agent 实际改了文件（p4 已打开），但最终输出没有可解析的 FINAL_RESULT
-    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(
-      makeResult({ ok: true, summary: "", raw_output: "一堆没有结构化结果的文本" }),
-    );
+    vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeInvestigation("fixed.ts"))
+      .mockResolvedValueOnce(
+        makeResult({ ok: true, summary: "", raw_output: "一堆没有结构化结果的文本" }),
+      );
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
-    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async (cl?: string) => [
-      { depot: "//depot/fixed.ts", action: "edit", changelist: "default", type: "text" },
-      // 编号 changelist 里是别的 bug 的文件，不能混进本次结果
-      { depot: "//depot/other.ts", action: "edit", changelist: "737633", type: "text" },
-    ].filter((o) => !cl || o.changelist === cl));
+    let openedCalls = 0;
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async (cl?: string) => {
+      openedCalls += 1;
+      if (openedCalls === 1 && cl === "default") return [];
+      return [
+        { depot: "//depot/fixed.ts", action: "edit", changelist: "default", type: "text" },
+        // 编号 changelist 里是别的 bug 的文件，不能混进本次结果
+        { depot: "//depot/other.ts", action: "edit", changelist: "737633", type: "text" },
+      ].filter((o) => !cl || o.changelist === cl);
+    });
     vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
     const createPendingCalls: Array<{ desc: string; files?: string[] }> = [];
     vi.spyOn(P4Client.prototype, "createPending").mockImplementation(
@@ -1693,7 +1980,7 @@ describe("worker 自动重试", () => {
 
     await w.processBug(bug);
     const job = w.store.getJob(bug.id);
-    expect(job?.agent_state).toBe("resolved");
+    expect(job?.agent_state).toBe("candidate");
     expect(job?.changelist).toBe(737999);
     expect(createPendingCalls).toHaveLength(1);
     expect(createPendingCalls[0].files).toEqual(["//depot/fixed.ts"]); // 只含 default 文件
@@ -1702,7 +1989,7 @@ describe("worker 自动重试", () => {
   });
 
   it("回归：遗留文件已被并入编号 changelist 时不盲撤（避免误杀其它 bug 的 pending 改动）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", test_cmd: "" }]);
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -1918,6 +2205,17 @@ describe("web 前端 bug_id 内插引号", () => {
   it("顶部有「重试全部失败」按钮并调 retry-failed 接口", () => {
     expect(html).toContain('id="btnRetryFailed"');
     expect(html).toContain("/api/retry-failed");
+  });
+
+  it("展示候选/验证/评审状态、质量指标，并可提交人工反馈", () => {
+    expect(html).toContain("review_pending");
+    expect(html).toContain("candidate_partial");
+    expect(html).toContain("blocked_workspace");
+    expect(html).toContain("stAcceptance");
+    expect(html).toContain("/api/bugs/${id}/feedback");
+    expect(html).toContain("accepted_unchanged");
+    expect(html).toContain("rejected_wrong_root_cause");
+    expect(html).toContain("reopened");
   });
 
   it("顶部有「清除并重新同步」按钮并调 resync 接口（含确认弹窗与进行中状态）", () => {

@@ -1,6 +1,6 @@
 # TapdBugFixAgent
 
-自动从 Tapd 拉取分配给你的 Bug，按优先级逐个交给 **pi 编码 Agent**（子进程调用，自主完成定位、编辑、验证）修复，
+自动从 Tapd 拉取分配给你的 Bug，按优先级执行 **准入 → 只读调查 → 最小修复 → 机器验证 → 独立评审**，
 产出 **Perforce pending changelist**（描述自动生成，首行带 `【b<短号>】` 可过 swarm 校验），并回写 Tapd 评论。
 配套 **Web 管理台** 实时监控与控制全流程。
 
@@ -74,7 +74,9 @@ workspaces:
     repos:
       - name: "P4_Project_Name"
         path: 'D:\p4\client'        # ③ 本地 p4 workspace root（专用 client）
-        test_cmd: ""                # 修复后运行的测试命令（留空跳过）
+        verify_cmds:                # 按顺序执行；任一失败即停止
+          - "npm run typecheck"
+          - "npm test -- --runInBand"
 
 p4:
   port: p4.example.com:1666         # ④ p4 服务器
@@ -109,9 +111,27 @@ npm run build && npm start
 
 CLI 通用选项：`--config <path>`、`--db <path>`、`--host` / `--port`（serve）。
 
-单个 bug 的处理流程：拉取队列（≤1 次/分钟缓存）→ `p4 sync` → 注入 prompt（bug 信息 + 失败重试证据 +
-修复守则 + 团队 skill）调 pi → 验证（default changelist 打开检查 / reconcile 兜底 / 测试命令）→
-生成 pending changelist → Tapd 评论（不改状态）。失败按 `max_attempts` 自动重试并携带上次失败证据。
+单个 bug 的处理流程：拉取队列（≤1 次/分钟缓存）→ 自动修复准入评分 → `p4 sync` →
+只读调查 Agent（通过 `--tools read,grep,find,ls` 强制禁止写入）→ 修复 Agent 最小修改 →
+P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Reviewer finding 定向修正/复审 →
+生成 pending changelist → Tapd 评论（不改状态）。失败按 `max_attempts` 自动重试并携带测试、文件和评审证据。
+
+这套流程参考 Codex 官方公开的 [workflows](https://developers.openai.com/codex/workflows) 与
+[code review](https://developers.openai.com/codex/code-review) 工作方式：先复现、补丁后重跑复现和最小相关测试；
+评审使用专用只读 Reviewer，输出分级且可执行的 findings。项目并不依赖 Codex 内部实现。
+
+### 准确率门禁
+
+- **结构化 Bug 上下文**：从 TAPD 原始字段整理复现步骤、预期/实际结果、环境、日志、评论和附件。
+- **自动修复准入**：描述过短、缺少复现信号时进入 `needs_info`；资源类进入 `manual_only`；支付、账号、
+  存档、协议等高风险项进入 `manual_review`。
+- **严格验证**：未配置 `verify_cmds` 时只能生成 `candidate`，不会标记为“已验证”。
+- **范围限制**：默认最多 8 个文件、500 行 diff，超限转失败/人工分析，避免无关大改。
+- **计划白名单**：实际 P4 改动必须属于只读调查阶段声明的 `planned_files`，计划外文件会拒绝候选。
+- **工作区隔离**：default changelist 中若有无法归属当前 Bug 的遗留文件，或 `p4 reconcile -n`
+  检出未登记的本地改动，任务进入 `blocked_workspace`，不调用 Agent、不消耗重试次数，也绝不把遗留改动混入当前补丁。
+- **独立评审**：Reviewer 强制只读；high/medium finding 会交回 Fixer，修正后重新验证和复审。
+- **真实结果回流**：人工可记录原样接受、修改后接受、具体拒绝原因和 reopen，管理台展示真实准确率。
 
 ## Web 管理台
 
@@ -121,11 +141,14 @@ CLI 通用选项：`--config <path>`、`--db <path>`、`--host` / `--port`（ser
 - **列表**：按状态分组（处理中置顶），显示优先级 / changelist / 尝试次数；`⚠不在Tapd列表` 标记本地有记录但
   已不在"分配给我"列表的 bug（可重试，Tapd 已删除的会自动跳过并留痕）
 - **详情抽屉**：Agent 实时进度（终端形式）、生成的 changelist 描述、修改文件、需人工资源、失败原因、
-  自动重试记录、操作日志
+  自动重试记录、只读调查结论、机器验证、Reviewer findings、操作日志
+- **人工结论**：在候选详情记录原样接受 / 修改后接受 / 根因错误 / 定位错误 / 回归 / 过度修改 /
+  未解决 / reopen；不会自动 submit，也不会修改 TAPD 状态
+- **质量指标**：顶部显示原样接受率和候选精确率；`GET /api/quality/metrics` 可供监控系统采集
 - **批量操作**：
   - **↻ 重试全部失败**：所有失败任务重置为待处理并入队
-  - **⟳ 清除并重新同步**（仅非运行状态可用）：清空全部本地记录，从 Tapd 强拉最新列表重置为待处理。
-    注意 p4 上已生成的 pending changelist 不受影响；但 Tapd 上仍是 new 的旧单会被重新处理
+  - **⟳ 清除并重新同步**（仅非运行状态可用）：清空本地任务状态和事件，从 Tapd 强拉最新列表重置为待处理。
+    人工反馈与质量指标会保留；p4 上已生成的 pending changelist 不受影响，但 Tapd 上仍是 new 的旧单会被重新处理
 - **单条操作**：重试 / 跳过（正在处理的重试/跳过会先中断当前尝试）
 - **⚙ 设置**：在线编辑连接配置（写 overrides.yaml）
 - token 错误会弹输入框让你当场修正并记住，不再是死胡同
@@ -142,8 +165,25 @@ Tapd ──REST(API账号)──>       │        │                        �
                               Web 管理台 (Express + SSE)
 ```
 
-**状态机**：`pending → in_progress → resolved / partial / manual_only / failed / skipped`；
+**新状态机**：
+
+```text
+pending → in_progress
+  ├─ needs_info / manual_only / manual_review
+  ├─ blocked_workspace         # default changelist 有无法归属的遗留文件，清理后人工重试
+  ├─ candidate                 # 有补丁但未配置机器验证
+  ├─ candidate_partial         # 候选代码 + 人工资源项
+  ├─ verified                  # 机器验证通过，未启用独立评审
+  └─ review_pending            # 机器验证和独立评审通过
+       ├─ accepted
+       ├─ accepted_modified
+       ├─ rejected
+       └─ reopened
+```
+
 失败未耗尽重试回 `pending`；Tapd 上已删除的单自动转 `skipped` 留痕。
+开发阶段不维护旧数据库迁移。新版默认使用 `tapd_agent_v2.db`；旧 `tapd_agent.db` 原样保留，
+不读取也不自动转换。若显式传入旧 schema 数据库，启动会提示改用新库。
 
 **P4 安全**：Agent 只允许 `p4 edit / add / delete`（submit / revert / sync / change 写入 prompt 禁止）；
 工具侧只收集 **default changelist** 的文件生成 pending，绝不动其它编号 changelist；
@@ -155,6 +195,31 @@ name + description，文件必须无 BOM）。可用 `pi.skill_dirs` 覆盖。
 
 **修复守则**：`prompts/defensive-patterns.md` 启动时读取注入 prompt（整理自
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的真实缺陷类别，MIT）。删文件即停用。
+
+## 历史 Bug 离线评测
+
+用固定 JSONL 历史集比较不同模型或 Prompt，不接触真实 P4 workspace：
+
+```bash
+npm run dev -- eval \
+  --dataset eval/cases.jsonl \
+  --result deepseek-v4=eval/results-deepseek-v4.jsonl \
+  --result reviewer-v2=eval/results-reviewer-v2.jsonl
+```
+
+数据集每行：
+
+```json
+{"bug_id":"b1","category":"async_state","expected_files":["src/Settings.ts"],"forbidden_files":["src/Auth.ts"],"requires_verification":true}
+```
+
+结果每行：
+
+```json
+{"bug_id":"b1","changed_files":["src/Settings.ts"],"verification_ok":true,"review_approved":true,"human_outcome":"accepted_unchanged","reopened":false}
+```
+
+输出覆盖率、有效修复率、验证通过率、范围精确率、评审通过率、原样接受率和加权综合分。
 
 **changelist 描述**：首行 `【b<短号>】<标题>`（= Tapd「复制Bug单信息」按钮的文本，可过 swarm 校验；
 短号由完整 id 推导），后附单号链接 / 修复说明 / 修改文件 / 需人工资源 / 验证结果。

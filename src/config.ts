@@ -5,6 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 
+import type { AdmissionPolicy } from "./quality.js";
+
 export const PROJECT_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), "..",
 );
@@ -20,7 +22,8 @@ export const DEFAULT_EXCLUDE_STATUS = ["resolved", "closed", "rejected"];
 export interface RepoConfig {
   name: string;
   path: string;
-  test_cmd: string;
+  /** 按顺序执行的机器验证命令。 */
+  verify_cmds: string[];
 }
 
 export interface WorkspaceConfig {
@@ -28,9 +31,6 @@ export interface WorkspaceConfig {
   owner: string;
   repos: RepoConfig[];
   default_repo: string;
-  /** @deprecated 已废弃：Tapd 单子状态不再自动修改（人工 review/submit 后自行处理）。
-   *  字段仅为兼容旧 config.yaml 保留解析，运行期不读。 */
-  comment_status: string;
 }
 
 /** 自定义 pi provider 配置（对应 ~/.pi/agent/models.json 的 providers.<id>）。
@@ -55,6 +55,22 @@ export interface PiConfig {
    *  团队仓库共享的 .agents/skills / .agent/skills 默认就会尝试，无需配置；
    *  此字段用于覆盖默认或追加。 */
   skill_dirs?: string[];
+}
+
+export interface QualityConfig {
+  admission: AdmissionPolicy;
+  /** 没有任何验证命令时只产出 candidate，不允许标记 verified。 */
+  require_verification: boolean;
+  max_changed_files: number;
+  max_diff_lines: number;
+}
+
+export interface ReviewConfig {
+  enabled: boolean;
+  /** Reviewer 拒绝后允许 Fixer 定向修正的轮数。 */
+  max_fix_rounds: number;
+  /** 可选独立评审模型；空值沿用修复模型。 */
+  model: string;
 }
 
 /** Web 设置页可编辑的配置项，持久化到 overrides.yaml（不重写带注释的 config.yaml）。
@@ -128,12 +144,11 @@ export function saveSettingsOverrides(ov: SettingsOverrides, path = SETTINGS_PAT
 }
 
 export interface Config {
-  mode: string;
-  poll_interval_min: number;
   max_bugs_per_run: number;
   max_attempts: number;
   agent_timeout_s: number;
-  llm_review: boolean;
+  quality: QualityConfig;
+  review: ReviewConfig;
   exclude_status: string[];
   priority_weight: Record<string, number>;
   workspaces: WorkspaceConfig[];
@@ -185,25 +200,63 @@ function buildRepos(data: unknown): RepoConfig[] {
   for (const item of Array.isArray(data) ? data : []) {
     if (!item || typeof item !== "object") continue;
     const d = item as Record<string, unknown>;
+    const verifyCmds = Array.isArray(d.verify_cmds)
+      ? d.verify_cmds.map(String).map((v) => v.trim()).filter(Boolean)
+      : [];
     repos.push({
       name: String(d.name ?? ""),
       path: String(d.path ?? ""),
-      test_cmd: String(d.test_cmd ?? ""),
+      verify_cmds: verifyCmds,
     });
   }
   return repos;
+}
+
+function assertNoLegacyConfig(raw: Record<string, unknown>): void {
+  const unsupported: string[] = [];
+  if ("mode" in raw) unsupported.push("mode");
+  if ("llm_review" in raw) unsupported.push("llm_review");
+  if ("poll_interval_min" in raw) unsupported.push("poll_interval_min");
+  const quality = raw.quality && typeof raw.quality === "object"
+    ? raw.quality as Record<string, unknown>
+    : {};
+  if ("investigation_enabled" in quality) unsupported.push("quality.investigation_enabled");
+  const pi = raw.pi && typeof raw.pi === "object" ? raw.pi as Record<string, unknown> : {};
+  if ("model" in pi) unsupported.push("pi.model");
+  for (const [workspaceIndex, workspace] of (Array.isArray(raw.workspaces) ? raw.workspaces : []).entries()) {
+    if (!workspace || typeof workspace !== "object") continue;
+    const data = workspace as Record<string, unknown>;
+    if ("comment_status" in data) unsupported.push(`workspaces[${workspaceIndex}].comment_status`);
+    for (const [repoIndex, repo] of (Array.isArray(data.repos) ? data.repos : []).entries()) {
+      if (repo && typeof repo === "object" && "test_cmd" in repo) {
+        unsupported.push(`workspaces[${workspaceIndex}].repos[${repoIndex}].test_cmd`);
+      }
+    }
+  }
+  if (unsupported.length) {
+    throw new Error(`不再支持的配置字段: ${unsupported.join(", ")}；请直接改用当前 config.example.yaml`);
+  }
 }
 
 export function loadConfig(configPath?: string, envFile?: string, settingsPath = SETTINGS_PATH): Config {
   loadEnvFile(envFile);
 
   const cfg: Config = {
-    mode: "review",
-    poll_interval_min: 30,
     max_bugs_per_run: 10,
-    max_attempts: 1,
+    max_attempts: 2,
     agent_timeout_s: 900,
-    llm_review: false,
+    quality: {
+      admission: {
+        min_score: 55,
+        require_reproduction_signal: true,
+        manual_keywords: ["prefab", "场景", "图集", "xlsx", "csv", "bytes", "二进制资源"],
+        high_risk_keywords: ["支付", "账号", "登录", "鉴权", "存档", "协议", "加密", "隐私"],
+      },
+      require_verification: true,
+      max_changed_files: 8,
+      max_diff_lines: 500,
+    },
+    review: { enabled: true, max_fix_rounds: 1, model: "" },
     exclude_status: [...DEFAULT_EXCLUDE_STATUS],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -220,14 +273,41 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
     cfg.config_path = path.resolve(p);
     const parsed = yaml.load(fs.readFileSync(p, "utf-8"));
     raw = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    assertNoLegacyConfig(raw);
   }
 
-  cfg.mode = String(raw.mode ?? cfg.mode);
-  cfg.poll_interval_min = Number(raw.poll_interval_min ?? cfg.poll_interval_min);
   cfg.max_bugs_per_run = Number(raw.max_bugs_per_run ?? cfg.max_bugs_per_run);
   cfg.max_attempts = Number(raw.max_attempts ?? cfg.max_attempts);
   cfg.agent_timeout_s = Number(raw.agent_timeout_s ?? cfg.agent_timeout_s);
-  cfg.llm_review = Boolean(raw.llm_review ?? cfg.llm_review);
+
+  const qualityRaw = (raw.quality ?? {}) as Record<string, unknown>;
+  const admissionRaw = (qualityRaw.admission ?? {}) as Record<string, unknown>;
+  cfg.quality.require_verification = Boolean(
+    qualityRaw.require_verification ?? cfg.quality.require_verification,
+  );
+  cfg.quality.max_changed_files = Number(
+    qualityRaw.max_changed_files ?? cfg.quality.max_changed_files,
+  );
+  cfg.quality.max_diff_lines = Number(qualityRaw.max_diff_lines ?? cfg.quality.max_diff_lines);
+  cfg.quality.admission.min_score = Number(
+    admissionRaw.min_score ?? cfg.quality.admission.min_score,
+  );
+  cfg.quality.admission.require_reproduction_signal = Boolean(
+    admissionRaw.require_reproduction_signal ?? cfg.quality.admission.require_reproduction_signal,
+  );
+  if (Array.isArray(admissionRaw.manual_keywords)) {
+    cfg.quality.admission.manual_keywords = admissionRaw.manual_keywords.map(String).filter(Boolean);
+  }
+  if (Array.isArray(admissionRaw.high_risk_keywords)) {
+    cfg.quality.admission.high_risk_keywords = admissionRaw.high_risk_keywords.map(String).filter(Boolean);
+  }
+
+  const reviewRaw = (raw.review ?? {}) as Record<string, unknown>;
+  cfg.review.enabled = Boolean(reviewRaw.enabled ?? cfg.review.enabled);
+  cfg.review.max_fix_rounds = Math.max(0, Number(
+    reviewRaw.max_fix_rounds ?? cfg.review.max_fix_rounds,
+  ));
+  cfg.review.model = String(reviewRaw.model ?? cfg.review.model);
 
   const filters = (raw.filters ?? {}) as Record<string, unknown>;
   if (Array.isArray(filters.exclude_status)) {
@@ -248,7 +328,6 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
       owner: String(w.owner ?? ""),
       repos: buildRepos(w.repos),
       default_repo: String(w.default_repo ?? ""),
-      comment_status: String(w.comment_status ?? "resolved"),
     });
   }
 
@@ -339,6 +418,9 @@ export function validateConfig(cfg: Config): string[] {
     for (const repo of ws.repos) {
       if (!repo.path || !fs.existsSync(repo.path)) {
         problems.push(`仓库 ${repo.name ?? ""} 路径不存在: ${repo.path}`);
+      }
+      if (cfg.quality.require_verification && !repo.verify_cmds.length) {
+        problems.push(`仓库 ${repo.name ?? ""} 未配置 verify_cmds；候选补丁不会标记为已验证`);
       }
     }
   }

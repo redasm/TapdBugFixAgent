@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts INTEGER DEFAULT 0,
     retry_evidence TEXT,
     last_attempt_files TEXT,
+    admission_score INTEGER,
+    investigation TEXT,
+    verification TEXT,
+    review_findings TEXT,
     started_at TEXT,
     finished_at TEXT
 );
@@ -44,9 +48,54 @@ CREATE TABLE IF NOT EXISTS events (
     bug_id INTEGER,
     msg TEXT
 );
+CREATE TABLE IF NOT EXISTS job_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bug_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    reason TEXT,
+    human_changed_lines INTEGER DEFAULT 0,
+    submitted_changelist INTEGER,
+    created_at TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(agent_state);
 CREATE INDEX IF NOT EXISTS idx_events_bug ON events(bug_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_bug ON job_feedback(bug_id);
 `;
+
+export type FeedbackOutcome =
+  | "accepted_unchanged"
+  | "accepted_modified"
+  | "rejected_wrong_root_cause"
+  | "rejected_wrong_location"
+  | "rejected_regression"
+  | "rejected_overchange"
+  | "rejected_no_effect"
+  | "reopened";
+
+export interface JobFeedbackInput {
+  outcome: FeedbackOutcome;
+  reason: string;
+  human_changed_lines: number;
+  submitted_changelist: number | null;
+}
+
+export interface QualityMetrics {
+  reviewed: number;
+  accepted_unchanged: number;
+  accepted_modified: number;
+  rejected: number;
+  reopened: number;
+  candidate_precision: number;
+  unchanged_acceptance_rate: number;
+  human_modification_rate: number;
+  reopen_rate: number;
+}
+
+const _FEEDBACK_OUTCOMES = new Set<FeedbackOutcome>([
+  "accepted_unchanged", "accepted_modified", "rejected_wrong_root_cause",
+  "rejected_wrong_location", "rejected_regression", "rejected_overchange",
+  "rejected_no_effect", "reopened",
+]);
 
 export function nowStr(): string {
   const d = new Date();
@@ -72,24 +121,30 @@ const _UPDATE_ALLOWED = new Set([
   "changelist", "generated_description", "files", "manual_assets",
   "failure_reason", "agent", "model", "attempts", "started_at", "finished_at",
   "retry_evidence", "last_attempt_files",
+  "admission_score", "investigation", "verification", "review_findings",
 ]);
 
 export class StateStore {
   private db: Database.Database;
 
-  constructor(dbPath = "tapd_agent.db") {
+  constructor(dbPath = "tapd_agent_v2.db") {
     const resolved = dbPath === ":memory:" ? dbPath : path.resolve(dbPath);
     this.db = new Database(resolved);
     // 所有整数结果以 BigInt 返回，避免大整数 bug_id / changelist 丢精度（构造选项 safeIntegers 类型缺失，用等价方法）
     this.db.defaultSafeIntegers(true);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(_SCHEMA);
-    // 迁移：旧库补新增列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）
     const cols = this.db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
-    for (const col of ["model", "retry_evidence", "last_attempt_files"]) {
-      if (!cols.some((c) => c.name === col)) {
-        this.db.exec(`ALTER TABLE jobs ADD COLUMN ${col} TEXT`);
-      }
+    const requiredColumns = [
+      "model", "retry_evidence", "last_attempt_files", "admission_score",
+      "investigation", "verification", "review_findings",
+    ];
+    const missing = requiredColumns.filter((name) => !cols.some((column) => column.name === name));
+    if (missing.length) {
+      this.db.close();
+      throw new Error(
+        `数据库 schema 不匹配，缺少列: ${missing.join(", ")}；开发阶段不执行迁移，请删除数据库后重建`,
+      );
     }
     this.db
       .prepare("INSERT OR IGNORE INTO control(id, state, updated_at) VALUES (1, 'stopped', ?)")
@@ -144,7 +199,7 @@ export class StateStore {
     for (const [key, value] of Object.entries(fields)) {
       if (!_UPDATE_ALLOWED.has(key)) continue;
       let v = value;
-      if (key === "files" || key === "manual_assets") {
+      if (["files", "manual_assets", "investigation", "verification", "review_findings"].includes(key)) {
         // null/undefined 存真正的 NULL；数组/对象才 dumps 成 JSON 字符串。
         // 注意：dumps(null) 会得到字面字符串 "null"，前端 JSON.parse 后是 null，
         // 取 .length 会崩——所以 null 必须原样入库，不能过 dumps。
@@ -215,9 +270,81 @@ export class StateStore {
     return Number(row.n);
   }
 
+  recordFeedback(bugId: string, input: JobFeedbackInput): void {
+    if (!_FEEDBACK_OUTCOMES.has(input.outcome)) {
+      throw new Error(`未知反馈结果: ${String(input.outcome)}`);
+    }
+    if (!this.getJob(bugId)) throw new Error(`未找到 bug: ${bugId}`);
+    const changedLines = Math.max(0, Math.floor(Number(input.human_changed_lines) || 0));
+    this.db.prepare(
+      `INSERT INTO job_feedback(
+         bug_id, outcome, reason, human_changed_lines, submitted_changelist, created_at
+       ) VALUES (?,?,?,?,?,?)`,
+    ).run(
+      bugId,
+      input.outcome,
+      input.reason.slice(0, 2000),
+      changedLines,
+      input.submitted_changelist,
+      nowStr(),
+    );
+    const agentState = input.outcome === "accepted_unchanged"
+      ? "accepted"
+      : input.outcome === "accepted_modified"
+        ? "accepted_modified"
+        : input.outcome === "reopened" ? "reopened" : "rejected";
+    this.updateJob(bugId, { agent_state: agentState, finished_at: nowStr() });
+    this.addEvent(`人工反馈: ${input.outcome}${input.reason ? `（${input.reason}）` : ""}`, "info", bugId);
+  }
+
+  listFeedback(bugId?: string): Record<string, unknown>[] {
+    const rows = bugId
+      ? this.db.prepare("SELECT * FROM job_feedback WHERE bug_id=? ORDER BY id").all(bugId)
+      : this.db.prepare("SELECT * FROM job_feedback ORDER BY id").all();
+    return (rows as Record<string, unknown>[]).map((row) => ({
+      ...row,
+      id: Number(row.id),
+      bug_id: idToString(row.bug_id),
+      human_changed_lines: Number(row.human_changed_lines ?? 0),
+      submitted_changelist: numOrNull(row.submitted_changelist),
+    }));
+  }
+
+  qualityMetrics(): QualityMetrics {
+    const latestDecision = new Map<string, FeedbackOutcome>();
+    const reopened = new Set<string>();
+    for (const row of this.listFeedback()) {
+      const id = String(row.bug_id);
+      const outcome = String(row.outcome) as FeedbackOutcome;
+      if (outcome === "reopened") reopened.add(id);
+      else latestDecision.set(id, outcome);
+    }
+    let acceptedUnchanged = 0;
+    let acceptedModified = 0;
+    let rejected = 0;
+    for (const outcome of latestDecision.values()) {
+      if (outcome === "accepted_unchanged") acceptedUnchanged += 1;
+      else if (outcome === "accepted_modified") acceptedModified += 1;
+      else rejected += 1;
+    }
+    const reviewed = acceptedUnchanged + acceptedModified + rejected;
+    const accepted = acceptedUnchanged + acceptedModified;
+    return {
+      reviewed,
+      accepted_unchanged: acceptedUnchanged,
+      accepted_modified: acceptedModified,
+      rejected,
+      reopened: reopened.size,
+      candidate_precision: reviewed ? accepted / reviewed : 0,
+      unchanged_acceptance_rate: reviewed ? acceptedUnchanged / reviewed : 0,
+      human_modification_rate: accepted ? acceptedModified / accepted : 0,
+      reopen_rate: accepted ? reopened.size / accepted : 0,
+    };
+  }
+
   /** 清空全部 job 记录与事件（web「清除并重新同步」用）。
    *  控制态（control 表）保留；changelist 等历史一并删除——p4 上已生成的
-   *  pending changelist 不受影响（那是 p4 服务器侧的对象）。 */
+   *  pending changelist 不受影响（那是 p4 服务器侧的对象）。人工反馈是长期质量标签，保留。 */
   deleteAllJobs(): number {
     const n = this.jobCount();
     const tx = this.db.transaction(() => {
