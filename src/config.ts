@@ -19,6 +19,27 @@ export const DEFAULT_PRIORITY_WEIGHT: Record<string, number> = {
 };
 export const DEFAULT_EXCLUDE_STATUS = ["resolved", "closed", "rejected"];
 
+export type AgentBackend = "pi" | "codex";
+
+export interface AgentSelectionConfig {
+  /** 主修复后端；默认 pi，便于平滑升级和 A/B 对照。 */
+  backend: AgentBackend;
+}
+
+export interface CodexConfig {
+  /** 空值使用本机 Codex 配置的默认模型。 */
+  model: string;
+  reasoning_effort: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+  approval_policy: "never" | "on-request" | "on-failure" | "untrusted";
+  network_access: boolean;
+  /** 可选兼容网关；空值使用 Codex 默认服务。 */
+  base_url: string;
+  /** API Key 所在环境变量名；空值时沿用 Codex CLI 登录状态。 */
+  api_key_env: string;
+  /** 可选自定义 codex 可执行文件路径。 */
+  codex_path: string;
+}
+
 export interface RepoConfig {
   name: string;
   path: string;
@@ -67,6 +88,8 @@ export interface QualityConfig {
 
 export interface ReviewConfig {
   enabled: boolean;
+  /** 可选 Reviewer 后端；空值沿用主修复后端。 */
+  backend: "" | AgentBackend;
   /** Reviewer 拒绝后允许 Fixer 定向修正的轮数。 */
   max_fix_rounds: number;
   /** 可选独立评审模型；空值沿用修复模型。 */
@@ -77,6 +100,9 @@ export interface ReviewConfig {
  *  loadConfig 启动时按"字段级合并"应用，优先级最高（覆盖 config.yaml 与 .env）。
  *  空字符串/undefined 的字段视为"保持不变"，不会被写入或覆盖。 */
 export interface SettingsOverrides {
+  agent?: Partial<AgentSelectionConfig>;
+  codex?: Partial<CodexConfig>;
+  review?: Partial<ReviewConfig>;
   pi?: { provider?: Partial<PiProviderConfig> };
   p4?: Record<string, string>;
   tapd?: { backend?: string; access_token?: string; api_user?: string; api_password?: string };
@@ -89,6 +115,11 @@ const PI_PROVIDER_FIELDS = [
   "model_id", "reasoning", "context_window", "max_tokens",
 ] as const;
 const TAPD_SCALAR_FIELDS = ["backend", "access_token", "api_user", "api_password"] as const;
+const CODEX_FIELDS = [
+  "model", "reasoning_effort", "approval_policy", "network_access",
+  "base_url", "api_key_env", "codex_path",
+] as const;
+const REVIEW_FIELDS = ["enabled", "backend", "max_fix_rounds", "model"] as const;
 
 /** 读取 overrides.yaml（不存在或损坏 → null）。 */
 export function readSettingsOverrides(path = SETTINGS_PATH): SettingsOverrides | null {
@@ -104,6 +135,26 @@ export function readSettingsOverrides(path = SETTINGS_PATH): SettingsOverrides |
 
 /** 把 ov 字段级合并进 target（可变对象）。null/undefined/空串字段跳过，保留原值。 */
 function mergeSettingsInto(target: Record<string, unknown>, ov: SettingsOverrides): void {
+  if (ov.agent?.backend) {
+    const cur = (target.agent ??= {}) as Record<string, unknown>;
+    cur.backend = ov.agent.backend;
+  }
+  if (ov.codex) {
+    const cur = (target.codex ??= {}) as Record<string, unknown>;
+    for (const k of CODEX_FIELDS) {
+      const v = (ov.codex as Record<string, unknown>)[k];
+      if (v === undefined || v === null || v === "") continue;
+      cur[k] = v;
+    }
+  }
+  if (ov.review) {
+    const cur = (target.review ??= {}) as Record<string, unknown>;
+    for (const k of REVIEW_FIELDS) {
+      const v = (ov.review as Record<string, unknown>)[k];
+      if (v === undefined || v === null || (v === "" && k !== "backend")) continue;
+      cur[k] = v;
+    }
+  }
   if (ov.pi?.provider) {
     const cur = (target.pi ??= {}) as Record<string, unknown>;
     const prov = (cur.provider ??= {}) as Record<string, unknown>;
@@ -133,7 +184,14 @@ function mergeSettingsInto(target: Record<string, unknown>, ov: SettingsOverride
 /** 把设置合并进运行中的 Config（不落盘；web POST 用，worker/agent 共用同一 config 引用即实时生效）。 */
 export function applySettingsOverrides(cfg: Config, ov: SettingsOverrides | null): void {
   if (!ov) return;
-  mergeSettingsInto({ pi: cfg.pi, p4: cfg.p4, tapd: cfg.tapd }, ov);
+  mergeSettingsInto({
+    agent: cfg.agent,
+    codex: cfg.codex,
+    review: cfg.review,
+    pi: cfg.pi,
+    p4: cfg.p4,
+    tapd: cfg.tapd,
+  }, ov);
 }
 
 /** 把设置合并写回 overrides.yaml（保留已有其它项；下次启动 loadConfig 自动读回）。 */
@@ -147,6 +205,8 @@ export interface Config {
   max_bugs_per_run: number;
   max_attempts: number;
   agent_timeout_s: number;
+  agent: AgentSelectionConfig;
+  codex: CodexConfig;
   quality: QualityConfig;
   review: ReviewConfig;
   exclude_status: string[];
@@ -245,6 +305,16 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
     max_bugs_per_run: 10,
     max_attempts: 2,
     agent_timeout_s: 900,
+    agent: { backend: "pi" },
+    codex: {
+      model: "",
+      reasoning_effort: "high",
+      approval_policy: "never",
+      network_access: false,
+      base_url: "",
+      api_key_env: "OPENAI_API_KEY",
+      codex_path: "",
+    },
     quality: {
       admission: {
         min_score: 55,
@@ -256,7 +326,7 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
       max_changed_files: 8,
       max_diff_lines: 500,
     },
-    review: { enabled: true, max_fix_rounds: 1, model: "" },
+    review: { enabled: true, backend: "", max_fix_rounds: 1, model: "" },
     exclude_status: [...DEFAULT_EXCLUDE_STATUS],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -279,6 +349,22 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   cfg.max_bugs_per_run = Number(raw.max_bugs_per_run ?? cfg.max_bugs_per_run);
   cfg.max_attempts = Number(raw.max_attempts ?? cfg.max_attempts);
   cfg.agent_timeout_s = Number(raw.agent_timeout_s ?? cfg.agent_timeout_s);
+
+  const agentRaw = (raw.agent ?? {}) as Record<string, unknown>;
+  cfg.agent.backend = String(agentRaw.backend ?? cfg.agent.backend) as AgentBackend;
+
+  const codexRaw = (raw.codex ?? {}) as Record<string, unknown>;
+  cfg.codex.model = String(codexRaw.model ?? cfg.codex.model);
+  cfg.codex.reasoning_effort = String(
+    codexRaw.reasoning_effort ?? cfg.codex.reasoning_effort,
+  ) as CodexConfig["reasoning_effort"];
+  cfg.codex.approval_policy = String(
+    codexRaw.approval_policy ?? cfg.codex.approval_policy,
+  ) as CodexConfig["approval_policy"];
+  cfg.codex.network_access = Boolean(codexRaw.network_access ?? cfg.codex.network_access);
+  cfg.codex.base_url = String(codexRaw.base_url ?? cfg.codex.base_url);
+  cfg.codex.api_key_env = String(codexRaw.api_key_env ?? cfg.codex.api_key_env);
+  cfg.codex.codex_path = String(codexRaw.codex_path ?? cfg.codex.codex_path);
 
   const qualityRaw = (raw.quality ?? {}) as Record<string, unknown>;
   const admissionRaw = (qualityRaw.admission ?? {}) as Record<string, unknown>;
@@ -304,6 +390,9 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
 
   const reviewRaw = (raw.review ?? {}) as Record<string, unknown>;
   cfg.review.enabled = Boolean(reviewRaw.enabled ?? cfg.review.enabled);
+  cfg.review.backend = String(
+    reviewRaw.backend ?? cfg.review.backend,
+  ) as ReviewConfig["backend"];
   cfg.review.max_fix_rounds = Math.max(0, Number(
     reviewRaw.max_fix_rounds ?? cfg.review.max_fix_rounds,
   ));
@@ -392,6 +481,19 @@ function isPlaceholder(value: unknown): boolean {
 /** 返回配置问题列表（空表示 OK）。 */
 export function validateConfig(cfg: Config): string[] {
   const problems: string[] = [];
+  const agentBackend = cfg.agent?.backend ?? "pi";
+  if (agentBackend !== "pi" && agentBackend !== "codex") {
+    problems.push(`agent.backend 必须是 pi 或 codex（当前: ${agentBackend}）`);
+  }
+  if (cfg.review.backend && cfg.review.backend !== "pi" && cfg.review.backend !== "codex") {
+    problems.push(`review.backend 必须为空、pi 或 codex（当前: ${cfg.review.backend}）`);
+  }
+  if (!["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(cfg.codex.reasoning_effort)) {
+    problems.push(`codex.reasoning_effort 无效（当前: ${cfg.codex.reasoning_effort}）`);
+  }
+  if (!["never", "on-request", "on-failure", "untrusted"].includes(cfg.codex.approval_policy)) {
+    problems.push(`codex.approval_policy 无效（当前: ${cfg.codex.approval_policy}）`);
+  }
   const tapd = cfg.tapd as Record<string, unknown>;
   const backend = String(tapd.backend ?? "rest");
   if (backend === "mcp") {

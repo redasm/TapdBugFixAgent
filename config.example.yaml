@@ -1,4 +1,4 @@
-# 注：web 管理台顶部的「⚙ 设置」可编辑 pi/p4/tapd 连接配置，保存写入同目录 overrides.yaml
+# 注：web 管理台顶部的「⚙ 设置」可选择 Pi/Codex 并编辑 Agent/p4/tapd 配置，保存写入同目录 overrides.yaml
 # （启动时合并、优先级最高），不必改本文件。本文件保留 workspaces / 优先级等复杂结构。
 
 # 修复流程参数
@@ -6,6 +6,20 @@ max_bugs_per_run: 10           # 单轮最多处理数量
 max_attempts: 2                # 单个 bug 自动重试次数：失败后自动回到队列重试（带上次失败证据），
                                # 重试耗尽才标记 failed 并回写 Tapd 失败评论。设为 1 = 不自动重试
 agent_timeout_s: 3600          # 每个编码 Agent 调用的超时（秒）。真实 bug 在大型仓库里定位+修改常超过 15 分钟
+
+# Agent 后端：保留 Pi，也可切换到 OpenAI 官方 Codex SDK。
+# 可用同一套历史评测与人工反馈指标做 A/B 对比。
+agent:
+  backend: pi                  # pi | codex
+
+codex:
+  model: ""                    # 空值使用本机 Codex 默认模型
+  reasoning_effort: high       # minimal | low | medium | high | xhigh | max | ultra
+  approval_policy: never       # 自动任务建议 never；外层流程仍有 P4/验证/评审门禁
+  network_access: false        # 默认禁止联网，降低不确定性与提示注入风险
+  base_url: ""                 # 可选兼容网关
+  api_key_env: OPENAI_API_KEY  # 只保存环境变量名，不保存密钥
+  codex_path: ""               # 可选自定义 codex 可执行文件路径
 quality:
   require_verification: true        # 无验证命令时只能生成 candidate，不能标记 verified
   max_changed_files: 8
@@ -18,6 +32,7 @@ quality:
 
 review:
   enabled: true                     # 独立只读 Reviewer；high/medium finding 必须修正
+  backend: ""                       # 空值沿用 agent.backend；可设 pi/codex 做交叉评审
   max_fix_rounds: 1                 # Reviewer 拒绝后最多定向修正一轮
   model: ""                         # 可指定不同评审模型；空值沿用修复模型
 

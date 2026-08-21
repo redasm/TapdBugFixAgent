@@ -31,7 +31,7 @@ git clone <本仓库> && cd TapdBugFixAgent
 # 1. 装依赖（Node ≥ 20）
 npm install
 
-# 2. 装编码 Agent（全局）
+# 2. 装 Pi 编码 Agent（仅使用 Pi 后端时需要）
 npm install -g @earendil-works/pi-coding-agent
 
 # 3. 生成配置
@@ -53,7 +53,7 @@ npm start -- serve
 | 依赖 | 说明 |
 |---|---|
 | Node.js ≥ 20 | 运行本体与 Tapd MCP（stdio 模式经 `npx` 跑官方包） |
-| pi 编码 Agent | `npm install -g @earendil-works/pi-coding-agent`，子进程方式调用 |
+| 编码 Agent | Pi：全局安装 `@earendil-works/pi-coding-agent`；Codex：项目依赖已包含官方 `@openai/codex-sdk` |
 | p4 命令行 | 在 PATH 中；为 Agent 建一个**专用 client workspace**（如 `tapd-agent_<你>`），别与日常开发共用 |
 | Tapd 凭据 | **个人访问令牌**（推荐，个人设置 → 个人访问令牌 创建）或 API 账号 |
 
@@ -62,6 +62,9 @@ pi 鉴权（任选其一）：
 - 或先手动跑一次 `pi /login` 做 OAuth 登录；
 - 或走公司网关/中转：在 `config.yaml` 配 `pi.provider` 段（base_url + api_key_env），工具会在每次
   spawn 前自动合并写入 `~/.pi/agent/models.json`（密钥引用环境变量名，不落盘）。
+
+Codex 鉴权：使用本机 Codex 登录状态，或在 `.env` 设置 `OPENAI_API_KEY`。服务不会把 API Key 返回给管理台，
+`codex.api_key_env` 只配置环境变量名。
 
 ## 配置
 
@@ -85,7 +88,20 @@ p4:
   password: "..."
 ```
 
-其余（pi 网关、Web token、Tapd 后端选择）见 `config.example.yaml` 内注释，默认值开箱可用。
+其余（Agent 后端、Pi/Codex 参数、Web token、Tapd 后端选择）见 `config.example.yaml` 内注释。默认仍使用 Pi；
+切换 Codex 只需设置：
+
+```yaml
+agent:
+  backend: codex
+
+codex:
+  model: ""                 # 空值沿用本机 Codex 默认模型
+  reasoning_effort: high
+
+review:
+  backend: ""               # 跟随主后端；也可设 pi/codex 做交叉评审
+```
 
 ### .env
 
@@ -95,7 +111,7 @@ WEB_TOKEN=...              # 管理台鉴权（URL 带 ?token= 或页面弹窗�
 # P4PORT/P4CLIENT/P4USER/P4PASSWD  # 也可放这里，优先级高于 config.yaml
 ```
 
-> 改连接配置不必动文件：管理台顶部 **⚙ 设置** 可在线编辑 pi / p4 / tapd 连接项，保存写 `overrides.yaml`（优先级最高）。
+> 改连接配置不必动文件：管理台顶部 **⚙ 设置** 可在线选择 Pi/Codex、编辑 Agent 与 p4/tapd 连接项，保存写 `overrides.yaml`（优先级最高）。
 
 ## 运行
 
@@ -116,9 +132,15 @@ CLI 通用选项：`--config <path>`、`--db <path>`、`--host` / `--port`（ser
 P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Reviewer finding 定向修正/复审 →
 生成 pending changelist → Tapd 评论（不改状态）。失败按 `max_attempts` 自动重试并携带测试、文件和评审证据。
 
-这套流程参考 Codex 官方公开的 [workflows](https://developers.openai.com/codex/workflows) 与
-[code review](https://developers.openai.com/codex/code-review) 工作方式：先复现、补丁后重跑复现和最小相关测试；
-评审使用专用只读 Reviewer，输出分级且可执行的 findings。项目并不依赖 Codex 内部实现。
+整体执行架构参考 OpenAI 的 [Codex as a platform](https://developers.openai.com/blog/codex-as-a-platform) 与
+[开源 Codex harness](https://github.com/openai/codex)：由宿主应用提供业务上下文、边界、状态与审批，Agent harness
+负责持续任务、工具调用、进度和失败处理。Prompt 设计同时参考 Codex 官方公开的
+[prompting/workflows](https://developers.openai.com/codex/workflows) 与 [code review](https://developers.openai.com/codex/code-review) 原则；
+不复制或依赖任何产品的隐藏 system prompt。三个阶段使用不同的执行契约：
+
+- **调查**：先读仓库规则和相关测试，区分观察事实、推断和未验证假设，比较候选根因并给出排除依据；证据不足则停止。
+- **实施**：编辑前复核调查结论，只做最小完整补丁，按“专项复现 → 最小相关测试 → 配置验证”执行并如实报告结果。
+- **评审**：只读检查根因覆盖、范围、回归测试和关键错误/生命周期路径；只报告有证据、失败场景和明确修法的 actionable findings。
 
 ### 准确率门禁
 
@@ -158,9 +180,9 @@ P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Rev
 ## 工作原理
 
 ```
-Tapd ──MCP(个人令牌)──> Orchestrator(worker) ──subprocess──> pi 编码 Agent
-Tapd ──REST(API账号)──>       │        │                        │
-      ^                       │        └── p4 edit/add ────> Perforce workspace
+Tapd ──MCP(个人令牌)──> Orchestrator(worker) ──adapter──> Pi subprocess
+Tapd ──REST(API账号)──>       │        │          └──────> OpenAI Codex SDK
+      ^                       │        └── reconcile/edit/add ─> Perforce workspace
       └── 评论回写(不改状态)   │
                               Web 管理台 (Express + SSE)
 ```
@@ -189,12 +211,13 @@ pending → in_progress
 工具侧只收集 **default changelist** 的文件生成 pending，绝不动其它编号 changelist；
 `p4 reconcile -n` 兜底防改动丢失。
 
-**团队 skill**：自动挂载仓库下的 `.agents/skills` / `.agent/skills`（存在才挂）给 pi——
+**团队 skill**：Pi 后端自动挂载仓库下的 `.agents/skills` / `.agent/skills`（存在才挂）——
 同事放在版本库里的 skill 修复 Agent 也能用。目录结构 `<名字>/SKILL.md`（frontmatter 需
 name + description，文件必须无 BOM）。可用 `pi.skill_dirs` 覆盖。
 
-**修复守则**：`prompts/defensive-patterns.md` 启动时读取注入 prompt（整理自
-[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的真实缺陷类别，MIT）。删文件即停用。
+**修复守则**：`prompts/defensive-patterns.md` 启动时读取并注入实施 Prompt。它按“检查点 / 必须保持的不变量 /
+常见坏修复”整理根因、异步竞争、取消与清理、重试幂等、状态机、缓存、协议、边界输入、验证诚实性和 diff 范围；
+只要求 Agent 应用与当前 Bug 有关的条目。删文件即停用。
 
 ## 历史 Bug 离线评测
 
@@ -237,7 +260,7 @@ worker 轮询时自动转跳过并写明原因。
 **修复好的单子又出现在队列？** 工具不改 Tapd 状态，所以单子状态仍是 new；若用「清除并重新同步」，
 这些单会重新处理。已人工关闭（resolved 等）的单不会。
 
-**开发**：`npm test`（vitest，114 个用例）；源码在 `src/`，构建产物 `dist/`（含 `prompts/`）。
+**开发**：`npm test`（vitest，162 个用例）；源码在 `src/`，构建产物 `dist/`（含 `prompts/`）。
 
 ## 风险提示
 

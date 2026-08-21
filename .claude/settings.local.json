@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(git -C \"C:\\\\AppProject\\\\TapdBugFixAgent\" status --short)",
+      "Bash(python -m py_compile tapd_agent/__init__.py tapd_agent/__main__.py tapd_agent/cli.py tapd_agent/config.py tapd_agent/models.py tapd_agent/state.py tapd_agent/descgen.py tapd_agent/verify.py tapd_agent/p4util.py tapd_agent/worker.py tapd_agent/tapd/__init__.py tapd_agent/tapd/client.py tapd_agent/agents/__init__.py tapd_agent/agents/base.py tapd_agent/agents/claude_cli.py tapd_agent/agents/codex_cli.py tapd_agent/agents/command.py tapd_agent/web/__init__.py tapd_agent/web/app.py tests/test_core.py)",
+      "Bash(python -m venv .venv)",
+      "Bash(./.venv/Scripts/python.exe -m pip install --quiet --disable-pip-version-check -r requirements.txt)",
+      "Bash(echo \"PIP_EXIT=$?\")",
+      "Bash(./.venv/Scripts/python.exe -m unittest discover -s tests -v)",
+      "Bash(./.venv/Scripts/python.exe -m tapd_agent --help)",
+      "Bash(./.venv/Scripts/python.exe -m tapd_agent dry-run)",
+      "Bash(./.venv/Scripts/python.exe -m tapd_agent serve --port 8099)",
+      "Bash(echo \"started pid $!\")",
+      "Bash(./.venv/Scripts/python.exe -m pip install --quiet --disable-pip-version-check \"mcp\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile tapd_agent/config.py tapd_agent/agents/claude_cli.py)",
+      "Bash(./.venv/Scripts/python.exe -m unittest discover -s tests)",
+      "Bash(timeout 90 claude -p --output-format json)",
+      "Bash(./.venv/Scripts/python.exe -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('result:', d.get\\('result'\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m tapd_agent run --once)",
+      "Bash(powershell -NoProfile -Command 'Get-Process | Where-Object {$_.Name -match '\\\\''AUEPDU|Config|DB|Export|Build|UnrealGameSync'\\\\''} | Select-Object Name,Id,StartTime | Format-Table -AutoSize')",
+      "Bash(.venv/Scripts/python -m pytest tests/ -q)",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(tasklist //FI \"IMAGENAME eq claude.exe\")",
+      "Bash(tasklist //FI \"IMAGENAME eq node.exe\")",
+      "Read(//tmp/**)",
+      "Bash(powershell -NoProfile -Command 'Get-Process claude -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object Id, @{N='\\\\''CPU_s'\\\\'';E={[math]::Round\\($_.CPU,1\\)}}, StartTime | Format-Table -AutoSize')",
+      "Bash(time claude -p \"先用 Glob 工具找文件名包含 HUD 的文件，然后用 Read 工具读取第一个匹配文件的前 100 行，最后把读取到的文件路径和首行内容告诉我。\" --permission-mode acceptEdits --allowedTools \"Read,Edit,Write,Glob,Grep,Bash\" --model claude-sonnet-5)",
+      "Bash(.venv/Scripts/python.exe /tmp/serve_progress.py)",
+      "Bash(curl -s http://127.0.0.1:8124/api/bugs/1152729922001234007)",
+      "Bash(.venv/Scripts/python.exe -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('progress lines:', len\\(d.get\\('progress',[]\\)\\)\\); [print\\(' -', e['msg'][:70]\\) for e in d.get\\('progress',[]\\)[:4]]\")",
+      "Bash(git -C /c/AppProject/TapdBugFixAgent status --short)",
+      "Bash(git -C /c/AppProject/TapdBugFixAgent diff --stat)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_core.py -q)",
+      "WebSearch",
+      "Bash(pi --version)",
+      "Bash(npm --version)",
+      "WebFetch(domain:pi.dev)"
+    ]
+  }
+}
