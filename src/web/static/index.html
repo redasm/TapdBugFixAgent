@@ -249,6 +249,40 @@
     </div>
     <div class="modal-body">
       <div class="section">
+        <h4>Agent 后端</h4>
+        <div class="settings-grid">
+          <div class="field">
+            <label>主修复后端</label>
+            <select id="sAgentBackend">
+              <option value="pi">Pi</option>
+              <option value="codex">OpenAI Codex SDK</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Reviewer 后端</label>
+            <select id="sReviewBackend">
+              <option value="">跟随主后端</option>
+              <option value="pi">Pi</option>
+              <option value="codex">OpenAI Codex SDK</option>
+            </select>
+          </div>
+          <div class="settings-note">有效模型: <span id="sAgentEffectiveModel" class="mono">-</span></div>
+        </div>
+      </div>
+      <div class="section">
+        <h4>OpenAI Codex SDK</h4>
+        <div class="settings-grid">
+          <div class="field"><label>模型（留空使用 Codex 默认）</label><input id="sCodexModel" type="text" placeholder="gpt-5.2-codex"></div>
+          <div class="field"><label>推理强度</label><select id="sCodexReasoning"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></div>
+          <div class="field"><label>审批策略</label><select id="sCodexApproval"><option value="never">never</option><option value="on-request">on-request</option><option value="on-failure">on-failure</option><option value="untrusted">untrusted</option></select></div>
+          <div class="field check"><input id="sCodexNetwork" type="checkbox"><label>允许网络访问</label></div>
+          <div class="field full"><label>兼容网关 base_url（可选）</label><input id="sCodexUrl" type="text"></div>
+          <div class="field"><label>API Key 环境变量名</label><input id="sCodexKeyEnv" type="text" placeholder="OPENAI_API_KEY"></div>
+          <div class="field"><label>Codex 可执行文件路径（可选）</label><input id="sCodexPath" type="text"></div>
+          <div class="settings-note">API Key 不会在页面显示或写入 overrides.yaml，只保存环境变量名。</div>
+        </div>
+      </div>
+      <div class="section">
         <h4>pi 编码 Agent（走中转/代理时填；留空则用 pi 默认鉴权）</h4>
         <div class="settings-grid">
           <div class="field">
@@ -819,6 +853,16 @@ async function openSettings() {
   const s = await api('/api/settings');
   if (!s) return;
   const p = s.pi?.provider || {};
+  setVal('sAgentBackend', s.agent?.backend || 'pi');
+  setVal('sReviewBackend', s.review?.backend || '');
+  setVal('sCodexModel', s.codex?.model);
+  setVal('sCodexReasoning', s.codex?.reasoning_effort || 'high');
+  setVal('sCodexApproval', s.codex?.approval_policy || 'never');
+  setVal('sCodexUrl', s.codex?.base_url);
+  setVal('sCodexKeyEnv', s.codex?.api_key_env || 'OPENAI_API_KEY');
+  setVal('sCodexPath', s.codex?.codex_path);
+  $('sCodexNetwork').checked = !!s.codex?.network_access;
+  $('sAgentEffectiveModel').textContent = s.agent?.effective_model || '(后端默认模型)';
   setVal('sPiId', p.id);
   setVal('sPiModel', p.model_id);
   setVal('sPiUrl', p.base_url);
@@ -848,6 +892,17 @@ function closeSettings() { $('settingsModal').style.display = 'none'; }
 
 async function saveSettings() {
   const body = {
+    agent: { backend: $('sAgentBackend').value },
+    review: { backend: $('sReviewBackend').value },
+    codex: {
+      model: $('sCodexModel').value,
+      reasoning_effort: $('sCodexReasoning').value,
+      approval_policy: $('sCodexApproval').value,
+      network_access: $('sCodexNetwork').checked,
+      base_url: $('sCodexUrl').value,
+      api_key_env: $('sCodexKeyEnv').value,
+      codex_path: $('sCodexPath').value,
+    },
     pi: { provider: {
       id: $('sPiId').value,
       base_url: $('sPiUrl').value,
@@ -873,6 +928,7 @@ async function saveSettings() {
     $('settingsMsg').textContent = '✓ 已保存，对后续 bug 生效';
     $('settingsMsg').className = '';
     $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
+    $('sAgentEffectiveModel').textContent = s.agent?.effective_model || '(后端默认模型)';
     refresh();
   } else {
     $('settingsMsg').textContent = '✗ 保存失败（见控制台）';

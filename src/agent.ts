@@ -318,13 +318,12 @@ export function resultFromOutput(text: string, exitCode: number): AgentResult {
     blocked_reasons: [],
     exit_code: exitCode,
     log: "",
-    raw_output: (text ?? "").slice(0, 8000),
+    raw_output: (text ?? "").slice(-32000),
   };
   if (data) {
-    ar.ok = true;
     ar.summary = String(data.summary ?? "");
     ar.changed_files = Array.isArray(data.changed_files)
-      ? data.changed_files.map(String)
+      ? data.changed_files.map(String).map((value) => value.trim()).filter(Boolean)
       : [];
     ar.manual_assets = Array.isArray(data.manual_assets)
       ? data.manual_assets.filter((a) => a && typeof a === "object").map(
@@ -335,7 +334,7 @@ export function resultFromOutput(text: string, exitCode: number): AgentResult {
         )
       : [];
     ar.blocked_reasons = Array.isArray(data.blocked_reasons)
-      ? data.blocked_reasons.map(String)
+      ? data.blocked_reasons.map(String).map((value) => value.trim()).filter(Boolean)
       : [];
   } else if (exitCode === 0 && (text ?? "").trim()) {
     ar.summary = (text ?? "").trim().slice(-2000);
@@ -364,7 +363,7 @@ export function formatRetryEvidence(entries: RetryEvidenceEntry[]): string {
 // ---------------------------------------------------------------------------
 // pi 适配器
 // ---------------------------------------------------------------------------
-export interface PiRunOptions {
+export interface AgentRunOptions {
   prompt: string;
   repoDir: string;
   timeoutS: number;
@@ -374,6 +373,10 @@ export interface PiRunOptions {
   tools?: string[];
   /** 可选模型覆盖，供独立 Reviewer 使用。 */
   model?: string;
+  /** Codex SDK 使用的阶段化沙箱；Pi 通过 tools 白名单保持兼容。 */
+  sandboxMode?: "read-only" | "workspace-write";
+  /** Codex SDK 原生结构化输出 schema；Pi 继续使用 FINAL_RESULT 协议。 */
+  outputSchema?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +444,10 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
   fs.writeFileSync(modelsPath, JSON.stringify(root, null, 2) + "\n");
 }
 
+export type PiRunOptions = AgentRunOptions;
+
 export class PiAgent {
+  readonly name = "pi" as const;
   constructor(private config: Config) {}
 
   /** 解析要传给 pi `--skill` 的目录（绝对路径，仅仓库里实际存在的）。
@@ -465,7 +471,7 @@ export class PiAgent {
     return out;
   }
 
-  async run(opts: PiRunOptions): Promise<AgentResult> {
+  async run(opts: AgentRunOptions): Promise<AgentResult> {
     // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）
     try {
       ensurePiModels(this.config.pi);

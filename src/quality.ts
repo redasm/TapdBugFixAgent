@@ -60,6 +60,22 @@ const collectStrings = (value: unknown): string[] => {
   return one ? [one] : [];
 };
 
+const collectAttachments = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return collectStrings(value);
+  const attachments: string[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      attachments.push(...collectStrings(item));
+      continue;
+    }
+    const data = item as Record<string, unknown>;
+    const name = firstText(data, ["name", "filename", "file_name", "attachment_name", "title"]);
+    const url = firstText(data, ["download_url", "url", "path"]);
+    if (name || url) attachments.push(name && url ? `${name}: ${url}` : name || url);
+  }
+  return attachments;
+};
+
 const collectComments = (value: unknown): string[] => {
   if (!Array.isArray(value)) return collectStrings(value);
   const comments: string[] = [];
@@ -108,7 +124,7 @@ export const buildBugContext = (bug: Bug): BugContext => {
     environment,
     logs: collectStrings(raw.logs ?? raw.log ?? raw.stack_trace ?? raw.stack),
     comments: collectComments(raw.comments ?? raw.comment_list),
-    attachments: collectStrings(raw.attachments ?? raw.attachment_list),
+    attachments: collectAttachments(raw.attachments ?? raw.attachment_list),
   };
 };
 

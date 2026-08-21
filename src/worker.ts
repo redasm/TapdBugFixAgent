@@ -14,7 +14,13 @@ import {
   runVerificationPipeline,
   VerificationError,
 } from "./verify.js";
-import { AgentCancelledError, CancelEvent, effectivePiModel, formatRetryEvidence, PiAgent } from "./agent.js";
+import { AgentCancelledError, CancelEvent, formatRetryEvidence } from "./agent.js";
+import {
+  createCodingAgent,
+  effectiveAgentModel,
+  selectedAgentBackend,
+  type CodingAgent,
+} from "./agentBackend.js";
 import { nowStr, type StateStore } from "./state.js";
 import { assessFixability } from "./quality.js";
 import {
@@ -410,22 +416,26 @@ export class Worker {
   }
 
   private async reviewCandidate(
+    reviewer: CodingAgent,
     p4: P4Client,
     bug: Bug,
     investigation: InvestigationResult,
     diff: string,
     verificationSummary: string,
   ): Promise<ReviewResult> {
-    const reviewer = new PiAgent(this.config);
     const result = await reviewer.run({
       prompt: buildReviewPrompt({ bug, investigation, diff, verificationSummary }),
       repoDir: p4.path,
       timeoutS: Math.min(this.config.agent_timeout_s, 600),
       tools: ["read", "grep", "find", "ls"],
+      sandboxMode: "read-only",
       model: this.config.review.model || undefined,
       cancelEvent: this.cancelEvent,
       onProgress: (msg) => this.store.addEvent(`Reviewer ${msg}`, "debug", bug.id),
     });
+    if (!result.ok) {
+      throw new VerificationError(`Reviewer 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
+    }
     return parseReviewResult(result.raw_output || result.log || result.summary);
   }
 
@@ -458,8 +468,9 @@ export class Worker {
       }
 
       // 处理开始时就把 agent / 模型写进 job，web 列表与详情可实时看到
-      const model = effectivePiModel(this.config.pi);
-      this.store.updateJob(bug.id, { agent: "pi", model });
+      const backend = selectedAgentBackend(this.config);
+      const model = effectiveAgentModel(this.config, backend);
+      this.store.updateJob(bug.id, { agent: backend, model });
 
       p4 = new P4Client(repo.path, this.config.p4);
 
@@ -490,16 +501,24 @@ export class Worker {
       // ---- 带证据的重试：把之前的失败记录压缩成提示，喂给全新上下文的 Agent ----
       const retryText = formatRetryEvidence(this.retryEvidenceEntries(bug.id));
       const attempts = Number(this.store.getJob(bug.id)?.attempts ?? 0) + 1;
-      const agent = new PiAgent(this.config);
+      const agent = createCodingAgent(this.config, backend);
+      const reviewerBackend = selectedAgentBackend(this.config, this.config.review.backend);
+      const reviewer = this.config.review.enabled
+        ? createCodingAgent(this.config, reviewerBackend)
+        : null;
       this.store.addEvent("调用只读调查 Agent：定位根因、证据与最小修改范围", "info", bug.id);
       const investigated = await agent.run({
         prompt: buildInvestigationPrompt(bug, repo.name, repo.path),
         repoDir: repo.path,
         timeoutS: Math.min(this.config.agent_timeout_s, 900),
         tools: ["read", "grep", "find", "ls"],
+        sandboxMode: "read-only",
         onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
       });
+      if (!investigated.ok) {
+        throw new Error(`调查 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`);
+      }
       const investigation: InvestigationResult = parseInvestigation(
         investigated.raw_output || investigated.log || investigated.summary,
       );
@@ -524,8 +543,8 @@ export class Worker {
       });
       this.store.addEvent(
         retryText
-          ? `调用编码 Agent（pi）（第 ${attempts} 次尝试，注入上次失败证据）`
-          : "调用编码 Agent（pi）",
+          ? `调用编码 Agent（${backend}）（第 ${attempts} 次尝试，注入上次失败证据）`
+          : `调用编码 Agent（${backend}）`,
         "info",
         bug.id,
       );
@@ -533,9 +552,16 @@ export class Worker {
         prompt,
         repoDir: repo.path,
         timeoutS: this.config.agent_timeout_s,
+        sandboxMode: "workspace-write",
         onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
       });
+      if (!result.ok) {
+        throw new Error(`修复 Agent 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
+      }
+      if (result.blocked_reasons.length) {
+        throw new VerificationError("修复 Agent 报告仍有阻塞项: " + result.blocked_reasons.join("；"));
+      }
       lastResult = result;
       const manualAssets = new Map(result.manual_assets.map((asset) => [asset.path, asset]));
       if (result.manual_assets.length) {
@@ -573,6 +599,7 @@ export class Worker {
         this.store.updateJob(bug.id, { verification: verified });
         if (this.config.review.enabled && verificationPassed) {
           let review = await this.reviewCandidate(
+            reviewer!,
             p4,
             bug,
             investigation,
@@ -597,9 +624,16 @@ export class Worker {
               }),
               repoDir: repo.path,
               timeoutS: this.config.agent_timeout_s,
+              sandboxMode: "workspace-write",
               onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
               cancelEvent: this.cancelEvent,
             });
+            if (!result.ok) {
+              throw new Error(`修正 Agent 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
+            }
+            if (result.blocked_reasons.length) {
+              throw new VerificationError("修正 Agent 报告仍有阻塞项: " + result.blocked_reasons.join("；"));
+            }
             for (const asset of result.manual_assets) manualAssets.set(asset.path, asset);
             result.manual_assets = [...manualAssets.values()];
             lastResult = result;
@@ -613,6 +647,7 @@ export class Worker {
             verificationPassed = verified.verified;
             this.store.updateJob(bug.id, { verification: verified });
             review = await this.reviewCandidate(
+              reviewer!,
               p4,
               bug,
               investigation,
@@ -663,7 +698,7 @@ export class Worker {
         generated_description: desc,
         files: dumps(files),
         manual_assets: dumps(result.manual_assets),
-        agent: "pi",
+        agent: backend,
         failure_reason: null,
         retry_evidence: null, // 成功则清空重试证据
         last_attempt_files: null,

@@ -12,7 +12,7 @@ import {
   type PiProviderConfig,
   type SettingsOverrides,
 } from "../config.js";
-import { effectivePiModel } from "../agent.js";
+import { effectiveAgentModel } from "../agentBackend.js";
 import type { StateStore } from "../state.js";
 import type { Worker } from "../worker.js";
 
@@ -34,8 +34,28 @@ function settingsForWeb(config: Config): Record<string, unknown> {
   const p = config.pi.provider;
   const tapd = config.tapd as Record<string, unknown>;
   return {
+    agent: {
+      backend: config.agent.backend,
+      effective_model: effectiveAgentModel(config),
+    },
+    codex: {
+      model: config.codex.model,
+      reasoning_effort: config.codex.reasoning_effort,
+      approval_policy: config.codex.approval_policy,
+      network_access: config.codex.network_access,
+      base_url: config.codex.base_url,
+      api_key_env: config.codex.api_key_env,
+      codex_path: config.codex.codex_path,
+      has_api_key: !!(config.codex.api_key_env && process.env[config.codex.api_key_env]),
+    },
+    review: {
+      enabled: config.review.enabled,
+      backend: config.review.backend,
+      max_fix_rounds: config.review.max_fix_rounds,
+      model: config.review.model,
+    },
     pi: {
-      effective_model: effectivePiModel(config.pi),
+      effective_model: effectiveAgentModel(config, "pi"),
       provider: p
         ? {
             id: p.id ?? "",
@@ -68,6 +88,31 @@ function settingsForWeb(config: Config): Record<string, unknown> {
 /** 把请求 body 转成 SettingsOverrides；字符串空值/缺失 = 保持不变（不覆盖）。 */
 function settingsFromBody(body: Record<string, unknown>): SettingsOverrides {
   const ov: SettingsOverrides = {};
+  const agentRaw = (body.agent ?? {}) as Record<string, unknown>;
+  if (agentRaw.backend === "pi" || agentRaw.backend === "codex") {
+    ov.agent = { backend: agentRaw.backend };
+  }
+  const codexRaw = (body.codex ?? {}) as Record<string, unknown>;
+  const codex: NonNullable<SettingsOverrides["codex"]> = {};
+  for (const k of ["model", "reasoning_effort", "approval_policy", "base_url", "api_key_env", "codex_path"] as const) {
+    const v = codexRaw[k];
+    if (typeof v === "string" && v !== "") codex[k] = v as never;
+  }
+  if (typeof codexRaw.network_access === "boolean") {
+    codex.network_access = codexRaw.network_access;
+  }
+  if (Object.keys(codex).length) ov.codex = codex;
+  const reviewRaw = (body.review ?? {}) as Record<string, unknown>;
+  const review: NonNullable<SettingsOverrides["review"]> = {};
+  if (typeof reviewRaw.enabled === "boolean") review.enabled = reviewRaw.enabled;
+  if (["", "pi", "codex"].includes(String(reviewRaw.backend ?? ""))) {
+    review.backend = String(reviewRaw.backend ?? "") as "" | "pi" | "codex";
+  }
+  if (typeof reviewRaw.model === "string" && reviewRaw.model !== "") review.model = reviewRaw.model;
+  if (reviewRaw.max_fix_rounds !== undefined && reviewRaw.max_fix_rounds !== "") {
+    review.max_fix_rounds = Math.max(0, Number(reviewRaw.max_fix_rounds));
+  }
+  if (Object.keys(review).length) ov.review = review;
   const prov = (body.pi ?? {}) as Record<string, unknown>;
   const provRaw = (prov.provider ?? {}) as Record<string, unknown>;
   if (Object.keys(provRaw).length) {

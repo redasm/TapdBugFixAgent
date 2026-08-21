@@ -38,6 +38,12 @@ import {
 } from "../src/agent.js";
 import { Worker } from "../src/worker.js";
 import { TapdMcpClient } from "../src/tapdMcp.js";
+import {
+  createCodingAgent,
+  effectiveAgentModel,
+  selectedAgentBackend,
+} from "../src/agentBackend.js";
+import { CodexAgent, progressFromCodexEvent } from "../src/codexAgent.js";
 
 // mock MCP SDK：给 tapdMcp 回归测试用（不发起真实子进程/网络）
 const mcpMockState = vi.hoisted(() => ({
@@ -100,7 +106,7 @@ function makeResult(over: Partial<AgentResult> = {}): AgentResult {
 
 function makeInvestigation(file: string): AgentResult {
   return makeResult({
-    raw_output: `FINAL_RESULT: {"root_cause":"测试根因","evidence":["${file}:1"],"reproduction":{"command":"","before":"复现失败"},"planned_files":["${file}"],"confidence":0.9,"blocked_reasons":[]}`,
+    raw_output: `FINAL_RESULT: {"root_cause":"测试根因","evidence":["[观察] ${file}:1","[推断] 根因由该观察事实支持"],"reproduction":{"command":"","before":"复现失败"},"planned_files":["${file}"],"confidence":0.9,"blocked_reasons":[]}`,
   });
 }
 
@@ -109,6 +115,16 @@ function makeConfig(): Config {
     max_bugs_per_run: 10,
     max_attempts: 1,
     agent_timeout_s: 900,
+    agent: { backend: "pi" },
+    codex: {
+      model: "",
+      reasoning_effort: "high",
+      approval_policy: "never",
+      network_access: false,
+      base_url: "",
+      api_key_env: "OPENAI_API_KEY",
+      codex_path: "",
+    },
     quality: {
       admission: {
         min_score: 0,
@@ -120,7 +136,7 @@ function makeConfig(): Config {
       max_changed_files: 8,
       max_diff_lines: 500,
     },
-    review: { enabled: false, max_fix_rounds: 0, model: "" },
+    review: { enabled: false, backend: "", max_fix_rounds: 0, model: "" },
     exclude_status: ["resolved", "closed", "rejected"],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -266,6 +282,19 @@ priority_weight:
     expect(cfg.workspaces[0].workspace_id).toBe("111");
     expect(cfg.workspaces[0].repos[0].name).toBe("p");
     expect(cfg.priority_weight["低"]).toBe(1);
+    expect(cfg.agent.backend).toBe("pi");
+    expect(cfg.codex.reasoning_effort).toBe("high");
+  });
+
+  it("加载 Codex 后端和独立 Reviewer 后端", () => {
+    const dir = tmpdir();
+    const cfgPath = path.join(dir, "c.yaml");
+    fs.writeFileSync(cfgPath, `agent:\n  backend: codex\ncodex:\n  model: gpt-test\n  reasoning_effort: xhigh\nreview:\n  backend: pi\n`, "utf-8");
+    const cfg = loadConfig(cfgPath);
+    expect(cfg.agent.backend).toBe("codex");
+    expect(cfg.codex.model).toBe("gpt-test");
+    expect(cfg.codex.reasoning_effort).toBe("xhigh");
+    expect(cfg.review.backend).toBe("pi");
   });
 
   it("loadConfig 拒绝旧 pi.model 字段", () => {
@@ -307,6 +336,32 @@ priority_weight:
     const cfg = makeConfig();
     const problems = validateConfig(cfg);
     expect(problems.some((p) => p.includes("TAPD"))).toBe(true);
+  });
+});
+
+describe("Agent 后端选择", () => {
+  it("默认保持 Pi，并可切换到 Codex", () => {
+    const cfg = makeConfig();
+    expect(selectedAgentBackend(cfg)).toBe("pi");
+    expect(createCodingAgent(cfg)).toBeInstanceOf(PiAgent);
+    cfg.agent.backend = "codex";
+    cfg.codex.model = "gpt-test";
+    expect(selectedAgentBackend(cfg)).toBe("codex");
+    expect(effectiveAgentModel(cfg)).toBe("gpt-test");
+    expect(createCodingAgent(cfg)).toBeInstanceOf(CodexAgent);
+  });
+
+  it("Codex 事件转换为可读进度", () => {
+    const progress = progressFromCodexEvent({
+      type: "item.completed",
+      item: {
+        id: "1",
+        type: "file_change",
+        status: "completed",
+        changes: [{ path: "src/a.ts", kind: "update" }],
+      },
+    } as never);
+    expect(progress).toContain("src/a.ts");
   });
 });
 
@@ -371,6 +426,20 @@ p4:
     expect(cfg.pi.provider?.model_id).toBe("m2");
     expect(cfg.pi.provider?.base_url).toBe("https://old"); // 未提供字段保留
     expect(cfg.p4.client).toBe("new-client");
+  });
+
+  it("Agent/Codex/Reviewer 设置可在线覆盖", () => {
+    const cfg = makeConfig();
+    applySettingsOverrides(cfg, {
+      agent: { backend: "codex" },
+      codex: { model: "gpt-test", reasoning_effort: "xhigh", network_access: true },
+      review: { backend: "pi" },
+    });
+    expect(cfg.agent.backend).toBe("codex");
+    expect(cfg.codex.model).toBe("gpt-test");
+    expect(cfg.codex.reasoning_effort).toBe("xhigh");
+    expect(cfg.codex.network_access).toBe(true);
+    expect(cfg.review.backend).toBe("pi");
   });
 
   it("saveSettingsOverrides 保留已有项，多次保存合并", () => {
@@ -760,6 +829,24 @@ describe("agent parsing", () => {
     expect(ar.ok).toBe(true);
     expect(ar.summary).toBe("修复");
     expect(ar.manual_assets.length).toBe(1);
+  });
+
+  it("长输出保留末尾 FINAL_RESULT，供调查和 Reviewer 二次解析", () => {
+    const final = 'FINAL_RESULT: {"summary":"完成","changed_files":["a.ts"],"blocked_reasons":[]}';
+    const ar = resultFromOutput("分析".repeat(20000) + final, 0);
+
+    expect(ar.raw_output).toContain(final);
+    expect(ar.raw_output.length).toBeLessThanOrEqual(32000);
+  });
+
+  it("即使输出了结构化 JSON，非零退出码仍保持失败", () => {
+    const ar = resultFromOutput(
+      'FINAL_RESULT: {"summary":"部分完成","changed_files":["a.ts"],"blocked_reasons":[]}',
+      2,
+    );
+
+    expect(ar.ok).toBe(false);
+    expect(ar.changed_files).toEqual(["a.ts"]);
   });
 
   it("无 JSON 时回落为文本摘要", () => {
@@ -1615,7 +1702,7 @@ describe("worker 两阶段修复协议", () => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"root_cause":"空引用来自缓存失效","evidence":["Login.ts:42"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+          raw_output: 'FINAL_RESULT: {"root_cause":"空引用来自缓存失效","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
         });
       }
       return makeResult({ changed_files: ["Login.ts"], summary: "修复缓存失效" });
@@ -1636,7 +1723,41 @@ describe("worker 两阶段修复协议", () => {
 
     expect(calls).toHaveLength(2);
     expect(calls[0].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(calls[0].sandboxMode).toBe("read-only");
+    expect(calls[1].sandboxMode).toBe("workspace-write");
     expect(String(calls[1].prompt)).toContain("空引用来自缓存失效");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("Codex 后端沿用同一编排，并按阶段切换沙箱", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.agent.backend = "codex";
+    w.config.codex.model = "gpt-test";
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      return calls.length === 1
+        ? makeInvestigation("Login.ts")
+        : makeResult({ changed_files: ["Login.ts"], summary: "Codex 修复" });
+    });
+    const piRun = vi.spyOn(PiAgent.prototype, "run");
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(piRun).not.toHaveBeenCalled();
+    expect(calls.map((call) => call.sandboxMode)).toEqual(["read-only", "workspace-write"]);
+    expect(w.store.getJob(bug.id)?.agent).toBe("codex");
+    expect(w.store.getJob(bug.id)?.model).toBe("gpt-test");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });
 
@@ -1652,7 +1773,7 @@ describe("worker 两阶段修复协议", () => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["Login.ts:42"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+          raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
         });
       }
       return makeResult({ changed_files: ["Login.ts"], summary: "修复空引用" });
@@ -1682,7 +1803,7 @@ describe("worker 两阶段修复协议", () => {
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     vi.spyOn(PiAgent.prototype, "run")
       .mockResolvedValueOnce(makeResult({
-        raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["Login.ts:42"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+        raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
       }))
       .mockResolvedValueOnce(makeResult({ changed_files: ["Login.ts"], summary: "修复空引用" }));
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
@@ -1701,6 +1822,30 @@ describe("worker 两阶段修复协议", () => {
     expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("超出调查阶段计划范围");
   });
 
+  it("修复 Agent 同时报告改动和阻塞时拒绝生成候选", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeInvestigation("Login.ts"))
+      .mockResolvedValueOnce(makeResult({
+        changed_files: ["Login.ts"],
+        blocked_reasons: ["无法运行专项复现"],
+        summary: "只完成了部分修改",
+      }));
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    const createPending = vi.spyOn(P4Client.prototype, "createPending");
+
+    await w.processBug(bug);
+
+    expect(createPending).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("failed");
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("仍有阻塞项");
+  });
+
   it("Reviewer 拒绝后把结构化 finding 交回 Fixer，修正并复审通过", async () => {
     const w = makeWorker([{
       name: "r",
@@ -1717,7 +1862,7 @@ describe("worker 两阶段修复协议", () => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["Settings.ts:42"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
+          raw_output: 'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
         });
       }
       if (calls.length === 2) {
