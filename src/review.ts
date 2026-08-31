@@ -70,6 +70,8 @@ ${input.diff}
 - medium: 明确的功能遗漏、边界问题或测试缺口，提交前应修复。
 - low: 不阻止提交的局部改进建议。
 - 只要存在 high 或 medium finding，approved 必须为 false。
+- 仅仅缺少必须在编辑器、真机或游戏运行时由人工执行的验证，不是代码缺陷：如果配置的机器验证已通过，且 diff/代码数据流没有显示修复无效，应降为 low，作为人工验收建议，不得单独否决候选。
+- “尚未读取到运行时配置”本身属于不确定性，不等于已证明配置条件不满足。只有能指出该 Bug 的实际配置值或确定的数据流使新逻辑不可达时，才可作为 medium/high。
 - 每条阻断 finding 必须指出 diff/代码中的具体证据、可触发的失败场景和可执行 required_action；无法说明失败场景时不要上报为阻断问题。
 - 不要输出表扬或泛化总结。没有 finding 时用简短 note 说明根因、范围和验证均通过检查。
 - approved 只能在没有 high/medium finding、根因已覆盖、范围匹配且验证证据充分时为 true。
@@ -128,13 +130,20 @@ export const parseReviewResult = (output: string): ReviewResult => {
   if (parsed.some((item) => !item)) {
     return invalidReview("Reviewer findings 存在缺失字段或非法 severity", output);
   }
-  const findings = parsed as ReviewFinding[];
+  const findings = (parsed as ReviewFinding[]).map((finding) => {
+    const text = `${finding.title}\n${finding.evidence}\n${finding.required_action}`;
+    const manualValidationOnly = finding.severity === "medium"
+      && /验证证据不足|缺少(?:运行时|人工|真机|编辑器|游戏内).*验证|未(?:运行|执行).*复现/.test(text)
+      && /运行期|人工|真机|编辑器|游戏内|GM|打日志/.test(text)
+      && !/已确认|实际配置(?:为|是)|必然|不可达|逻辑错误|条件错误/.test(text);
+    return manualValidationOnly ? { ...finding, severity: "low" as const } : finding;
+  });
   if (data.approved !== true && !findings.length) {
     return invalidReview("Reviewer 拒绝候选但未给出可执行 finding", output);
   }
   const blocking = findings.some((finding) => finding.severity !== "low");
   return {
-    approved: data.approved === true && !blocking,
+    approved: !blocking,
     note: String(data.note ?? "").trim(),
     findings,
   };

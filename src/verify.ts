@@ -2,7 +2,7 @@
  *
  * 流程：
  * 1. p4 opened 非空（Agent 确实开了文件）
- * 2. p4 reconcile -n 兜底：若 Agent 改了文件却没 p4 edit，自动 reconcile 打开，防止改动丢失
+ * 2. p4 reconcile -n ./... 兜底：若 Agent 改了仓库目录内文件却没 p4 edit，自动 reconcile 打开，防止改动丢失
  * 3. 运行仓库测试命令
  */
 
@@ -11,14 +11,37 @@ import type { OpenedFile, P4Client } from "./p4.js";
 
 export class VerificationError extends Error {}
 
+/** 把 Agent 的“根别名:相对路径”转换为当前 P4 仓库内的精确扫描目标。
+ *  Git 附加目录和不安全路径不会传给 p4。 */
+export function p4ReconcileTargets(files: string[]): string[] {
+  const targets = files.flatMap((raw) => {
+    const value = raw.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!value) return [];
+    const separator = value.indexOf(":");
+    const alias = separator >= 0 ? value.slice(0, separator).toLowerCase() : "project";
+    const relative = separator >= 0 ? value.slice(separator + 1) : value;
+    if (alias !== "project" || !relative || relative.startsWith("/") || /^[a-z]:\//i.test(relative)) return [];
+    if (relative.includes("*") || relative.includes("?") || relative.split("/").includes("..")) return [];
+    return [`./${relative}`];
+  });
+  return [...new Set(targets)];
+}
+
 /** 确保 Agent 的改动都在 p4 中打开，返回 opened 列表。
  *  只收集 default changelist 的文件：pending changelist 的 Files 列表只允许
  *  default 里的文件（p4 change 规范），编号 changelist 是其它 bug 的产物。 */
-export async function checkAndPrepareP4(p4: P4Client): Promise<OpenedFile[]> {
+export async function checkAndPrepareP4(
+  p4: P4Client,
+  reconcileTargets: string[] = [],
+): Promise<OpenedFile[]> {
   const opened = await p4.opened("default");
-  const preview = await p4.reconcilePreview();
+  // Agent 正常执行 p4 edit/add 时无需再扫描磁盘；这是主路径，也避免大型 Unreal
+  // 工作区每个 Bug 都做一次数分钟的全目录摘要计算。
+  if (opened.length) return opened;
 
-  if (!opened.length && !preview.trim()) {
+  const preview = await p4.reconcilePreview(reconcileTargets);
+
+  if (!preview.trim()) {
     const elsewhere = (await p4.opened()).filter((o) => o.changelist !== "default");
     const hint = elsewhere.length
       ? `（另有 ${elsewhere.length} 个文件开在编号 changelist ` +
@@ -29,7 +52,7 @@ export async function checkAndPrepareP4(p4: P4Client): Promise<OpenedFile[]> {
   }
 
   if (preview.trim()) {
-    await p4.reconcile();
+    await p4.reconcile(preview);
     const openedAfter = await p4.opened("default");
     if (!openedAfter.length) {
       throw new VerificationError("reconcile 后仍无 opened 文件");
@@ -66,6 +89,11 @@ export interface PatchScopeResult {
 export interface PlannedScopeResult {
   ok: boolean;
   unplanned_files: string[];
+}
+
+export interface RootedChangedFile {
+  root: string;
+  path: string;
 }
 
 /** 运行测试命令，返回 (是否通过, 输出尾部)。未配置测试命令视为通过。 */
@@ -165,7 +193,16 @@ export function assessPlannedScope(files: string[], plannedFiles: string[]): Pla
   const planned = plannedFiles.map(normalize).filter(Boolean);
   const unplanned = files.filter((file) => {
     const actual = normalize(file);
-    return !planned.some((expected) => actual === expected || actual.endsWith(`/${expected}`));
+    return !planned.some((expected) => {
+      if (actual === expected) return true;
+      // 兼容旧版无根别名输出：project:Foo.cpp 可匹配 Foo.cpp，P4 depot 路径也可按后缀匹配。
+      const expectedRoot = expected.includes(":") ? expected.slice(0, expected.indexOf(":")) : "";
+      const actualRoot = actual.includes(":") ? actual.slice(0, actual.indexOf(":")) : "";
+      if (expectedRoot && actualRoot && expectedRoot !== actualRoot) return false;
+      const expectedPath = expected.includes(":") ? expected.slice(expected.indexOf(":") + 1) : expected;
+      const actualPath = actual.includes(":") ? actual.slice(actual.indexOf(":") + 1) : actual;
+      return actualPath === expectedPath || actualPath.endsWith(`/${expectedPath}`);
+    });
   });
   return { ok: unplanned.length === 0, unplanned_files: unplanned };
 }

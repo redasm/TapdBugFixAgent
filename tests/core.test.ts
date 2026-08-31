@@ -3,6 +3,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
@@ -18,14 +19,16 @@ import {
   saveSettingsOverrides,
   validateConfig,
 } from "../src/config.js";
-import type { Config } from "../src/config.js";
+import type { Config, RepoConfig } from "../src/config.js";
 import { StateStore } from "../src/state.js";
-import { P4Client, P4Error, setSpecField } from "../src/p4.js";
+import { ensureP4IgnoreFile, GENERATED_P4IGNORE, isP4ConnectionFailure, P4CancelledError, P4Client, P4ConnectionError, P4Error, P4SyncTimeoutError, p4EnvFromConfig, p4PathIgnored, setSpecField } from "../src/p4.js";
 import type { OpenedFile } from "../src/p4.js";
-import { VerificationError, checkAndPrepareP4 } from "../src/verify.js";
+import { VerificationError, checkAndPrepareP4, p4ReconcileTargets } from "../src/verify.js";
 import {
   AgentCancelledError,
+  AgentInfrastructureError,
   AgentRuntimeError,
+  AgentTimeoutError,
   CancelEvent,
   PiAgent,
   effectivePiModel,
@@ -43,12 +46,32 @@ import {
   effectiveAgentModel,
   selectedAgentBackend,
 } from "../src/agentBackend.js";
-import { CodexAgent, progressFromCodexEvent } from "../src/codexAgent.js";
+import {
+  CodexAgent,
+  CommandExecutionGuard,
+  codexOutputSchema,
+  codexThreadOptions,
+  ensureCodexModelCatalog,
+  progressFromCodexEvent,
+} from "../src/codexAgent.js";
+import {
+  codexMcpConfig,
+  configuredManualKeywords,
+  inspectMcpServer,
+  mcpToolGuidance,
+  parseMcpServers,
+  probeMcpServer,
+  resolveMcpServers,
+} from "../src/mcpServers.js";
+import { assessFixability } from "../src/quality.js";
+import { buildFixBranchName, GitWorkspace } from "../src/git.js";
 
 // mock MCP SDK：给 tapdMcp 回归测试用（不发起真实子进程/网络）
 const mcpMockState = vi.hoisted(() => ({
   tools: [] as Array<Record<string, unknown>>,
   callResult: { content: [] as Array<Record<string, unknown>> },
+  calledTools: [] as string[],
+  closed: 0,
 }));
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
   Client: class {
@@ -56,9 +79,11 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
     async listTools(): Promise<{ tools: unknown[] }> {
       return { tools: mcpMockState.tools };
     }
-    async callTool(): Promise<unknown> {
+    async callTool(input: { name: string }): Promise<unknown> {
+      mcpMockState.calledTools.push(input.name);
       return mcpMockState.callResult;
     }
+    async close(): Promise<void> { mcpMockState.closed += 1; }
   },
 }));
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
@@ -124,7 +149,11 @@ function makeConfig(): Config {
       base_url: "",
       api_key_env: "OPENAI_API_KEY",
       codex_path: "",
+      model_catalog_json: "",
+      context_window: 0,
+      auto_compact_token_limit: 0,
     },
+    mcp_servers: {},
     quality: {
       admission: {
         min_score: 0,
@@ -153,7 +182,7 @@ function tmpdir(): string {
 }
 
 /** 建一个带一个 workspace（repos 可注入）的 worker。 */
-function makeWorker(repos: Array<{ name: string; path: string; verify_cmds: string[] }> = []): Worker {
+function makeWorker(repos: RepoConfig[] = []): Worker {
   const store = new StateStore(":memory:");
   const cfg = makeConfig();
   cfg.workspaces = [
@@ -332,6 +361,51 @@ priority_weight:
     expect(cfg.pi.skill_dirs).toEqual([".agents/skills", "D:/shared/skills"]);
   });
 
+  it("loadConfig 解析项目下的多个 Git 附加目录", () => {
+    const root = tmpdir();
+    const project = path.join(root, "project");
+    const engine = path.join(root, "engine");
+    fs.mkdirSync(project);
+    fs.mkdirSync(engine);
+    const cfgPath = path.join(root, "config.yaml");
+    fs.writeFileSync(cfgPath, `workspaces:
+  - workspace_id: "111"
+    owner: yangfan
+    default_repo: game
+    repos:
+      - name: game
+        path: ${JSON.stringify(project)}
+        ignore_paths:
+          - Config/
+          - "**/Saved/"
+        preflight_reconcile: once
+        verify_cmds: []
+        additional_dirs:
+          - name: engine
+            path: ${JSON.stringify(engine)}
+            vcs: git
+            base_branch: branch_0.7.0
+            author: yangfan
+            ignore_paths:
+              - Engine/Binaries/Win64/UnrealBuildAccelerator/
+            verify_cmds: ["npm test"]
+`, "utf-8");
+
+    const cfg = loadConfig(cfgPath);
+
+    expect(cfg.workspaces[0].repos[0].ignore_paths).toEqual(["Config/", "**/Saved/"]);
+    expect(cfg.workspaces[0].repos[0].preflight_reconcile).toBe("once");
+    expect(cfg.workspaces[0].repos[0].additional_dirs).toEqual([{
+      name: "engine",
+      path: engine,
+      vcs: "git",
+      base_branch: "branch_0.7.0",
+      author: "yangfan",
+      ignore_paths: ["Engine/Binaries/Win64/UnrealBuildAccelerator/"],
+      verify_cmds: ["npm test"],
+    }]);
+  });
+
   it("validate 报告缺少凭据", () => {
     const cfg = makeConfig();
     const problems = validateConfig(cfg);
@@ -362,6 +436,434 @@ describe("Agent 后端选择", () => {
       },
     } as never);
     expect(progress).toContain("src/a.ts");
+  });
+
+  it("Codex MCP 工具失败进度包含 SDK 返回的错误正文", () => {
+    const progress = progressFromCodexEvent({
+      type: "item.completed",
+      item: {
+        id: "mcp-1",
+        type: "mcp_tool_call",
+        server: "unreal_mcp",
+        tool: "read_mcp_resource",
+        arguments: { uri: "ping" },
+        status: "failed",
+        error: { message: "Invalid request parameters" },
+      },
+    } as never);
+    expect(progress).toContain("unreal_mcp/read_mcp_resource");
+    expect(progress).toContain("Invalid request parameters");
+  });
+
+  it("Codex 命令失败进度包含 exit code 和输出尾部", () => {
+    const progress = progressFromCodexEvent({
+      type: "item.completed",
+      item: {
+        id: "cmd-1",
+        type: "command_execution",
+        command: "git status --short",
+        aggregated_output: "fatal: not a git repository",
+        exit_code: 128,
+        status: "failed",
+      },
+    } as never);
+    expect(progress).toContain("命令失败（exit 128）");
+    expect(progress).toContain("not a git repository");
+  });
+
+  it("Codex 将 rg exit 1 且无输出显示为未命中而不是失败", () => {
+    const progress = progressFromCodexEvent({
+      type: "item.completed",
+      item: {
+        id: "cmd-2",
+        type: "command_execution",
+        command: "powershell.exe -Command 'rg -n missing Source'",
+        aggregated_output: "",
+        exit_code: 1,
+        status: "failed",
+      },
+    } as never);
+    expect(progress).toContain("搜索未命中");
+    expect(progress).not.toContain("命令失败");
+  });
+
+  it("Codex 将 rg 管道提前结束造成的 exit 1 显示为已有结果", () => {
+    const progress = progressFromCodexEvent({
+      type: "item.completed",
+      item: {
+        id: "cmd-3",
+        type: "command_execution",
+        command: "rg -n WildEvent . | Select-Object -First 20",
+        aggregated_output: "Source/WildEvent.ts:42:class WildEvent",
+        exit_code: 1,
+        status: "failed",
+      },
+    } as never);
+    expect(progress).toContain("搜索已返回结果");
+    expect(progress).not.toContain("命令失败");
+  });
+
+  it("Codex 保留 rg 路径错误为真实命令失败", () => {
+    const progress = progressFromCodexEvent({
+      type: "item.completed",
+      item: {
+        id: "cmd-4",
+        type: "command_execution",
+        command: "rg -n WildEvent MissingDir",
+        aggregated_output: "rg: MissingDir: 系统找不到指定的文件。 (os error 2)",
+        exit_code: 1,
+        status: "failed",
+      },
+    } as never);
+    expect(progress).toContain("命令失败（exit 1）");
+    expect(progress).toContain("系统找不到指定的文件");
+  });
+
+  it("Codex 线程接收去重排序后的 additionalDirectories", () => {
+    const cfg = makeConfig();
+    const options = codexThreadOptions({
+      prompt: "fix",
+      repoDir: "C:\\project",
+      additionalDirs: ["C:\\engine-b", "C:\\engine-a", "C:\\engine-b"],
+      timeoutS: 10,
+    }, cfg.codex, "workspace-write");
+
+    expect(options.workingDirectory).toBe("C:\\project");
+    expect(options.additionalDirectories).toEqual(["C:\\engine-a", "C:\\engine-b"]);
+  });
+
+  it("自定义 Codex 网关禁用原生 outputSchema，避免工具调用被提前终止", () => {
+    const cfg = makeConfig();
+    const schema = { type: "object", properties: { summary: { type: "string" } } };
+    const opts = { prompt: "x", repoDir: "C:\\project", timeoutS: 60, outputSchema: schema };
+
+    cfg.codex.base_url = "https://gateway.example.com";
+    expect(codexOutputSchema(opts, cfg.codex)).toBeUndefined();
+
+    cfg.codex.base_url = "";
+    expect(codexOutputSchema(opts, cfg.codex)).toBe(schema);
+  });
+
+  it("Codex 调查守卫阻止重复命令和超出命令预算", () => {
+    const repeated = new CommandExecutionGuard(10, 2);
+    repeated.observe("rg -n Foo Source");
+    repeated.observe("  RG   -n foo source ");
+    expect(() => repeated.observe("rg -n Foo Source")).toThrow(/重复超过 2 次/);
+
+    const budget = new CommandExecutionGuard(2, 10);
+    budget.observe("one");
+    budget.observe("two");
+    expect(() => budget.observe("three")).toThrow(/超过预算 2 次/);
+  });
+
+  it("自定义 Codex 网关不自动套用 GPT 模型目录", () => {
+    const cfg = makeConfig();
+    cfg.codex.model = "glm-5.3";
+    cfg.codex.base_url = "https://gateway.example.com";
+    cfg.codex.context_window = 1_000_000;
+    expect(ensureCodexModelCatalog(cfg, cfg.codex.model)).toBeUndefined();
+
+    cfg.codex.model_catalog_json = "{agent}/models/glm.json";
+    expect(ensureCodexModelCatalog(cfg, cfg.codex.model)).toBe(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "models/glm.json"),
+    );
+  });
+});
+
+describe("Git 附加工作区", () => {
+  it("按主分支、作者和秒级时间生成分支名", () => {
+    expect(buildFixBranchName(
+      "branch_0.7.0", "yangfan", new Date(2026, 6, 7, 17, 17, 30),
+    )).toBe("branch_0.7.0_yangfan20260707171730");
+  });
+
+  it("创建修复分支、本地提交并切回主分支", async () => {
+    const repo = tmpdir();
+    execFileSync("git", ["init", "-b", "branch_0.7.0"], { cwd: repo });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, "engine.txt"), "before\n");
+    execFileSync("git", ["add", "engine.txt"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "base"], { cwd: repo });
+    const workspace = new GitWorkspace(repo);
+    const session = await workspace.prepareBranch(
+      "branch_0.7.0", "yangfan", new Date(2026, 6, 7, 17, 17, 30),
+    );
+    fs.writeFileSync(path.join(repo, "engine.txt"), "after\n");
+
+    const result = await workspace.finalize(session, "fix engine bug");
+
+    expect(result?.branch).toBe("branch_0.7.0_yangfan20260707171730");
+    expect(result?.files).toEqual(["engine.txt"]);
+    expect(execFileSync("git", ["branch", "--show-current"], { cwd: repo }).toString().trim())
+      .toBe("branch_0.7.0");
+    expect(execFileSync("git", ["show", `${result?.commit}:engine.txt`], { cwd: repo }).toString())
+      .toBe("after\n");
+  });
+
+  it("失败回滚只清理本次创建的分支", async () => {
+    const repo = tmpdir();
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n");
+    execFileSync("git", ["add", "tracked.txt"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "base"], { cwd: repo });
+    const workspace = new GitWorkspace(repo);
+    const session = await workspace.prepareBranch("main", "yangfan", new Date(2026, 0, 2, 3, 4, 5));
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty\n");
+    fs.writeFileSync(path.join(repo, "new.txt"), "temporary\n");
+
+    await workspace.rollback(session);
+
+    expect(execFileSync("git", ["branch", "--show-current"], { cwd: repo }).toString().trim()).toBe("main");
+    expect(execFileSync("git", ["branch", "--list", session.branch], { cwd: repo }).toString().trim()).toBe("");
+    expect(fs.readFileSync(path.join(repo, "tracked.txt"), "utf-8").replace(/\r\n/g, "\n"))
+      .toBe("base\n");
+    expect(fs.existsSync(path.join(repo, "new.txt"))).toBe(false);
+  });
+
+  it("忽略已跟踪和未跟踪的本地构建目录，不阻塞、提交或回滚", async () => {
+    const repo = tmpdir();
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    fs.mkdirSync(path.join(repo, "Build"));
+    fs.writeFileSync(path.join(repo, "engine.txt"), "base\n");
+    fs.writeFileSync(path.join(repo, "Build", "tracked.bin"), "base build\n");
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "base"], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, "Build", "tracked.bin"), "local build\n");
+    fs.writeFileSync(path.join(repo, "Build", "untracked.pdb"), "local symbols\n");
+    const workspace = new GitWorkspace(repo, ["Build/"]);
+    const session = await workspace.prepareBranch("main", "yangfan", new Date(2026, 0, 2, 3, 4, 5));
+    fs.writeFileSync(path.join(repo, "engine.txt"), "fixed\n");
+
+    const result = await workspace.finalize(session, "fix engine bug");
+
+    expect(result?.files).toEqual(["engine.txt"]);
+    expect(fs.readFileSync(path.join(repo, "Build", "tracked.bin"), "utf-8")).toBe("local build\n");
+    expect(fs.readFileSync(path.join(repo, "Build", "untracked.pdb"), "utf-8")).toBe("local symbols\n");
+    expect(execFileSync("git", ["show", "--name-only", "--format=", result!.commit], { cwd: repo })
+      .toString().trim()).toBe("engine.txt");
+  });
+
+  it("带忽略目录的失败回滚保留本地构建产物", async () => {
+    const repo = tmpdir();
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    fs.mkdirSync(path.join(repo, "Build"));
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n");
+    fs.writeFileSync(path.join(repo, "Build", "tracked.bin"), "base build\n");
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "base"], { cwd: repo });
+
+    const workspace = new GitWorkspace(repo, ["Build/"]);
+    const session = await workspace.prepareBranch("main", "yangfan", new Date(2026, 0, 2, 3, 4, 5));
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty\n");
+    fs.writeFileSync(path.join(repo, "temporary.txt"), "temporary\n");
+    fs.writeFileSync(path.join(repo, "Build", "tracked.bin"), "local build\n");
+    fs.writeFileSync(path.join(repo, "Build", "untracked.pdb"), "local symbols\n");
+
+    await workspace.rollback(session);
+
+    expect(fs.readFileSync(path.join(repo, "tracked.txt"), "utf-8").replace(/\r\n/g, "\n"))
+      .toBe("base\n");
+    expect(fs.existsSync(path.join(repo, "temporary.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(repo, "Build", "tracked.bin"), "utf-8")).toBe("local build\n");
+    expect(fs.readFileSync(path.join(repo, "Build", "untracked.pdb"), "utf-8")).toBe("local symbols\n");
+  });
+});
+
+describe("通用 MCP Agent 接入", () => {
+  beforeEach(() => {
+    mcpMockState.tools = [];
+    mcpMockState.callResult = { content: [] };
+    mcpMockState.calledTools = [];
+    mcpMockState.closed = 0;
+  });
+
+  it("按仓库根解析所有启用服务，调查阶段生成只读 Codex MCP 配置", () => {
+    const repo = tmpdir();
+    const firstCwd = path.join(repo, "tools", "first");
+    const secondCwd = path.join(repo, "tools", "second");
+    fs.mkdirSync(firstCwd, { recursive: true });
+    fs.mkdirSync(secondCwd, { recursive: true });
+    const cfg = parseMcpServers({
+      demo_mcp: {
+        command: "python-test",
+        args: ["{repo}\\tools\\first\\server.py"],
+        cwd: "${repo}\\tools\\first",
+        env: { PROJECT_ROOT: "{repo}" },
+        read_only_tools: ["ping", "inspect"],
+        disabled_tools: ["execute_python"],
+      },
+      second_mcp: {
+        command: "node",
+        args: ["server.js"],
+        cwd: "{repo}\\tools\\second",
+        enabled_tools: ["read", "write"],
+        read_only_tools: ["read"],
+      },
+      agent_local_mcp: {
+        command: "cmd",
+        cwd: "{agent}",
+        read_only_tools: [],
+      },
+      disabled_mcp: { enabled: false, command: "ignored" },
+    });
+    const servers = resolveMcpServers(cfg, repo, true);
+    const codex = codexMcpConfig(servers) as Record<string, Record<string, Record<string, unknown>>>;
+
+    expect(servers).toHaveLength(3);
+    expect(servers[0].args).toEqual([path.join(firstCwd, "server.py")]);
+    expect(servers[0].cwd).toBe(firstCwd);
+    expect(servers[0].env.PROJECT_ROOT).toBe(repo);
+    expect(servers[0].enabledTools).toEqual(["ping", "inspect"]);
+    expect(servers[1].enabledTools).toEqual(["read"]);
+    expect(servers[2].cwd).toBe(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
+    expect(codex.mcp_servers.demo_mcp.disabled_tools).toContain("execute_python");
+    expect(codex.mcp_servers.demo_mcp.default_tools_approval_mode).toBe("approve");
+    expect(codex.mcp_servers.demo_mcp.enabled_tools).toEqual(["ping", "inspect"]);
+    expect(codex.mcp_servers.second_mcp.enabled_tools).toEqual(["read"]);
+    expect(codex.mcp_servers.disabled_mcp).toBeUndefined();
+  });
+
+  it("实施阶段使用 enabled_tools，未配置 allowlist 时开放除 denylist 外的工具", () => {
+    const repo = tmpdir();
+    const cfg = parseMcpServers({
+      allowlisted: { command: "node", cwd: "{repo}", enabled_tools: ["read", "write"] },
+      unrestricted: { command: "node", cwd: "{repo}", disabled_tools: ["dangerous"] },
+    });
+    const servers = resolveMcpServers(cfg, repo, false);
+
+    expect(servers[0].enabledTools).toEqual(["read", "write"]);
+    expect(servers[1].enabledTools).toBeUndefined();
+    expect(servers[1].disabledTools).toEqual(["dangerous"]);
+  });
+
+  it("远程 HTTP MCP 可直接映射到 Codex 配置", () => {
+    const cfg = parseMcpServers({
+      docs: {
+        url: "https://mcp.example.com/mcp",
+        bearer_token_env_var: "MCP_TOKEN",
+        http_headers: { "X-Region": "cn" },
+        env_http_headers: { "X-Tenant": "MCP_TENANT" },
+        read_only_tools: ["search"],
+      },
+    });
+    const codex = codexMcpConfig(resolveMcpServers(cfg, tmpdir(), true)) as Record<string, Record<string, Record<string, unknown>>>;
+
+    expect(codex.mcp_servers.docs).toMatchObject({
+      url: "https://mcp.example.com/mcp",
+      bearer_token_env_var: "MCP_TOKEN",
+      http_headers: { "X-Region": "cn" },
+      env_http_headers: { "X-Tenant": "MCP_TENANT" },
+      enabled_tools: ["search"],
+    });
+    expect(codex.mcp_servers.docs.command).toBeUndefined();
+  });
+
+  it("MCP 预检枚举实际工具、调用 ping，并生成禁止误用 resources API 的提示", async () => {
+    const repo = tmpdir();
+    mcpMockState.tools = [
+      { name: "ping", inputSchema: { type: "object" } },
+      { name: "read_blueprint_content", inputSchema: { type: "object" } },
+      { name: "execute_python", inputSchema: { type: "object" } },
+    ];
+    mcpMockState.callResult = { content: [{ type: "text", text: "pong" }] };
+    const [server] = resolveMcpServers(parseMcpServers({
+      unreal_mcp: {
+        command: "python",
+        cwd: "{repo}",
+        read_only_tools: ["ping", "read_blueprint_content", "missing_tool"],
+        disabled_tools: ["execute_python"],
+      },
+    }), repo, true);
+
+    const inspection = inspectMcpServer(server, await probeMcpServer(server));
+    const guidance = mcpToolGuidance([inspection]);
+
+    expect(inspection.availableTools).toEqual(["ping", "read_blueprint_content"]);
+    expect(inspection.missingEnabledTools).toEqual(["missing_tool"]);
+    expect(mcpMockState.calledTools).toEqual(["ping"]);
+    expect(mcpMockState.closed).toBe(1);
+    expect(guidance).toContain("服务 `unreal_mcp`");
+    expect(guidance).toContain("`read_blueprint_content`");
+    expect(guidance).toContain("禁止用 read_mcp_resource");
+    expect(guidance).toContain("禁止把 tool 名当作 resource URI");
+  });
+
+  it("Chrome MCP 预检调用 list_pages，提前发现未开启远程调试", async () => {
+    const repo = tmpdir();
+    mcpMockState.tools = [
+      { name: "list_pages", inputSchema: { type: "object" } },
+      { name: "take_snapshot", inputSchema: { type: "object" } },
+    ];
+    mcpMockState.callResult = { content: [{ type: "text", text: "page 1" }] };
+    const [server] = resolveMcpServers(parseMcpServers({
+      chrome_devtools: {
+        command: "npx",
+        cwd: "{repo}",
+        read_only_tools: ["list_pages", "take_snapshot"],
+      },
+    }), repo, true);
+
+    const probe = await probeMcpServer(server);
+
+    expect(probe.healthCheckTool).toBe("list_pages");
+    expect(mcpMockState.calledTools).toEqual(["list_pages"]);
+  });
+
+  it("MCP 自己声明资源门禁关键词，禁用时转人工、启用时自动放行", () => {
+    const disabled = parseMcpServers({
+      prefab: { enabled: false, command: "node", automates_manual_keywords: ["prefab"] },
+    });
+    const policy = {
+      min_score: 0,
+      require_reproduction_signal: false,
+      manual_keywords: configuredManualKeywords(disabled),
+      high_risk_keywords: [],
+    };
+    const bug = makeBug({ title: "prefab 显示异常" });
+
+    expect(assessFixability(bug, policy, []).disposition).toBe("manual_only");
+    disabled.prefab.enabled = true;
+    expect(assessFixability(bug, policy, ["prefab"]).disposition).toBe("auto_fix");
+  });
+
+  it("同时命中可自动和不可自动资源时仍保持人工门禁", () => {
+    const bug = makeBug({ title: "prefab 引用的 xlsx 数据错误" });
+    const result = assessFixability(bug, {
+      min_score: 0,
+      require_reproduction_signal: false,
+      manual_keywords: ["prefab", "xlsx"],
+      high_risk_keywords: [],
+    }, ["prefab"]);
+
+    expect(result.disposition).toBe("manual_only");
+    expect(result.reasons.join(" ")).toContain("xlsx");
+  });
+
+  it("配置校验会拒绝不存在的绝对 command 和 cwd", () => {
+    const cfg = makeConfig();
+    const root = tmpdir();
+    cfg.workspaces = [{
+      workspace_id: "111", owner: "me", default_repo: "r",
+      repos: [{ name: "r", path: root, verify_cmds: [] }],
+    }];
+    cfg.mcp_servers = parseMcpServers({
+      broken: {
+        command: path.join(root, "missing-python.exe"),
+        cwd: "{repo}\\missing-cwd",
+      },
+    });
+
+    const problems = validateConfig(cfg).join("\n");
+    expect(problems).toContain("mcp_servers.broken.command 不存在");
+    expect(problems).toContain("mcp_servers.broken.cwd 不存在");
   });
 });
 
@@ -625,6 +1127,27 @@ describe("state", () => {
 // p4 spec / 重试
 // ---------------------------------------------------------------------------
 describe("p4", () => {
+  it("p4.ignore 映射为 P4IGNORE", () => {
+    expect(p4EnvFromConfig({ ignore: ".p4ignore" })).toEqual({ P4IGNORE: ".p4ignore" });
+  });
+
+  it("P4 ignore_paths 可忽略已跟踪目录和任意层级生成目录", () => {
+    const ignored = ["Config/", "Binaries/", "**/.github/agents/"];
+    expect(p4PathIgnored("//nami/branch/Source/Client/Config/Build.ini", ignored)).toBe(true);
+    expect(p4PathIgnored("//nami/branch/Source/Client/TypeScript/.github/agents/a.md", ignored)).toBe(true);
+    expect(p4PathIgnored("//nami/branch/Source/Client/Source/Feature.cpp", ignored)).toBe(false);
+  });
+
+  it("由 ignore_paths 自动生成 P4IGNORE 文件，无需重复配置 p4.ignore", () => {
+    const dir = tmpdir();
+    expect(ensureP4IgnoreFile(dir, ["Saved/", "**/.github/agents/"])).toBe(GENERATED_P4IGNORE);
+    expect(fs.readFileSync(path.join(dir, GENERATED_P4IGNORE), "utf-8")).toContain([
+      GENERATED_P4IGNORE,
+      "Saved/",
+      "**/.github/agents/",
+    ].join("\n"));
+  });
+
   it("set_description", () => {
     const spec = "Change:\tnew\n\nClient:\ttapd-agent_x\n\nDescription:\n\t<enter description here>\n\nFiles:\n\t//depot/a.cpp#1 edit\n";
     const out = setSpecField(spec, "Description", "第一行\n第二行");
@@ -651,6 +1174,20 @@ describe("p4", () => {
     expect(o[2]).toEqual({ depot: "//nami/branch_0.7.0/c.ts", action: "add", changelist: "default", type: "text" });
   });
 
+  it("opened() 排除 P4 ignore_paths 中已受控的文件", async () => {
+    const client = new P4Client("C:\\tmp", {}, undefined, undefined, ["Config/"]);
+    (client as unknown as { run: () => Promise<string> }).run = async () => [
+      "//nami/branch/Source/Client/Config/Build.ini#1 - edit default change (text)",
+      "//nami/branch/Source/Client/Source/Fix.cpp#2 - edit default change (text)",
+    ].join("\n");
+    expect(await client.opened("default")).toEqual([{
+      depot: "//nami/branch/Source/Client/Source/Fix.cpp",
+      action: "edit",
+      changelist: "default",
+      type: "text",
+    }]);
+  });
+
   it("回归：opened('default') 必须带 -c default（不带会把编号 changelist 的文件混进新 pending，p4 change -i 报 Can't include file(s) not already opened）", async () => {
     const client = new P4Client("C:\\tmp", { client: "test-client" });
     const calls: string[][] = [];
@@ -662,6 +1199,102 @@ describe("p4", () => {
     await client.opened();
     expect(calls[0]).toEqual(["opened", "-c", "default"]);
     expect(calls[1]).toEqual(["opened"]);
+  });
+
+  it("opened 严格模式遇到连接异常时抛错，避免误报 P4 连接成功", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    (client as unknown as { run: () => Promise<string> }).run = async () => {
+      throw new P4Error("Connect to server failed");
+    };
+    await expect(client.opened("default", true)).rejects.toThrow("Connect to server failed");
+  });
+
+  it("识别休眠、VPN 和服务器拒绝造成的 P4 连接故障", () => {
+    expect(isP4ConnectionFailure("Connect to server failed; WSAECONNREFUSED")).toBe(true);
+    expect(isP4ConnectionFailure("TCP connect failed: network is unreachable")).toBe(true);
+    expect(isP4ConnectionFailure("no such file(s)")).toBe(false);
+  });
+
+  it("opened 遇到短暂 P4 断线时自动重连后继续", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    let calls = 0;
+    (client as unknown as { run: () => Promise<string> }).run = async () => {
+      calls += 1;
+      if (calls < 3) throw new P4ConnectionError("Connect to server failed; WSAECONNREFUSED");
+      return "//depot/Fix.ts#1 - edit default change (text)";
+    };
+    client.sleep = async () => {};
+
+    expect(await client.opened("default", true)).toHaveLength(1);
+    expect(calls).toBe(3);
+  });
+
+  it("diff 连接失败时单次降级，不重试也不中断已完成修复", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    let calls = 0;
+    (client as unknown as { run: () => Promise<string> }).run = async () => {
+      calls += 1;
+      throw new P4ConnectionError("Connect to server failed; WSAECONNREFUSED");
+    };
+
+    await expect(client.diffUnified(["//depot/Fix.ts"])).resolves.toBe("");
+    expect(calls).toBe(1);
+  });
+
+  it("reconcile -n 默认扫描当前仓库目录并使用 2 分钟超时", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: Array<{ args: string[]; timeout?: number }> = [];
+    (client as unknown as {
+      run: (args: string[], input?: string, timeout?: number) => Promise<string>;
+    }).run = async (args: string[], _input?: string, timeout?: number) => {
+      calls.push({ args, timeout });
+      return "";
+    };
+    await client.reconcilePreview();
+    expect(calls).toEqual([{ args: ["reconcile", "-n", "./..."], timeout: 2 * 60 * 1000 }]);
+  });
+
+  it("reconcile -n 可只扫描 planned_files", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: string[][] = [];
+    (client as unknown as { run: (args: string[]) => Promise<string> }).run = async (args: string[]) => {
+      calls.push(args);
+      return "";
+    };
+    await client.reconcilePreview(["./Source/Foo.cpp", "./Content/A.uasset"]);
+    expect(calls).toEqual([[
+      "reconcile", "-n", "./Source/Foo.cpp", "./Content/A.uasset",
+    ]]);
+  });
+
+  it("reconcile 过滤忽略路径，并只打开预览中允许的文件", async () => {
+    const client = new P4Client("C:\\tmp", {}, undefined, undefined, ["Config/", "**/.github/agents/"]);
+    const calls: string[][] = [];
+    (client as unknown as { run: (args: string[]) => Promise<string> }).run = async (args: string[]) => {
+      calls.push(args);
+      return [
+        "//nami/branch/Source/Client/Config/Build.ini#1 - opened for edit",
+        "... //nami/branch/Source/Client/Config/Build.ini - also opened by other@client",
+        "//nami/branch/Source/Client/TypeScript/.github/agents/a.md#1 - opened for add",
+        "//nami/branch/Source/Client/Source/Fix.cpp#2 - opened for edit",
+      ].join("\n");
+    };
+    const preview = await client.reconcilePreview();
+    expect(preview).toContain("Source/Fix.cpp");
+    expect(preview).not.toContain("Config/Build.ini");
+    expect(preview).not.toContain("also opened by");
+    expect(preview).not.toContain(".github/agents/a.md");
+    await client.reconcile(preview);
+    expect(calls[1]).toEqual(["reconcile", "//nami/branch/Source/Client/Source/Fix.cpp"]);
+  });
+
+  it("reconcile -n 被人工取消时向上抛出，不降级成无本地改动", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    (client as unknown as { run: () => Promise<string> }).run = async () => {
+      throw new P4CancelledError("人工取消");
+    };
+
+    await expect(client.reconcilePreview()).rejects.toBeInstanceOf(P4CancelledError);
   });
 
   it("回归：revert 默认带 -c default（绝不误撤编号 changelist 里其它 bug 的改动）", async () => {
@@ -685,9 +1318,60 @@ describe("p4", () => {
       if (calls.n < 3) throw new P4Error("rename: failed to rename ... 文件被占用");
       return "updated";
     };
-    const out = await client.sync(600000, 3, 0);
+    const out = await client.sync(["./..."], 600000, 3, 0);
     expect(out).toBe("updated");
     expect(calls.n).toBe(3);
+  });
+
+  it("sync 默认同步当前仓库目录并使用 10 分钟超时", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: Array<{ args: string[]; timeout?: number }> = [];
+    (client as unknown as {
+      run: (args: string[], input?: string, timeout?: number) => Promise<string>;
+    }).run = async (args: string[], _input?: string, timeout?: number) => {
+      calls.push({ args, timeout });
+      return "updated";
+    };
+    await client.sync();
+    expect(calls).toEqual([{
+      args: ["sync", "--parallel=threads=4,min=10", "./..."],
+      timeout: 10 * 60 * 1000,
+    }]);
+  });
+
+  it("sync 可只同步 planned_files 目标", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: string[][] = [];
+    (client as unknown as { run: (args: string[]) => Promise<string> }).run = async (args) => {
+      calls.push(args);
+      return "updated";
+    };
+    await client.sync(["./Source/Foo.cpp", "./Content/A.uasset"]);
+    expect(calls).toEqual([[
+      "sync", "--parallel=threads=4,min=10", "./Source/Foo.cpp", "./Content/A.uasset",
+    ]]);
+  });
+
+  it("sync 超时立即失败，不继续重试", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    let calls = 0;
+    (client as unknown as { run: () => Promise<string> }).run = async () => {
+      calls += 1;
+      throw new P4Error("p4 sync ./... 超时(600s)");
+    };
+    await expect(client.sync(["./..."], 600000, 3, 0)).rejects.toThrow("超时(600s)");
+    expect(calls).toBe(1);
+  });
+
+  it("sync 普通确定性错误不重试", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    let calls = 0;
+    (client as unknown as { run: () => Promise<string> }).run = async () => {
+      calls += 1;
+      throw new P4Error("p4 sync ./... 失败: no such file(s)");
+    };
+    await expect(client.sync(["./..."], 600000, 3, 0)).rejects.toThrow("no such file");
+    expect(calls).toBe(1);
   });
 
   it("sync 持续失败抛最后一次错误", async () => {
@@ -697,7 +1381,7 @@ describe("p4", () => {
       lastErr = new P4Error("rename: failed to rename ... 文件被占用");
       throw lastErr;
     };
-    await expect(client.sync(600000, 2, 0)).rejects.toBeInstanceOf(P4Error);
+    await expect(client.sync(["./..."], 600000, 2, 0)).rejects.toBeInstanceOf(P4Error);
     expect(lastErr).not.toBeNull();
   });
 });
@@ -732,9 +1416,19 @@ class FakeP4 {
 }
 
 describe("checkAndPrepareP4", () => {
+  it("只把 project planned_files 转成精确 P4 reconcile 目标", () => {
+    expect(p4ReconcileTargets([
+      "project:Source/Foo.cpp",
+      "project:Content/A.uasset",
+      "engine:Engine/Source/Bar.cpp",
+      "project:../outside.txt",
+      "project:Source/Foo.cpp",
+    ])).toEqual(["./Source/Foo.cpp", "./Content/A.uasset"]);
+  });
+
   it("Agent 漏了 p4 edit 时 reconcile 兜底", async () => {
     const fake = new FakeP4([], "...//x.cpp#1 - edit from D:/...");
-    const opened = await checkAndPrepareP4(fake as unknown as P4Client);
+    const opened = await checkAndPrepareP4(fake as unknown as P4Client, ["./x.cpp"]);
     expect(fake.reconciled).toBe(true);
     expect(opened.length).toBe(1);
   });
@@ -809,6 +1503,21 @@ describe("agent parsing", () => {
     const text = '分析……（网关吞掉了标记）\n{"summary": "s", "changed_files": ["x.ts"], "manual_assets": [], "blocked_reasons": []}';
     const data = extractFinalJson(text);
     expect(data?.changed_files).toEqual(["x.ts"]);
+  });
+
+  it("结构化输出为纯调查 JSON 时也可提取", () => {
+    const text = JSON.stringify({
+      root_cause: "缓存失效后仍解引用旧对象",
+      evidence: ["[观察] project:Login.ts:42", "[推断] 旧对象为空导致崩溃"],
+      reproduction: { command: "npm test -- login", before: "FAIL" },
+      diagnostic_pages: [],
+      planned_files: ["project:Login.ts"],
+      confidence: 0.9,
+      blocked_reasons: [],
+    });
+    const data = extractFinalJson(text);
+    expect(data?.root_cause).toContain("缓存失效");
+    expect(data?.planned_files).toEqual(["project:Login.ts"]);
   });
 
   it("回归：围栏开栏行后直接跟 JSON（stripCodeFence 曾把正文清成空串）", () => {
@@ -916,6 +1625,41 @@ function withFakePiOnPath(dir: string, fn: () => Promise<void>): Promise<void> {
 }
 
 describe("PiAgent 子进程控制", () => {
+  it("只读调查统一挂载所有 Pi MCP 并限制为各自只读工具", async () => {
+    const d = tmpdir();
+    writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
+    const cfg = makeConfig();
+    cfg.mcp_servers = parseMcpServers({
+      unreal_mcp: {
+        command: "python",
+        cwd: "{repo}",
+        read_only_tools: ["ping", "inspect"],
+        disabled_tools: ["execute_python"],
+      },
+      prefab_mcp2: {
+        command: "python",
+        cwd: "{repo}",
+        read_only_tools: ["lgui_ping"],
+      },
+    });
+    const agent = new PiAgent(cfg);
+    await withFakePiOnPath(d, async () => {
+      await agent.run({
+        prompt: "x",
+        repoDir: d,
+        timeoutS: 60,
+        tools: ["read", "grep"],
+        sandboxMode: "read-only",
+      });
+    });
+
+    const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
+    expect(args).toContain("--extension");
+    expect(args).toContain("unreal_mcp_ping");
+    expect(args).toContain("prefab_mcp2_lgui_ping");
+    expect(args).not.toContain("unreal_mcp_execute_python");
+  });
+
   it("只读阶段通过 --tools 限制为代码浏览工具，并可覆盖评审模型", async () => {
     const d = tmpdir();
     writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
@@ -1110,9 +1854,11 @@ describe("PiAgent 子进程控制", () => {
     });
     // 前 2 个增量合并成一条；工具事件单独一条；末尾增量收尾时冲刷
     expect(progress).toEqual([
+      "Pi: 准备调用模型 (Pi 默认模型)（sandbox=workspace-write，timeout=60s）",
       "Agent: line 0line 1",
       "Agent: Bash p4 edit a.ts",
       "Agent: line 2",
+      "Pi: 进程结束（exit=0）",
     ]);
   });
 
@@ -1129,7 +1875,12 @@ describe("PiAgent 子进程控制", () => {
     await withFakePiOnPath(d, async () => {
       await agent.run({ prompt: "x", repoDir: d, timeoutS: 60, onProgress: (m) => progress.push(m) });
     });
-    expect(progress).toEqual(["Agent: 第一行", "Agent: 第二行"]);
+    expect(progress).toEqual([
+      "Pi: 准备调用模型 (Pi 默认模型)（sandbox=workspace-write，timeout=60s）",
+      "Agent: 第一行",
+      "Agent: 第二行",
+      "Pi: 进程结束（exit=0）",
+    ]);
   });
 });
 
@@ -1312,6 +2063,24 @@ describe("worker web 合并", () => {
     stubMyBugs(w, [bug]);
     expect(await w.retryBug(bug.id)).toBe(true);
     expect(w.store.getJob(bug.id)).toBeUndefined();
+  });
+
+  it("已跳过 bug 可恢复为待处理并清除跳过完成状态", async () => {
+    const w = makeWorker();
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, [bug]);
+    w.store.upsertJob(bug, {
+      agent_state: "skipped",
+      failure_reason: "人工跳过",
+      finished_at: "2026-08-28 10:00:00",
+    });
+
+    expect(await w.retryBug(bug.id)).toBe(true);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("pending");
+    expect(job?.failure_reason).toBeNull();
+    expect(job?.finished_at).toBeNull();
+    expect(w.store.listEvents(bug.id).some((e) => String(e.msg).includes("从跳过恢复"))).toBe(true);
   });
 
   it("重试未知 bug 返回 false", async () => {
@@ -1507,6 +2276,14 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     expect(r.synced).toBe(1);
     expect(w.store.getJob(bug.id)?.agent_state).toBe("pending");
   });
+
+  it("停止后当前任务尚未退出时拒绝清除同步，避免删除运行中任务的状态和日志", async () => {
+    const w = makeWorker();
+    w.store.setControl("stopped");
+    w.currentBugId = "1152729922001254287";
+
+    await expect(w.resyncFromTapd()).rejects.toThrow(/仍在停止中/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1571,7 +2348,21 @@ describe("worker 控制与取消", () => {
     expect(gotCancel).toBe(w.cancelEvent); // worker 把取消事件传给 agent
     const events = w.store.listEvents(bug.id);
     expect(events.some((e) => String(e.msg).includes("人工中断"))).toBe(true);
-    expect(events.some((e) => String(e.msg).includes("失败"))).toBe(false);
+    expect(events.some((e) => String(e.msg).includes("处理失败"))).toBe(false);
+  });
+
+  it("P4 扫描被暂停或关闭取消时 bug 回到 pending，不记为失败", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubMyBugs(w, [bug]);
+    vi.spyOn(P4Client.prototype, "opened").mockRejectedValue(new P4CancelledError("人工取消 P4"));
+
+    await w.processBug(bug);
+
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("pending");
+    expect(job?.attempts).toBe(0);
+    expect(w.store.listEvents(bug.id).some((e) => String(e.msg).includes("人工中断"))).toBe(true);
   });
 
   it("回归：人工跳过正在处理的 bug，中断后不把 skipped 覆盖回 pending", async () => {
@@ -1656,6 +2447,156 @@ describe("formatRetryEvidence", () => {
 });
 
 describe("worker 两阶段修复协议", () => {
+  it("专用 P4 工作区正常完成后只做一次启动基线扫描", async () => {
+    const repo: RepoConfig = {
+      name: "game", path: "C:\\project", verify_cmds: [], preflight_reconcile: "once",
+    };
+    const w = makeWorker([repo]);
+    const first = makeBug({ id: "1152729922001234007" });
+    const second = makeBug({ id: "1152729922001234008" });
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    let agentCalls = 0;
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async () => {
+      agentCalls += 1;
+      return agentCalls % 2 === 1
+        ? makeInvestigation("project:Source/Foo.cpp")
+        : makeResult({ manual_assets: [{ path: "asset", reason: "manual" }], summary: "人工资源" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const preview = vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+
+    await w.processBug(first);
+    await w.processBug(second);
+
+    // 1 次启动基线 + 每个 Bug 完成后各 1 次改动收集；第二个 Bug 没有重复前置扫描。
+    expect(preview).toHaveBeenCalledTimes(3);
+    expect(w.store.listEvents(second.id).some((event) =>
+      String(event.msg).includes("跳过重复 reconcile 扫描"))).toBe(true);
+  });
+
+  it("同一 Bug 可只修改 Git 引擎目录并保留本地分支和 commit", async () => {
+    const repo: RepoConfig = {
+      name: "game",
+      path: "C:\\project",
+      verify_cmds: [],
+      additional_dirs: [{
+        name: "engine",
+        path: "C:\\engine",
+        vcs: "git",
+        base_branch: "branch_0.7.0",
+        author: "yangfan",
+        verify_cmds: [],
+      }],
+    };
+    const w = makeWorker([repo]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    const comments: string[] = [];
+    stubTapd(w, { addComment: async (_id: string, text: string) => { comments.push(text); } } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      return calls.length === 1
+        ? makeInvestigation("engine:Engine/Source/Foo.cpp")
+        : makeResult({ changed_files: ["engine:Engine/Source/Foo.cpp"], summary: "修复引擎逻辑" });
+    });
+    const sync = vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(GitWorkspace.prototype, "prepareBranch").mockResolvedValue({
+      baseBranch: "branch_0.7.0", baseCommit: "base", branch: "branch_0.7.0_yangfan20260707171730",
+    });
+    vi.spyOn(GitWorkspace.prototype, "changedFiles").mockResolvedValue(["Engine/Source/Foo.cpp"]);
+    vi.spyOn(GitWorkspace.prototype, "diff").mockResolvedValue("--- a/Engine/Source/Foo.cpp\n+++ b/Engine/Source/Foo.cpp\n-old\n+fixed");
+    vi.spyOn(GitWorkspace.prototype, "finalize").mockResolvedValue({
+      branch: "branch_0.7.0_yangfan20260707171730",
+      commit: "0123456789abcdef",
+      files: ["Engine/Source/Foo.cpp"],
+    });
+    const createPending = vi.spyOn(P4Client.prototype, "createPending");
+
+    await w.processBug(bug);
+
+    expect(calls.every((call) => (call.additionalDirs as string[]).includes("C:\\engine"))).toBe(true);
+    expect(sync).not.toHaveBeenCalled();
+    expect(createPending).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+    expect(String(w.store.getJob(bug.id)?.files)).toContain("engine:Engine/Source/Foo.cpp");
+    expect(comments.join("\n")).toContain("branch_0.7.0_yangfan20260707171730");
+    expect(comments.join("\n")).toContain("0123456789abcdef");
+  });
+
+  it("跨目录修复失败时回滚本次 Git 分支", async () => {
+    const repo: RepoConfig = {
+      name: "game",
+      path: "C:\\project",
+      verify_cmds: [],
+      additional_dirs: [{
+        name: "engine", path: "C:\\engine", vcs: "git",
+        base_branch: "main", author: "yangfan", verify_cmds: [],
+      }],
+    };
+    const w = makeWorker([repo]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(GitWorkspace.prototype, "prepareBranch").mockResolvedValue({
+      baseBranch: "main", baseCommit: "base", branch: "main_yangfan20260707171730",
+    });
+    const rollback = vi.spyOn(GitWorkspace.prototype, "rollback").mockResolvedValue();
+    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({ ok: false, log: "agent failed" }));
+
+    await w.processBug(bug);
+
+    expect(rollback).toHaveBeenCalledOnce();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("failed");
+  });
+
+  it("启用 MCP 后资源 Bug 可准入，所有 Agent 阶段自动获得 MCP", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.mcp_servers = parseMcpServers({
+      prefab_mcp2: {
+        command: "python",
+        cwd: "C:\\tmp",
+        read_only_tools: ["lgui_ping"],
+        automates_manual_keywords: ["prefab"],
+      },
+    });
+    const bug = makeBug({
+      title: "LGUI prefab 节点显示异常",
+      description: "复现步骤：打开界面。预期结果：节点可见。实际结果：节点消失。",
+    });
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      return calls.length === 1
+        ? makeInvestigation("Content/UI/Test.prefab")
+        : makeResult({ changed_files: ["Content/UI/Test.prefab"], summary: "MCP 已修改并回读验证" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/Content/UI/Test.prefab", action: "edit", changelist: "default", type: "binary" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls.every((call) => !("unrealMcpMode" in call))).toBe(true);
+    expect(calls[0].sandboxMode).toBe("read-only");
+    expect(calls[1].sandboxMode).toBe("workspace-write");
+    expect(calls[0].requiredMcpServers).toEqual(["prefab_mcp2"]);
+    expect(calls[1].requiredMcpServers).toEqual(["prefab_mcp2"]);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
   it("default changelist 存在无法归属的遗留文件时停止，绝不混入当前 Bug", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
@@ -1675,7 +2616,9 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("存在未 p4 edit 的本地改动时停止，避免 reconcile 后混入当前 Bug", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{
+      name: "r", path: "C:\\tmp", verify_cmds: [], preflight_reconcile: "always",
+    }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -1707,7 +2650,7 @@ describe("worker 两阶段修复协议", () => {
       }
       return makeResult({ changed_files: ["Login.ts"], summary: "修复缓存失效" });
     });
-    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    const sync = vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "opened")
       .mockResolvedValueOnce([])
       .mockResolvedValue([
@@ -1724,15 +2667,111 @@ describe("worker 两阶段修复协议", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0].tools).toEqual(["read", "grep", "find", "ls"]);
     expect(calls[0].sandboxMode).toBe("read-only");
+    expect(sync).toHaveBeenCalledOnce();
+    expect(sync).toHaveBeenCalledWith(["./Login.ts"]);
     expect(calls[1].sandboxMode).toBe("workspace-write");
     expect(String(calls[1].prompt)).toContain("空引用来自缓存失效");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("调查首轮只有开场白时在同一 Agent 补充一轮并继续修复", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) return makeResult({ raw_output: "我会先阅读相关代码并定位根因。" });
+      if (calls.length === 2) return makeInvestigation("Login.ts");
+      return makeResult({ changed_files: ["Login.ts"], summary: "修复缓存失效" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(3);
+    expect(String(calls[1].prompt)).toContain("上一轮输出未完成");
+    expect(String(calls[1].prompt)).toContain("我会先阅读相关代码");
+    expect(calls[0].outputSchema).toBeDefined();
+    expect(calls[1].outputSchema).toBe(calls[0].outputSchema);
+    expect(calls[2].outputSchema).toBeDefined();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("调查补充轮仍不完整时转 needs_info 且不消耗 Bug 重试", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeResult({ raw_output: "我会先调查。" }))
+      .mockResolvedValueOnce(makeResult({ raw_output: "仍在检查代码。" }));
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+
+    await w.processBug(bug);
+
+    expect(run).toHaveBeenCalledTimes(2);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("needs_info");
+    expect(Number(job?.attempts ?? 0)).toBe(0);
+    expect(String(job?.failure_reason)).toContain("调查结果缺少 root_cause");
+  });
+
+  it("P4 精确同步超时后进入工作区阻塞且不消耗 Bug 重试次数", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(
+      makeInvestigation("project:Content/UI/Test.uasset"),
+    );
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const sync = vi.spyOn(P4Client.prototype, "sync").mockRejectedValue(
+      new P4SyncTimeoutError("p4 sync ./Content/UI/Test.uasset 超时(600s)"),
+    );
+
+    await w.processBug(bug);
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(sync).toHaveBeenCalledWith(["./Content/UI/Test.uasset"]);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
+    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("P4 精确同步超时");
+  });
+
+  it("P4 持续断线进入工作区阻塞且不消耗 Bug 重试次数", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run");
+    vi.spyOn(P4Client.prototype, "opened").mockRejectedValue(
+      new P4ConnectionError("p4 opened -c default 失败: Connect to server failed; WSAECONNREFUSED"),
+    );
+
+    await w.processBug(bug);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
+    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("P4 服务当前不可用");
   });
 
   it("Codex 后端沿用同一编排，并按阶段切换沙箱", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.agent.backend = "codex";
     w.config.codex.model = "gpt-test";
+    w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -1756,9 +2795,59 @@ describe("worker 两阶段修复协议", () => {
 
     expect(piRun).not.toHaveBeenCalled();
     expect(calls.map((call) => call.sandboxMode)).toEqual(["read-only", "workspace-write"]);
+    expect(calls.map((call) => call.timeoutS)).toEqual([600, 1800]);
+    expect(calls[0].maxCommandExecutions).toBe(50);
+    expect(calls[0].repeatedCommandLimit).toBe(3);
+    expect(calls[0].outputSchema).toBeDefined();
+    expect(calls[1].maxCommandExecutions).toBe(100);
+    expect(calls[1].repeatedCommandLimit).toBe(3);
+    expect(calls[1].outputSchema).toBeDefined();
     expect(w.store.getJob(bug.id)?.agent).toBe("codex");
     expect(w.store.getJob(bug.id)?.model).toBe("gpt-test");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("诊断链接依赖 Chrome MCP，预检失败时阻塞且不消耗重试", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.agent.backend = "codex";
+    w.config.max_attempts = 2;
+    const bug = makeBug({
+      description: "Crash 详情 https://crashsight.qq.com/crash-reporting/crashes/app/issue/report?pid=10",
+    });
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      throw new AgentInfrastructureError("required MCP 预检失败: chrome_devtools: Connection closed");
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].requiredMcpServers).toEqual(["chrome_devtools"]);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
+    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+  });
+
+  it("Agent 超时后转 needs_info 且不自动重试", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.agent.backend = "codex";
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(CodexAgent.prototype, "run").mockRejectedValue(
+      new AgentTimeoutError("Agent 调用超时(600s): codex"),
+    );
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+
+    await w.processBug(bug);
+
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("needs_info");
+    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("超时");
   });
 
   it("仅在机器验证实际通过后调用 Reviewer 并标记评审通过", async () => {
@@ -1896,8 +2985,11 @@ describe("worker 两阶段修复协议", () => {
 
     expect(calls).toHaveLength(5);
     expect(calls[2].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(calls[2].outputSchema).toBeDefined();
     expect(String(calls[3].prompt)).toContain("失败分支必须显示错误并返回");
+    expect(calls[3].outputSchema).toBeDefined();
     expect(calls[4].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(calls[4].outputSchema).toBe(calls[2].outputSchema);
     const job = w.store.getJob(bug.id);
     expect(job?.agent_state).toBe("candidate_partial");
     expect(String(job?.manual_assets)).toContain("Assets/Settings.prefab");
@@ -2332,10 +3424,19 @@ describe("web 前端 bug_id 内插引号", () => {
     "utf-8",
   );
 
-  it("actRetry/actSkip 的 onclick 用引号包裹 bug_id（防 >2^53 被舍入成别的 bug）", () => {
+  it("actRetry/actSkip/actRestore 的 onclick 用引号包裹 bug_id（防 >2^53 被舍入成别的 bug）", () => {
     expect(html).toContain("actRetry('${job.bug_id}')");
     expect(html).toContain("actSkip('${job.bug_id}')");
-    expect(html).not.toMatch(/act(Retry|Skip)\(\$\{job\.bug_id\}\)/);
+    expect(html).toContain("actRestore('${job.bug_id}')");
+    expect(html).not.toMatch(/act(Retry|Skip|Restore)\(\$\{job\.bug_id\}\)/);
+  });
+
+  it("跳过状态显示恢复入口，并在操作成功后等待刷新完成", () => {
+    expect(html).toContain("job.agent_state === 'skipped'");
+    expect(html).toContain("↻ 恢复为待处理");
+    expect(html).toContain("async function actRestore(id)");
+    expect(html).toMatch(/async function actSkip[\s\S]*?await refresh\(\)/);
+    expect(html).toMatch(/async function actRestore[\s\S]*?await refresh\(\)/);
   });
 
   it("files/manual_assets/retry_evidence 用 parseArr 容错解析（防字面 'null' 导致 .length 崩溃）", () => {

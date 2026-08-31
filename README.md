@@ -1,15 +1,15 @@
 # TapdBugFixAgent
 
 自动从 Tapd 拉取分配给你的 Bug，按优先级执行 **准入 → 只读调查 → 最小修复 → 机器验证 → 独立评审**，
-产出 **Perforce pending changelist**（描述自动生成，首行带 `【b<短号>】` 可过 swarm 校验），并回写 Tapd 评论。
+产出 **Perforce pending changelist**；若配置了附加 Git 引擎目录，还会创建并本地提交独立修复分支，然后回写 Tapd 评论。
 配套 **Web 管理台** 实时监控与控制全流程。
 
 ![运行效果](web_run.jpg)
 
-**安全约定**：永不 `p4 submit`、永不修改 Tapd 单子状态——代码停在 pending changelist，由你 review/submit 后自行关单。
-涉及 prefab / 表格等二进制资源的改动不强改：Agent 会列入「需人工处理资源」记录在案。
+**安全约定**：永不 `p4 submit`、永不 `git push`、永不修改 Tapd 单子状态——P4 代码停在 pending changelist，Git 代码停在本地修复分支，由你 review 后人工 submit/push。
+配置 Unreal MCP 后，Agent 可通过受控工具读取、修改并验证 Unreal/LGUI 资源；未命中或 MCP 未启用的二进制资源仍列入「需人工处理资源」。
 
-纯 TypeScript（Node ≥ 20），SQLite 状态库，无 Python 依赖。
+主体为 TypeScript（Node ≥ 20）并使用 SQLite 状态库；仅启用 Unreal MCP 时需要 Python。
 
 ---
 
@@ -52,10 +52,11 @@ npm start -- serve
 
 | 依赖 | 说明 |
 |---|---|
-| Node.js ≥ 20 | 运行本体与 Tapd MCP（stdio 模式经 `npx` 跑官方包） |
+| Node.js ≥ 20 | 运行本体与 Tapd MCP（官方包已锁定为项目依赖，stdio 模式经 `npx --no-install` 启动） |
 | 编码 Agent | Pi：全局安装 `@earendil-works/pi-coding-agent`；Codex：项目依赖已包含官方 `@openai/codex-sdk` |
 | p4 命令行 | 在 PATH 中；为 Agent 建一个**专用 client workspace**（如 `tapd-agent_<你>`），别与日常开发共用 |
 | Tapd 凭据 | **个人访问令牌**（推荐，个人设置 → 个人访问令牌 创建）或 API 账号 |
+| Unreal MCP（可选） | 目标仓库包含 `Plugins/UnrealMCP`；Unreal Editor 已加载插件并启动桥接；本机 Python 可启动两个 MCP server |
 
 pi 鉴权（任选其一）：
 - 环境变量 `ANTHROPIC_API_KEY`（或 `ANTHROPIC_OAUTH_TOKEN`）；
@@ -80,6 +81,16 @@ workspaces:
         verify_cmds:                # 按顺序执行；任一失败即停止
           - "npm run typecheck"
           - "npm test -- --runInBand"
+        additional_dirs:            # 可选：与项目代码一起调查/修改的 Git 引擎仓库
+          - name: engine
+            path: 'D:\git\engine'
+            vcs: git
+            base_branch: branch_0.7.0
+            author: yangfan
+            ignore_paths:             # 本地构建产物：允许存在，但不检查、不提交、不回滚
+              - 'Engine/Binaries/Win64/UnrealBuildAccelerator/'
+            verify_cmds:
+              - "cmake --build build --config Development"
 
 p4:
   port: p4.example.com:1666         # ④ p4 服务器
@@ -88,7 +99,7 @@ p4:
   password: "..."
 ```
 
-其余（Agent 后端、Pi/Codex 参数、Web token、Tapd 后端选择）见 `config.example.yaml` 内注释。默认仍使用 Pi；
+其余（Agent 后端、Pi/Codex 参数、Web token、Tapd 数据源）见 `config.example.yaml` 内注释。默认仍使用 Pi；
 切换 Codex 只需设置：
 
 ```yaml
@@ -102,6 +113,71 @@ codex:
 review:
   backend: ""               # 跟随主后端；也可设 pi/codex 做交叉评审
 ```
+
+### 同时修改项目目录和引擎目录
+
+主 `repos[].path` 仍是 Perforce 项目工作区；把一个或多个 Git 仓库放在同一项的
+`additional_dirs` 下即可。Codex SDK 会把它们作为 `additionalDirectories` 传入（CLI 等价于重复
+`--add-dir`），不需要把工作目录写进 skill 配置。
+
+每个 Bug 开始前，工具要求附加 Git 仓库处于干净状态，并从 `base_branch` 创建分支：
+`<主分支>_<作者><yyyyMMddHHmmss>`，例如 `branch_0.7.0_yangfan20260707171730`。
+已经被 Git 跟踪、但会被本地编译反复改写的生成目录可放入 `ignore_paths`。这些路径不会阻塞
+干净检查，也不会进入 Agent diff/commit；失败回滚时会原样保留。路径相对 Git 仓库根目录，
+目录以 `/` 结尾，也支持 Git glob。不要把源码目录加入此列表。
+修复成功后在该分支本地 commit 并切回主分支，但不会 push；失败或取消时仅清理本次工具创建的分支。
+调查与结果中的文件使用根别名区分，例如 `project:Source/Game.cpp`、
+`engine:Engine/Source/Runtime.cpp`。Pi 后端也能通过绝对路径访问这些目录，但没有 Codex
+`additionalDirectories` 提供的同等沙箱边界，因此多目录自动修改优先推荐 Codex。
+
+MCP 与 Codex / Claude Code 一样采用注册表配置：所有 `enabled: true` 的 server 都会在 Agent 启动时自动加载，后续增加 MCP 只需在 YAML 追加一项，不需要修改 TypeScript。示例：
+
+```yaml
+mcp_servers:
+  unreal_mcp:
+    enabled: true
+    command: 'C:\Python310\python.exe'
+    args: ['{repo}\Plugins\UnrealMCP\Python\unreal_mcp_server_advanced.py']
+    cwd: '{repo}\Plugins\UnrealMCP\Python'
+    disabled_tools: [execute_python]
+    read_only_tools: [ping, get_actors_in_level, read_blueprint_content]
+    automates_manual_keywords: [场景, 关卡, 蓝图, actor, datatable]
+
+  prefab_mcp2:
+    enabled: true
+    command: 'C:\Python310\python.exe'
+    args: [-m, prefab_mcp2.server]
+    cwd: '{repo}\Plugins\UnrealMCP\Python\prefab_mcp2'
+    env:
+      PYTHONPATH: '{repo}\Plugins\UnrealMCP\Python\prefab_mcp2\src'
+    read_only_tools: [lgui_ping, lgui_node_tree, lgui_node_info, lgui_prop_get]
+    automates_manual_keywords: [prefab, 预制体, lgui]
+
+  chrome_devtools:
+    enabled: true
+    required: false
+    approval_mode: approve
+    command: node
+    # 每个 Agent 进程只启动轻量 stdio 代理，实际 Chrome 调试连接由官方常驻 daemon 复用。
+    args: ['{agent}\\dist\\chromeDaemonProxy.js']
+    cwd: '{agent}'
+    env:
+      CHROME_DEVTOOLS_SESSION_ID: '74617064'
+    enabled_tools: &chrome_read_tools [list_pages, new_page, close_page, navigate_page, take_snapshot, take_screenshot, list_console_messages, get_console_message, list_network_requests, get_network_request]
+    read_only_tools: *chrome_read_tools
+    startup_timeout_sec: 60
+    tool_timeout_sec: 90
+```
+
+本地 server 使用 `command/args/cwd/env/env_vars`；远程 Streamable HTTP server 可改用 `url/bearer_token_env_var/http_headers/env_http_headers`。路径和值支持 `{repo}` / `${repo}`（当前 Bug 仓库根）及 `{agent}` / `${agent}`（本工具安装目录）占位符。`enabled`、`required`、`enabled_tools` 和 `disabled_tools` 对齐 Codex；`approval_mode` 会映射成 Codex 的 `default_tools_approval_mode`，默认 `approve`，避免自动任务的 `approval_policy: never` 拒绝已显式开放的 MCP 工具；`read_only_tools` 是本项目为调查与 Reviewer 增加的安全白名单。资源关键词直接配置在对应 MCP 的 `automates_manual_keywords`：server 禁用时保持人工门禁，启用后才允许自动处理，因此不必在全局 `manual_keywords` 重复填写。Codex 直接使用原生 MCP 配置，Pi 通过通用代理动态发现和注册工具；非 `required` 服务启动失败时会跳过，不阻塞纯代码 Bug；但当前 Bug 含诊断链接或命中某个资源关键词时，对应 MCP 会被动态视为必需，预检失败直接阻塞且不消耗修复重试。TAPD MCP 属于编排器数据源，继续单独配置在 `tapd.mcp`，不会加载给编码 Agent。
+
+`chrome_devtools` 使用项目中固定安装的 `chrome-devtools-mcp`，不会临时联网下载。项目代理会自动启动并复用同一个官方 daemon；因此调查、修复、Reviewer 或下一个 Bug 即使重新创建 stdio MCP，也不会重新建立 Chrome 调试连接。首次使用（以及 Chrome、Windows 或 daemon 重启后）需在 Chrome 144+ 的 `chrome://inspect/#remote-debugging` 开启远程调试，并在 Chrome 弹出的连接授权中允许一次；daemon 与 Chrome 持续运行期间后续任务无需重复授权。该安全确认由 Chrome 控制，不能在项目中永久绕过。不要改成 `--isolated`，否则会启动不带现有登录态的临时浏览器。调查阶段发现外部诊断链接时必须读取页面；登录失效、权限不足或页面不可达会明确阻塞该 Bug，而不是根据标题猜测。
+
+只读调查最多运行 10 分钟、执行 50 条命令；编码阶段最多执行 100 条命令；所有 Agent 阶段同一规范化命令最多重复 3 次。命令预算、重复循环或阶段超时触发后任务转为 `needs_info`，不会再用相同提示自动重试。
+
+自定义网关仍可用 `codex.context_window` / `codex.auto_compact_token_limit` 设置窗口与压缩阈值；`codex.model_catalog_json` 只应指向与实际模型工具协议匹配的显式目录。不要从 GPT 模型复制目录给 GLM/DeepSeek 等兼容网关模型，否则 Codex 会采用错误的工具调用协议，表现为只输出“我会先调查”而不真正调用工具。`Model metadata ... not found` 的提示对这类兼容网关是可接受的回退信息。
+
+Unreal 资源写入前仍须确认编辑器打开的工程就是该 P4 workspace；Agent 会比较 MCP 返回的项目根，发现不一致时停止写入。
 
 ### .env
 
@@ -127,8 +203,9 @@ npm run build && npm start
 
 CLI 通用选项：`--config <path>`、`--db <path>`、`--host` / `--port`（serve）。
 
-单个 bug 的处理流程：拉取队列（≤1 次/分钟缓存）→ 自动修复准入评分 → `p4 sync` →
-只读调查 Agent（通过 `--tools read,grep,find,ls` 强制禁止写入）→ 修复 Agent 最小修改 →
+单个 bug 的处理流程：拉取队列（≤1 次/分钟缓存）→ 自动修复准入评分 →
+只读调查 Agent（代码浏览工具；Unreal 资源 Bug 额外挂只读 MCP 工具）→ 精确同步 `planned_files` →
+修复 Agent 最小修改（资源写入仅通过 MCP）→
 P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Reviewer finding 定向修正/复审 →
 生成 pending changelist → Tapd 评论（不改状态）。失败按 `max_attempts` 自动重试并携带测试、文件和评审证据。
 
@@ -145,13 +222,14 @@ P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Rev
 ### 准确率门禁
 
 - **结构化 Bug 上下文**：从 TAPD 原始字段整理复现步骤、预期/实际结果、环境、日志、评论和附件。
-- **自动修复准入**：描述过短、缺少复现信号时进入 `needs_info`；资源类进入 `manual_only`；支付、账号、
+- **自动修复准入**：描述过短、缺少复现信号时进入 `needs_info`；可由已启用 Unreal MCP 处理的资源类进入自动调查，其余资源类进入 `manual_only`；支付、账号、
   存档、协议等高风险项进入 `manual_review`。
 - **严格验证**：未配置 `verify_cmds` 时只能生成 `candidate`，不会标记为“已验证”。
 - **范围限制**：默认最多 8 个文件、500 行 diff，超限转失败/人工分析，避免无关大改。
 - **计划白名单**：实际 P4 改动必须属于只读调查阶段声明的 `planned_files`，计划外文件会拒绝候选。
-- **工作区隔离**：default changelist 中若有无法归属当前 Bug 的遗留文件，或 `p4 reconcile -n`
-  检出未登记的本地改动，任务进入 `blocked_workspace`，不调用 Agent、不消耗重试次数，也绝不把遗留改动混入当前补丁。
+- **工作区隔离**：default changelist 中若有无法归属当前 Bug 的遗留文件，任务进入 `blocked_workspace`，不调用 Agent、
+  不消耗重试次数，也绝不把遗留改动混入当前补丁。大型专用工作区默认不做全目录 reconcile；Agent 漏掉 `p4 edit/add`
+  时只对调查阶段声明的 `planned_files` 执行精确 reconcile。
 - **独立评审**：Reviewer 强制只读；high/medium finding 会交回 Fixer，修正后重新验证和复审。
 - **真实结果回流**：人工可记录原样接受、修改后接受、具体拒绝原因和 reopen，管理台展示真实准确率。
 
@@ -209,7 +287,12 @@ pending → in_progress
 
 **P4 安全**：Agent 只允许 `p4 edit / add / delete`（submit / revert / sync / change 写入 prompt 禁止）；
 工具侧只收集 **default changelist** 的文件生成 pending，绝不动其它编号 changelist；
-`p4 reconcile -n` 兜底防改动丢失。
+每个 Bug 先进行只读调查，再用 `p4 sync --parallel=threads=4,min=10 <planned_files...>` 仅同步调查声明的
+`project:` 文件；纯 Git 修改不执行 P4 sync，reconcile 兜底也只扫描 `planned_files`。
+精确同步单次默认超时 10 分钟；超时会进入 `blocked_workspace` 且不消耗 Bug 重试次数，只有网络抖动、
+文件占用等瞬时错误会在 P4 层重试。
+个人本地 skill 可在 P4 工作区根目录的 `.p4ignore` 中忽略 `.agents/skills/`、`.agent/skills/`，
+并配置 `p4.ignore: .p4ignore`（或环境变量 `P4IGNORE=.p4ignore`）。忽略只影响 P4 跟踪，Pi 仍可加载这些 skill。
 
 **团队 skill**：Pi 后端自动挂载仓库下的 `.agents/skills` / `.agent/skills`（存在才挂）——
 同事放在版本库里的 skill 修复 Agent 也能用。目录结构 `<名字>/SKILL.md`（frontmatter 需
@@ -260,7 +343,7 @@ worker 轮询时自动转跳过并写明原因。
 **修复好的单子又出现在队列？** 工具不改 Tapd 状态，所以单子状态仍是 new；若用「清除并重新同步」，
 这些单会重新处理。已人工关闭（resolved 等）的单不会。
 
-**开发**：`npm test`（vitest，162 个用例）；源码在 `src/`，构建产物 `dist/`（含 `prompts/`）。
+**开发**：`npm test`（vitest，184 个用例）；源码在 `src/`，构建产物 `dist/`（含 `prompts/`）。
 
 ## 风险提示
 

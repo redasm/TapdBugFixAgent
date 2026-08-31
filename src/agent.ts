@@ -15,13 +15,56 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import type { Config, PiConfig } from "./config.js";
 import { p4EnvFromConfig } from "./p4.js";
+import {
+  inspectMcpServer,
+  piReadOnlyMcpTools,
+  probeMcpServer,
+  resolveMcpServers,
+} from "./mcpServers.js";
 import type { AgentResult, RetryEvidenceEntry } from "./models.js";
 
 export class AgentRuntimeError extends Error {}
 
 export class AgentCancelledError extends AgentRuntimeError {}
+
+/** 外部运行依赖不可用；应等待环境恢复，不消耗 Bug 自动重试次数。 */
+export class AgentInfrastructureError extends AgentRuntimeError {}
+
+/** Agent 已出现重复命令或超出工具预算；继续重试同一提示不会增加证据。 */
+export class AgentInvestigationLimitError extends AgentRuntimeError {}
+
+/** Agent 已耗尽本阶段时间预算；自动重复同一任务通常只会再次超时。 */
+export class AgentTimeoutError extends AgentRuntimeError {}
+
+export class CommandExecutionGuard {
+  private count = 0;
+  private readonly commandCounts = new Map<string, number>();
+
+  constructor(
+    private readonly maxCommands = Number.POSITIVE_INFINITY,
+    private readonly repeatedCommandLimit = Number.POSITIVE_INFINITY,
+  ) {}
+
+  observe(command: string): void {
+    this.count += 1;
+    const normalized = command.replace(/\s+/g, " ").trim().toLowerCase();
+    const repeated = (this.commandCounts.get(normalized) ?? 0) + 1;
+    this.commandCounts.set(normalized, repeated);
+    if (this.count > Math.max(1, this.maxCommands)) {
+      throw new AgentInvestigationLimitError(
+        `Agent 命令调用超过预算 ${this.maxCommands} 次，已停止继续执行`,
+      );
+    }
+    if (repeated > Math.max(1, this.repeatedCommandLimit)) {
+      throw new AgentInvestigationLimitError(
+        `同一 Agent 命令重复超过 ${this.repeatedCommandLimit} 次，已停止循环: ${command.slice(0, 240)}`,
+      );
+    }
+  }
+}
 
 export const FINAL_MARKER = "FINAL_RESULT:";
 
@@ -241,7 +284,11 @@ function balancedJsonAt(s: string, start: number): string | undefined {
   return undefined;
 }
 
-const RESULT_KEYS = ["summary", "changed_files", "manual_assets", "blocked_reasons"];
+const RESULT_KEYS = [
+  "summary", "changed_files", "manual_assets", "blocked_reasons",
+  "root_cause", "evidence", "reproduction", "diagnostic_pages", "planned_files", "confidence",
+  "approved", "note", "findings",
+];
 
 function looksLikeResult(obj: Record<string, unknown>): boolean {
   return RESULT_KEYS.some((k) => k in obj);
@@ -377,6 +424,14 @@ export interface AgentRunOptions {
   sandboxMode?: "read-only" | "workspace-write";
   /** Codex SDK 原生结构化输出 schema；Pi 继续使用 FINAL_RESULT 协议。 */
   outputSchema?: unknown;
+  /** 与主工作目录同时开放给 Agent 的附加目录（Codex 映射为 additionalDirectories）。 */
+  additionalDirs?: string[];
+  /** 本次任务必须可用的 MCP；即使 server 的全局 required=false 也会 fail closed。 */
+  requiredMcpServers?: string[];
+  /** 本阶段命令预算；达到后立即中止，避免无效循环跑满总超时。 */
+  maxCommandExecutions?: number;
+  /** 同一规范化命令允许执行的最大次数。 */
+  repeatedCommandLimit?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +526,17 @@ export class PiAgent {
     return out;
   }
 
+  private mcpProxyExtensionPath(): string | undefined {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    for (const candidate of [
+      path.join(here, "piExtensions", "mcpProxy.js"),
+      path.join(here, "piExtensions", "mcpProxy.ts"),
+    ]) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
   async run(opts: AgentRunOptions): Promise<AgentResult> {
     // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）
     try {
@@ -478,6 +544,35 @@ export class PiAgent {
     } catch (exc) {
       const msg = (exc as Error).message;
       opts.onProgress?.(`[警告] 写入 pi models.json 失败（已忽略）: ${msg}`);
+    }
+
+    if (opts.additionalDirs?.length) {
+      opts.onProgress?.(
+        "[警告] Pi 后端会在提示词中获知附加目录，但不提供 Codex additionalDirectories 的沙箱边界",
+      );
+    }
+
+    const mcpServers = resolveMcpServers(
+      this.config.mcp_servers,
+      opts.repoDir,
+      opts.sandboxMode === "read-only",
+    );
+    const requiredMcpServers = new Set(opts.requiredMcpServers ?? []);
+    if (requiredMcpServers.size) {
+      const configured = new Set(mcpServers.map((server) => server.name));
+      const missing = [...requiredMcpServers].filter((name) => !configured.has(name));
+      const inspections = await Promise.all(mcpServers
+        .filter((server) => requiredMcpServers.has(server.name))
+        .map(async (server) => inspectMcpServer(server, await probeMcpServer(server))));
+      const failed = inspections.filter((item) => item.error || item.missingEnabledTools.length);
+      if (missing.length || failed.length) {
+        const details = [
+          ...missing.map((name) => `${name}: 未启用或未配置`),
+          ...failed.map((item) =>
+            `${item.name}: ${item.error || `缺少工具 ${item.missingEnabledTools.join(", ")}`}`),
+        ].join("；");
+        throw new AgentInfrastructureError(`required MCP 预检失败: ${details}`);
+      }
     }
 
     // ---- Windows 多行参数传递修复 ----
@@ -503,11 +598,28 @@ export class PiAgent {
     // 模型覆盖：由 provider 构造 `--model <provider>/<model_id>`；未配置则不传（pi 用默认模型）
     const model = opts.model?.trim() || effectivePiModel(this.config.pi);
     if (model) args.push("--model", model);
-    if (opts.tools?.length) args.push("--tools", opts.tools.join(","));
+    const activeTools = opts.tools?.length
+      ? [...opts.tools, ...piReadOnlyMcpTools(mcpServers)]
+      : undefined;
+    if (activeTools?.length) args.push("--tools", [...new Set(activeTools)].join(","));
     // 团队共享 skill 目录：pi 只认 <cwd>/.pi/skills，团队仓库里大家放的是 .agent(s)/skills，
     // 用 --skill <目录>（可重复）挂载进去。只传仓库里实际存在的目录（相对路径按仓库根解析）。
     for (const dir of this.skillDirs(opts.repoDir)) {
       args.push("--skill", dir);
+    }
+    if (mcpServers.length) {
+      const extension = this.mcpProxyExtensionPath();
+      if (!extension) throw new AgentRuntimeError("未找到 Pi MCP 代理扩展构建产物");
+      args.push("--extension", extension);
+    }
+
+    opts.onProgress?.(
+      `Pi: 准备调用模型 ${model || "(Pi 默认模型)"}（sandbox=${opts.sandboxMode ?? "workspace-write"}，timeout=${opts.timeoutS}s）`,
+    );
+    if (mcpServers.length) {
+      opts.onProgress?.(
+        `MCP: Pi 配置已注入 ${mcpServers.length} 个服务：${mcpServers.map((server) => server.name).join(", ")}`,
+      );
     }
 
     const isWin = process.platform === "win32";
@@ -518,7 +630,13 @@ export class PiAgent {
         // 注入 config.p4 的 P4 环境变量（P4PORT/P4CLIENT/P4USER/P4PASSWD）。
         // 与 worker 的 P4Client 一致，否则 pi 落笔的 p4 edit 在默认 client 里，
         // 编排器 reconcile 后 opened 仍空 → 「修复失败：Agent 未打开任何文件」。
-        env: { ...process.env, ...p4EnvFromConfig(this.config.p4) },
+        env: {
+          ...process.env,
+          ...p4EnvFromConfig(this.config.p4),
+          ...(mcpServers.length
+            ? { TAPD_BUGFIX_MCP_SERVERS: JSON.stringify(mcpServers) }
+            : {}),
+        },
         shell: isWin, // Windows: cmd.exe 解析，才能执行 .cmd shim（npm 全局装的 pi.cmd）
         windowsHide: true,
         // 必须把 stdin 设为 ignore：spawn 默认 stdin 是 pipe 且无人关闭 → pi 的
@@ -533,11 +651,32 @@ export class PiAgent {
 
     const outLines: string[] = [];
     const errChunks: string[] = [];
-    proc.stderr?.on("data", (d: Buffer) => (errChunks.push(d.toString())));
+    let stderrBuf = "";
+    const flushStderr = (final = false) => {
+      const parts = stderrBuf.split(/\r?\n/);
+      const tail = parts.pop() ?? "";
+      stderrBuf = final ? "" : tail;
+      for (const line of parts) {
+        const text = line.trim();
+        if (text) opts.onProgress?.(`Pi stderr: ${text.slice(0, 500)}`);
+      }
+      if (final && tail.trim()) opts.onProgress?.(`Pi stderr: ${tail.trim().slice(0, 500)}`);
+    };
+    proc.stderr?.on("data", (d: Buffer) => {
+      const text = d.toString();
+      errChunks.push(text);
+      stderrBuf += text;
+      flushStderr();
+    });
 
     // 文本增量合并：message_update 的 text_delta 每个 token 一条，逐条上报会把事件表
     // 刷爆（一次修复 2 万条 debug 事件）。攒到换行或 120 字符再发；工具事件直接透传。
     let textBuf = "";
+    const commandGuard = new CommandExecutionGuard(
+      opts.maxCommandExecutions,
+      opts.repeatedCommandLimit,
+    );
+    let guardFailure: AgentInvestigationLimitError | undefined;
     const flushText = () => {
       const t = textBuf.replace(/\s+/g, " ").trim();
       textBuf = "";
@@ -545,6 +684,22 @@ export class PiAgent {
     };
     const onLine = (line: string) => {
       outLines.push(line);
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        if (event.type === "tool_execution_start") {
+          commandGuard.observe(JSON.stringify({
+            toolName: event.toolName ?? "",
+            args: event.args ?? {},
+          }));
+        }
+      } catch (error) {
+        if (error instanceof AgentInvestigationLimitError) {
+          guardFailure = error;
+          killProcessTree(proc);
+          return;
+        }
+        // 非 JSON 行由后续进度解析自然忽略。
+      }
       if (!opts.onProgress) return;
       try {
         const p = parseProgress(line);
@@ -579,15 +734,22 @@ export class PiAgent {
         if (Date.now() > deadline) {
           killProcessTree(proc);
           clearInterval(watchdog);
-          reject(new AgentRuntimeError(`Agent 调用超时(${opts.timeoutS}s): pi`));
+          reject(new AgentTimeoutError(`Agent 调用超时(${opts.timeoutS}s): pi`));
         }
       }, 200);
       proc.on("error", (err) => {
         clearInterval(watchdog);
+        opts.onProgress?.(`Pi: 启动异常 · ${err.message}`);
         reject(new AgentRuntimeError(`无法执行 pi: ${err.message}`));
       });
       proc.on("close", (code) => {
         clearInterval(watchdog);
+        flushStderr(true);
+        if (guardFailure) {
+          opts.onProgress?.(`Pi: ${guardFailure.message}`);
+          reject(guardFailure);
+          return;
+        }
         if (opts.cancelEvent?.cancelled) {
           reject(new AgentCancelledError("Agent 调用被人工取消: pi"));
           return;
@@ -601,6 +763,7 @@ export class PiAgent {
         const finalText = extractFinalText(outLines);
         const ar = resultFromOutput(finalText || outLines.join("\n"), code ?? -1);
         ar.log = (errChunks.join("").slice(-1000) + "\n" + (finalText || outLines.join("\n")).slice(-2500)).trim();
+        opts.onProgress?.(`Pi: 进程结束（exit=${code ?? -1}）`);
         resolve(ar);
       });
     });

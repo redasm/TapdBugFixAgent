@@ -6,6 +6,11 @@ import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 
 import type { AdmissionPolicy } from "./quality.js";
+import {
+  mcpServerConfigProblems,
+  parseMcpServers,
+  type McpServersConfig,
+} from "./mcpServers.js";
 
 export const PROJECT_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), "..",
@@ -38,6 +43,12 @@ export interface CodexConfig {
   api_key_env: string;
   /** 可选自定义 codex 可执行文件路径。 */
   codex_path: string;
+  /** 可选 Codex 模型目录；只接受与实际模型匹配的显式目录，禁止套用其他模型模板。 */
+  model_catalog_json: string;
+  /** 自定义/网关模型的上下文窗口，避免 Codex 使用未知模型回退值。 */
+  context_window: number;
+  /** 自动压缩触发 token 数；应小于 context_window。 */
+  auto_compact_token_limit: number;
 }
 
 export interface RepoConfig {
@@ -45,6 +56,27 @@ export interface RepoConfig {
   path: string;
   /** 按顺序执行的机器验证命令。 */
   verify_cmds: string[];
+  /** P4 工作区中允许保留的本地生成路径；不参与脏检查、reconcile、diff 或 changelist。 */
+  ignore_paths?: string[];
+  /** 启动前全目录脏扫描频率；大型专用 Agent 工作区推荐 never。 */
+  preflight_reconcile?: "always" | "once" | "never";
+  /** 与主 P4 工作区共同交给 Agent 的附加代码目录。 */
+  additional_dirs?: AdditionalDirConfig[];
+}
+
+export interface AdditionalDirConfig {
+  /** Prompt 和结果文件列表中的稳定根别名，例如 engine。 */
+  name: string;
+  path: string;
+  vcs: "git";
+  /** 每个 Bug 都从该本地主分支创建独立修复分支。 */
+  base_branch: string;
+  /** 修复分支作者段；空值时回退到 p4.user / workspace.owner。 */
+  author: string;
+  /** 在该目录中按顺序执行的机器验证命令。 */
+  verify_cmds: string[];
+  /** 允许保留的本地生成路径；相对 Git 根目录，不参与干净检查、diff、提交或失败回滚。 */
+  ignore_paths?: string[];
 }
 
 export interface WorkspaceConfig {
@@ -117,7 +149,8 @@ const PI_PROVIDER_FIELDS = [
 const TAPD_SCALAR_FIELDS = ["backend", "access_token", "api_user", "api_password"] as const;
 const CODEX_FIELDS = [
   "model", "reasoning_effort", "approval_policy", "network_access",
-  "base_url", "api_key_env", "codex_path",
+  "base_url", "api_key_env", "codex_path", "model_catalog_json",
+  "context_window", "auto_compact_token_limit",
 ] as const;
 const REVIEW_FIELDS = ["enabled", "backend", "max_fix_rounds", "model"] as const;
 
@@ -207,6 +240,7 @@ export interface Config {
   agent_timeout_s: number;
   agent: AgentSelectionConfig;
   codex: CodexConfig;
+  mcp_servers: McpServersConfig;
   quality: QualityConfig;
   review: ReviewConfig;
   exclude_status: string[];
@@ -263,13 +297,44 @@ function buildRepos(data: unknown): RepoConfig[] {
     const verifyCmds = Array.isArray(d.verify_cmds)
       ? d.verify_cmds.map(String).map((v) => v.trim()).filter(Boolean)
       : [];
+    const ignorePaths = Array.isArray(d.ignore_paths)
+      ? d.ignore_paths.map(String).map((value) => value.trim()).filter(Boolean)
+      : [];
+    const preflightReconcile = String(d.preflight_reconcile ?? "never").trim().toLowerCase();
     repos.push({
       name: String(d.name ?? ""),
       path: String(d.path ?? ""),
       verify_cmds: verifyCmds,
+      ignore_paths: ignorePaths,
+      preflight_reconcile: preflightReconcile as RepoConfig["preflight_reconcile"],
+      additional_dirs: buildAdditionalDirs(d.additional_dirs),
     });
   }
   return repos;
+}
+
+function buildAdditionalDirs(data: unknown): AdditionalDirConfig[] {
+  const dirs: AdditionalDirConfig[] = [];
+  for (const item of Array.isArray(data) ? data : []) {
+    if (!item || typeof item !== "object") continue;
+    const d = item as Record<string, unknown>;
+    const verifyCmds = Array.isArray(d.verify_cmds)
+      ? d.verify_cmds.map(String).map((value) => value.trim()).filter(Boolean)
+      : [];
+    const ignorePaths = Array.isArray(d.ignore_paths)
+      ? d.ignore_paths.map(String).map((value) => value.trim()).filter(Boolean)
+      : [];
+    dirs.push({
+      name: String(d.name ?? ""),
+      path: String(d.path ?? ""),
+      vcs: String(d.vcs ?? "git").toLowerCase() as "git",
+      base_branch: String(d.base_branch ?? ""),
+      author: String(d.author ?? ""),
+      verify_cmds: verifyCmds,
+      ignore_paths: ignorePaths,
+    });
+  }
+  return dirs;
 }
 
 function assertNoLegacyConfig(raw: Record<string, unknown>): void {
@@ -314,12 +379,16 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
       base_url: "",
       api_key_env: "OPENAI_API_KEY",
       codex_path: "",
+      model_catalog_json: "",
+      context_window: 0,
+      auto_compact_token_limit: 0,
     },
+    mcp_servers: {},
     quality: {
       admission: {
         min_score: 55,
         require_reproduction_signal: true,
-        manual_keywords: ["prefab", "场景", "图集", "xlsx", "csv", "bytes", "二进制资源"],
+        manual_keywords: [],
         high_risk_keywords: ["支付", "账号", "登录", "鉴权", "存档", "协议", "加密", "隐私"],
       },
       require_verification: true,
@@ -365,6 +434,15 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   cfg.codex.base_url = String(codexRaw.base_url ?? cfg.codex.base_url);
   cfg.codex.api_key_env = String(codexRaw.api_key_env ?? cfg.codex.api_key_env);
   cfg.codex.codex_path = String(codexRaw.codex_path ?? cfg.codex.codex_path);
+  cfg.codex.model_catalog_json = String(
+    codexRaw.model_catalog_json ?? cfg.codex.model_catalog_json,
+  );
+  cfg.codex.context_window = Number(codexRaw.context_window ?? cfg.codex.context_window);
+  cfg.codex.auto_compact_token_limit = Number(
+    codexRaw.auto_compact_token_limit ?? cfg.codex.auto_compact_token_limit,
+  );
+
+  cfg.mcp_servers = parseMcpServers(raw.mcp_servers);
 
   const qualityRaw = (raw.quality ?? {}) as Record<string, unknown>;
   const admissionRaw = (qualityRaw.admission ?? {}) as Record<string, unknown>;
@@ -465,6 +543,7 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   cfg.p4.client = process.env.P4CLIENT ?? cfg.p4.client ?? "";
   cfg.p4.user = process.env.P4USER ?? cfg.p4.user ?? "";
   cfg.p4.password = process.env.P4PASSWD ?? cfg.p4.password ?? "";
+  cfg.p4.ignore = process.env.P4IGNORE ?? cfg.p4.ignore ?? "";
 
   // Web 设置页的 overrides.yaml 最后应用（优先级最高，覆盖 config.yaml 与 .env）
   applySettingsOverrides(cfg, readSettingsOverrides(settingsPath));
@@ -493,6 +572,16 @@ export function validateConfig(cfg: Config): string[] {
   }
   if (!["never", "on-request", "on-failure", "untrusted"].includes(cfg.codex.approval_policy)) {
     problems.push(`codex.approval_policy 无效（当前: ${cfg.codex.approval_policy}）`);
+  }
+  if (cfg.codex.context_window < 0 || !Number.isFinite(cfg.codex.context_window)) {
+    problems.push("codex.context_window 必须是非负数");
+  }
+  if (cfg.codex.auto_compact_token_limit < 0 || !Number.isFinite(cfg.codex.auto_compact_token_limit)) {
+    problems.push("codex.auto_compact_token_limit 必须是非负数");
+  }
+  if (cfg.codex.context_window > 0
+      && cfg.codex.auto_compact_token_limit >= cfg.codex.context_window) {
+    problems.push("codex.auto_compact_token_limit 必须小于 codex.context_window");
   }
   const tapd = cfg.tapd as Record<string, unknown>;
   const backend = String(tapd.backend ?? "rest");
@@ -524,8 +613,46 @@ export function validateConfig(cfg: Config): string[] {
       if (cfg.quality.require_verification && !repo.verify_cmds.length) {
         problems.push(`仓库 ${repo.name ?? ""} 未配置 verify_cmds；候选补丁不会标记为已验证`);
       }
+      for (const ignored of repo.ignore_paths ?? []) {
+        const normalized = ignored.replace(/\\/g, "/");
+        if (path.isAbsolute(ignored) || normalized.split("/").includes("..")) {
+          problems.push(`仓库 ${repo.name || "(未命名)"} 的 ignore_paths 必须是仓库内相对路径: ${ignored}`);
+        }
+      }
+      if (!["always", "once", "never"].includes(repo.preflight_reconcile ?? "never")) {
+        problems.push(`仓库 ${repo.name || "(未命名)"} 的 preflight_reconcile 只能是 always、once 或 never`);
+      }
+      const aliases = new Set<string>(["project"]);
+      for (const dir of repo.additional_dirs ?? []) {
+        const alias = dir.name.trim().toLowerCase();
+        if (!alias) problems.push(`仓库 ${repo.name ?? ""} 的 additional_dirs.name 为空`);
+        else if (!/^[a-z][a-z0-9_-]*$/i.test(alias)) {
+          problems.push(`附加目录别名 ${dir.name} 无效；只能使用字母开头的字母、数字、_、-`);
+        } else if (aliases.has(alias)) {
+          problems.push(`仓库 ${repo.name ?? ""} 的目录别名重复: ${dir.name}`);
+        }
+        aliases.add(alias);
+        if (dir.vcs !== "git") problems.push(`附加目录 ${dir.name || "(未命名)"} 的 vcs 仅支持 git`);
+        if (!dir.path || !fs.existsSync(dir.path)) {
+          problems.push(`附加目录 ${dir.name || "(未命名)"} 路径不存在: ${dir.path}`);
+        }
+        if (!dir.base_branch) problems.push(`附加目录 ${dir.name || "(未命名)"} 未配置 base_branch`);
+        for (const ignored of dir.ignore_paths ?? []) {
+          const normalized = ignored.replace(/\\/g, "/");
+          if (path.isAbsolute(ignored) || normalized.split("/").includes("..")) {
+            problems.push(`附加目录 ${dir.name || "(未命名)"} 的 ignore_paths 必须是仓库内相对路径: ${ignored}`);
+          }
+        }
+        if (cfg.quality.require_verification && !dir.verify_cmds.length) {
+          problems.push(`附加目录 ${dir.name || "(未命名)"} 未配置 verify_cmds；候选补丁不会标记为已验证`);
+        }
+      }
     }
   }
+  problems.push(...mcpServerConfigProblems(
+    cfg.mcp_servers,
+    cfg.workspaces.flatMap((workspace) => workspace.repos.map((repo) => repo.path)),
+  ));
   if (!cfg.p4.client) problems.push("未配置 P4CLIENT（Agent 专用 p4 workspace）");
   return problems;
 }

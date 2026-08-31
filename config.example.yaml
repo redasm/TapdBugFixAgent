@@ -5,7 +5,7 @@
 max_bugs_per_run: 10           # 单轮最多处理数量
 max_attempts: 2                # 单个 bug 自动重试次数：失败后自动回到队列重试（带上次失败证据），
                                # 重试耗尽才标记 failed 并回写 Tapd 失败评论。设为 1 = 不自动重试
-agent_timeout_s: 3600          # 每个编码 Agent 调用的超时（秒）。真实 bug 在大型仓库里定位+修改常超过 15 分钟
+agent_timeout_s: 1800          # 每个编码 Agent 调用的超时（秒）；超时后停止自动重试并转 needs_info
 
 # Agent 后端：保留 Pi，也可切换到 OpenAI 官方 Codex SDK。
 # 可用同一套历史评测与人工反馈指标做 A/B 对比。
@@ -20,6 +20,159 @@ codex:
   base_url: ""                 # 可选兼容网关
   api_key_env: OPENAI_API_KEY  # 只保存环境变量名，不保存密钥
   codex_path: ""               # 可选自定义 codex 可执行文件路径
+  model_catalog_json: ""       # 仅填写与实际模型匹配的目录；不要把 GPT 模型元数据套到兼容网关模型
+  context_window: 0            # 自定义模型可填写实际上下文窗口；0 表示沿用模型目录
+  auto_compact_token_limit: 0  # 自动压缩阈值；0 表示沿用模型目录，且非零时须小于 context_window
+
+
+# 编码 Agent：pi（https://github.com/earendil-works/pi）
+#   以子进程方式调用 `pi --mode json "<prompt>"`（npm 全局安装 @earendil-works/pi-coding-agent）。
+#
+#   pi 0.74.2 鉴权注意：
+#     - 读 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN（或 `pi /login` 做 OAuth 登录，token 存
+#       ~/.pi/agent/auth.json）；**不读** ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN。
+#     - URL 只能通过 ~/.pi/agent/models.json 的自定义 provider 指定，pi 没有 --base-url 参数。
+#
+#   两种配法：
+#   【方式一：只用默认鉴权】不配 provider，pi 段留空：
+#     pi: {}
+#     鉴权靠 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN / `pi /login`，模型用 pi 默认。
+#
+#   【方式二：走中转/代理（url+key 全放 config.yaml，推荐）】
+#     填了 provider 段后，本工具会在 spawn pi 前自动把该段合并写入 ~/.pi/agent/models.json
+#     （只覆盖 providers.<id>，保留你已有其它 provider）。api_key_env 填环境变量**名**，
+#     运行期由 pi 解析，密钥不落盘。model_id 必填，构造 `--model <provider>/<model_id>`。
+pi:
+  provider:
+    id: "aiyizhan"                                    # provider id（--model 前缀）
+    base_url: "https://api.aiyizhan.ai/v1"            # 网关/中转地址
+    api_key_env: "ANTHROPIC_AUTH_TOKEN"               # 从环境变量读 key（推荐，不落盘）
+    # api_key: "sk-..."                               # 或直接写 key（不推荐，落盘明文）
+    auth_header: true                                 # true=Authorization: Bearer（本司网关协议）；false=默认 x-api-key
+    model_id: "claude-opus-4-8"                       # 模型 id，构造 `--model kuro/claude-opus-4-8`
+    # reasoning: true                                 # 可选，默认 true
+    # context_window: 200000                          # 可选，默认 200000
+    # max_tokens: 32000                               # 可选，默认 32000
+    # 说明：删掉 provider 段不会自动清掉 models.json 里已写入的项，想还原请手动删 ~/.pi/agent/models.json 对应条目。
+  # 团队共享 skill 目录：pi 默认只认 <仓库>/.pi/skills，这里把仓库里的团队目录也挂给 pi。
+  # 不配置时默认尝试仓库下的 .agents/skills （存在才挂载，--skill 可重复传）。
+  # 想追加/覆盖可显式列出（相对仓库根或绝对路径）：
+  # skill_dirs: [".agents/skills"]
+  # 注意：目录里放 <skill-name>/SKILL.md（frontmatter 需 name + description，文件须无 BOM）。
+
+# MCP 注册表：所有 enabled server 会在每个 Agent 启动时自动加载；增加 MCP 只需追加配置。
+# 本地服务使用 command / args / cwd / env，远程 Streamable HTTP 服务使用 url 及可选鉴权字段。
+# 字符串支持 {repo}/${repo}（当前 Bug 仓库根）和 {agent}/${agent}（本工具安装目录）。
+# enabled_tools / disabled_tools 与 Codex MCP 配置一致；read_only_tools 是本项目的调查/评审白名单。
+# automates_manual_keywords 同时声明资源门禁关键词；server 禁用时仍转人工，启用时才允许自动处理。
+mcp_servers:
+  # 复用已登录 Chrome 读取 CrashSight / Sentry 等诊断页。
+  # 首次使用前在 Chrome 144+ 打开 chrome://inspect/#remote-debugging 并启用远程调试；
+  # Chrome 弹出连接授权时选择允许。不要使用 --isolated，否则不会复用登录态。
+  chrome_devtools:
+    enabled: false
+    required: false
+    approval_mode: approve     # 工具已有 allowlist；自动任务无需与 approval_policy: never 冲突
+    command: node
+    # 短生命周期 stdio 代理复用官方常驻 daemon，避免每个 Bug/阶段都建立新的 Chrome 调试连接。
+    args: ['{agent}\\dist\\chromeDaemonProxy.js']
+    cwd: '{agent}'
+    env:
+      CHROME_DEVTOOLS_SESSION_ID: '74617064'
+    enabled_tools: &chrome_read_tools
+      - list_pages
+      - new_page
+      - close_page
+      - navigate_page
+      - take_snapshot
+      - take_screenshot
+      - list_console_messages
+      - get_console_message
+      - list_network_requests
+      - get_network_request
+    read_only_tools: *chrome_read_tools
+    startup_timeout_sec: 60
+    tool_timeout_sec: 90
+
+  unreal_mcp:
+    enabled: false
+    required: false               # true 时启动失败会中止 Agent；false 时跳过该服务
+    approval_mode: approve
+    command: "python"
+    args: ['{repo}\Plugins\UnrealMCP\Python\unreal_mcp_server_advanced.py']
+    cwd: '{repo}\Plugins\UnrealMCP\Python'
+    env: {}
+    disabled_tools: [execute_python]
+    read_only_tools:
+      - ping
+      - get_actors_in_level
+      - find_actors_by_name
+      - read_blueprint_content
+      - analyze_blueprint_graph
+      - get_blueprint_variable_details
+      - get_blueprint_function_details
+      - get_available_materials
+      - ue_list_data_tables
+      - ue_describe_data_table
+      - ue_read_data_table
+      - ue_search_data_tables
+      - validate_asset_path
+      - batch_validate_asset_paths
+      - find_spawner_actors
+      - find_npc_actors
+      - get_actor_transform
+      - get_selected_actors_transform
+      - get_current_level_info
+      - get_viewport_camera
+      - preview_editops
+      - editop_health
+      - list_docs
+      - read_doc
+      - describe_scheme
+      - run_data_check
+      - get_current_editor_context
+      - describe_template
+      - describe_entity
+      - outline_doc
+      - find_nodes
+      - read_subtree
+    automates_manual_keywords: [场景, 关卡, 蓝图, actor, datatable]
+    startup_timeout_sec: 20
+    tool_timeout_sec: 60
+
+  prefab_mcp2:
+    enabled: false
+    approval_mode: approve
+    command: "python"
+    args: [-m, prefab_mcp2.server]
+    cwd: '{repo}\Plugins\UnrealMCP\Python\prefab_mcp2'
+    env:
+      PYTHONPATH: '{repo}\Plugins\UnrealMCP\Python\prefab_mcp2\src'
+    read_only_tools:
+      - lgui_ping
+      - lgui_asset_list
+      - lgui_asset_classmap
+      - lgui_checkpoint_list
+      - lgui_checkpoint_get
+      - lgui_diff
+      - lgui_get_code_root
+      - lgui_session_open
+      - lgui_session_close
+      - lgui_session_list
+      - lgui_session_discard
+      - lgui_node_tree
+      - lgui_node_info
+      - lgui_node_find
+      - lgui_node_rect
+      - lgui_node_pick_at
+      - lgui_prop_list
+      - lgui_prop_get
+      - lgui_node_screenshot
+      - lgui_node_screenshot_marked
+      - lgui_registry_get
+    automates_manual_keywords: [prefab, 预制体, lgui]
+    startup_timeout_sec: 20
+    tool_timeout_sec: 60
 quality:
   require_verification: true        # 无验证命令时只能生成 candidate，不能标记 verified
   max_changed_files: 8
@@ -27,7 +180,7 @@ quality:
   admission:
     min_score: 55
     require_reproduction_signal: true
-    manual_keywords: [prefab, 场景, 图集, xlsx, csv, bytes, 二进制资源]
+    manual_keywords: []                 # 通用资源门禁由各 MCP 的 automates_manual_keywords 声明
     high_risk_keywords: [支付, 账号, 登录, 鉴权, 存档, 协议, 加密, 隐私]
 
 review:
@@ -58,44 +211,25 @@ workspaces:
     repos:                           # bug 所属仓库的本地路径（p4 workspace root）
       - name: "product"
         path: "C:\\repos\\product"   # 该目录需已配置好 p4 client 映射
+        ignore_paths:                  # 可选：P4 中也不参与脏检查/reconcile/changelist 的本地生成目录
+          - "Saved/"
+          - "Binaries/"
+        preflight_reconcile: never     # 推荐：不做全目录扫描；修复后仅对调查阶段 planned_files 做 reconcile 兜底
         verify_cmds:                  # 按顺序执行；任一失败即停止
           - "npm run typecheck"
           - "npm test -- --runInBand"
-
-# 编码 Agent：pi（https://github.com/earendil-works/pi）
-#   以子进程方式调用 `pi --mode json "<prompt>"`（npm 全局安装 @earendil-works/pi-coding-agent）。
-#
-#   pi 0.74.2 鉴权注意：
-#     - 读 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN（或 `pi /login` 做 OAuth 登录，token 存
-#       ~/.pi/agent/auth.json）；**不读** ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN。
-#     - URL 只能通过 ~/.pi/agent/models.json 的自定义 provider 指定，pi 没有 --base-url 参数。
-#
-#   两种配法：
-#   【方式一：只用默认鉴权】不配 provider，pi 段留空：
-#     pi: {}
-#     鉴权靠 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN / `pi /login`，模型用 pi 默认。
-#
-#   【方式二：走中转/代理（url+key 全放 config.yaml，推荐）】
-#     填了 provider 段后，本工具会在 spawn pi 前自动把该段合并写入 ~/.pi/agent/models.json
-#     （只覆盖 providers.<id>，保留你已有其它 provider）。api_key_env 填环境变量**名**，
-#     运行期由 pi 解析，密钥不落盘。model_id 必填，构造 `--model <provider>/<model_id>`。
-pi:
-  provider:
-    id: "kuro"                                        # provider id（--model 前缀）
-    base_url: "https://ai-gateway.com"                # 网关/中转地址
-    api_key_env: "ANTHROPIC_AUTH_TOKEN"               # 从环境变量读 key（推荐，不落盘）
-    # api_key: "sk-..."                               # 或直接写 key（不推荐，落盘明文）
-    auth_header: true                                 # true=Authorization: Bearer（本司网关协议）；false=默认 x-api-key
-    model_id: "claude-opus-4-8"                       # 模型 id，构造 `--model kuro/claude-opus-4-8`
-    # reasoning: true                                 # 可选，默认 true
-    # context_window: 200000                          # 可选，默认 200000
-    # max_tokens: 32000                               # 可选，默认 32000
-    # 说明：删掉 provider 段不会自动清掉 models.json 里已写入的项，想还原请手动删 ~/.pi/agent/models.json 对应条目。
-  # 团队共享 skill 目录：pi 默认只认 <仓库>/.pi/skills，这里把仓库里的团队目录也挂给 pi。
-  # 不配置时默认尝试仓库下的 .agents/skills （存在才挂载，--skill 可重复传）。
-  # 想追加/覆盖可显式列出（相对仓库根或绝对路径）：
-  # skill_dirs: [".agents/skills"]
-  # 注意：目录里放 <skill-name>/SKILL.md（frontmatter 需 name + description，文件须无 BOM）。
+        # 可选：同一个 Bug 允许同时修改多个附加 Git 仓库。Codex 会把这些路径作为
+        # additionalDirectories（CLI 对应可重复的 --add-dir）开放；无需配置 skill 目录。
+        additional_dirs:
+          - name: "engine"            # 稳定根别名；Agent 输出形如 engine:Engine/Source/Foo.cpp
+            path: "C:\\repos\\engine" # 必须是 Git 仓库根目录，且开始处理前工作树必须干净
+            vcs: git
+            base_branch: "branch_0.7.0"
+            author: "nave"         # 空值时回退 p4.user，再回退 workspace.owner
+            ignore_paths:             # 相对 Git 根目录；可含 glob，目录以 / 结尾
+              - "Engine/Binaries/Win64/UnrealBuildAccelerator/"
+            verify_cmds:
+              - "cmake --build build --config Development"
 
 # Perforce（环境变量 P4PORT/P4CLIENT/P4USER/P4PASSWD 优先级更高，也可直接填这里）
 p4:
@@ -111,29 +245,21 @@ web:
   token: ""                # 留空则本机免鉴权；建议设置一个，管理页需带 token
 
 # Tapd 后端
-#   mcp  - 通过 Tapd MCP Server 接入（推荐）：只需个人访问令牌 TAPD_ACCESS_TOKEN，无需公司 API 账号权限、无需托管
+#   mcp  - 通过 Tapd MCP Server 接入（推荐）：只需个人访问令牌 TAPD_ACCESS_TOKEN
 #   rest - 直接用 Tapd OpenAPI（api_user/api_password，需 API 账号权限）
 tapd:
   backend: mcp
-  # ---- backend: mcp 时使用 ----
   access_token: ""        # 个人访问令牌（Tapd 个人设置 -> 个人访问令牌 创建）
   mcp:
-    # 本地 stdio 模式（推荐，无需托管/URL）：
     transport: stdio
-    command: "npx"                         # 用 Node 运行官方包（本机有 Node 即可）
-    args: ["-y", "@xihe-lab/tapd-mcp-server"]
-    # 若已装 Python 3.13+ 也可改用: command: "uvx" / args: ["mcp-server-tapd"]
-    #
-    # 可选：腾讯云托管模式（不开托管就用上面的 stdio）：
-    # transport: streamable-http
-    # url: "https://..."                  # 腾讯云 MCP 专属连接地址
-    # token: ""                           # 远程鉴权（若地址未内嵌），也可用 env MCP_TOKEN
-    # 工具名映射（默认即为官方 mcp-server-tapd 的真实工具名，一般无需改）
+    command: "npx"
+    # npm install 后使用项目本地固定版本，禁止运行时联网下载。
+    args: ["--no-install", "@xihe-lab/tapd-mcp-server"]
+    # 远程托管模式可改为：transport: streamable-http / url: "https://..." / token: ""
     tool_map:
       list_bugs: "tapd_get_bugs"
       get_bug: "tapd_get_bugs"
       update_bug: "tapd_update_bug"
-      add_comment: "tapd_create_comment"   # 注意内容参数是 description
-  # ---- backend: rest 时使用（可选）----
+      add_comment: "tapd_create_comment"
   api_user: ""
   api_password: ""

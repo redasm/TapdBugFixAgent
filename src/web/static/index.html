@@ -58,6 +58,8 @@
   .row.busy { background: rgba(59,130,246,.05); }
   .row .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row.busy .title { color: var(--blue); }
+  .row .state-cell { display: flex; align-items: center; gap: 5px; min-width: 0; }
+  .row .row-action { padding: 2px 6px; font-size: 11px; white-space: nowrap; }
 
   /* 右侧详情抽屉（推挤式：开 = 460px，关 = 0；不遮挡底部 Agent 区） */
   .drawer { flex: 0 0 auto; width: 460px; max-width: 460px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; transition: max-width .25s ease, opacity .2s ease; }
@@ -180,7 +182,7 @@
     <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
     <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
     <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
-    <button id="btnResync" class="danger" title="清空本地任务状态与事件日志（人工质量反馈保留），中断当前处理，并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响">⟳ 清除并重新同步</button>
+    <button id="btnResync" class="danger" title="停止自动处理并等待当前任务退出后，清空本地任务状态与事件日志（人工质量反馈保留），再从 Tapd 重新拉取最新 bug 列表。p4 上已生成的 pending changelist 不受影响">⟳ 清除并重新同步</button>
   </div>
 </header>
 
@@ -469,6 +471,7 @@ function renderStatus() {
   bf.disabled = !failedN;
   bf.textContent = failedN ? `↻ 重试全部失败 (${failedN})` : '↻ 重试全部失败';
   const running = c === 'running';
+  const stopping = !running && !!st.current_bug;
   $('btnStart').disabled = running;
   $('btnPause').disabled = !running;
   $('btnResume').disabled = running;
@@ -476,9 +479,11 @@ function renderStatus() {
   // 清除并重新同步只在非运行状态可用：运行中点了会中断当前 bug 且 worker 立刻
   // 按新队列重跑，用户来不及看清后果。想用先「⏹ 关闭」（stopped 才是明确的停止意图）。
   const rs = $('btnResync');
-  rs.disabled = running;
+  rs.disabled = running || stopping;
   rs.title = running
     ? '运行中不可用：请先「⏹ 关闭」停止自动处理，再清除并重新同步'
+    : stopping
+      ? `当前 bug ${st.current_bug} 仍在停止中，请等待其退出后再清除同步`
     : '清空本地任务状态与事件日志（人工质量反馈保留），并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响';
 }
 
@@ -526,9 +531,11 @@ function renderList() {
         <div class="mono">${it.bug_id}</div>
         <div class="title" title="${escapeHtml(it.title)}">${it.tapd_missing ? '<span class="muted" title="该 bug 已不在 Tapd「分配给我」列表（可能已改派/流转），显示为本地记录；重试仍可处理">⚠不在Tapd列表 </span>' : ''}${escapeHtml(it.title)}</div>
         <div>${escapeHtml(it.priority_label || it.priority || '-')}</div>
-        <div><span class="badge ${it.agent_state || 'unprocessed'}">${it.agent_state ? (STATE_LABEL[it.agent_state] || it.agent_state) : '未处理'}</span></div>
+        <div class="state-cell"><span class="badge ${it.agent_state || 'unprocessed'}">${it.agent_state ? (STATE_LABEL[it.agent_state] || it.agent_state) : '未处理'}</span>${it.agent_state === 'skipped' ? '<button type="button" class="row-action ghost">↻ 恢复</button>' : ''}</div>
         <div class="mono">${it.changelist ?? '-'}</div>
         <div class="muted">${fmtTime(it.finished_at)}${it.attempts > 1 ? ` · ${it.attempts} 次` : ''}</div>`;
+      const restore = row.querySelector('.row-action');
+      if (restore) restore.onclick = async e => { e.stopPropagation(); await actRestore(String(it.bug_id)); };
       row.onclick = () => selectBug(String(it.bug_id));
       div.appendChild(row);
     }
@@ -583,6 +590,28 @@ function renderDetail(job) {
   const verification = parseObj(job.verification);
   const review = parseObj(job.review_findings);
   const findings = Array.isArray(review.findings) ? review.findings : [];
+  const actionHTML = job.agent_state === 'skipped'
+    ? `<div class="section">
+      <h4>操作</h4>
+      <div class="actions">
+        <button onclick="actRestore('${job.bug_id}')">↻ 恢复为待处理</button>
+      </div>
+      <div class="quality-note">恢复后会重新进入待处理队列；自动处理已开启时将按优先级执行。</div>
+    </div>`
+    : job.has_local
+      ? `<div class="section">
+        <h4>操作</h4>
+        <div class="actions">
+          <button onclick="actRetry('${job.bug_id}')">↻ 重试</button>
+          <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过</button>
+        </div>
+      </div>`
+      : `<div class="section">
+        <h4>操作</h4>
+        <div class="actions">
+          <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过（不处理）</button>
+        </div>
+      </div>`;
   const retryHTML = retries.length ? `<div class="section">
     <h4>自动重试记录（失败 ${retries.length} 次）</h4>
     ${retries.map(r => `<div class="retry-entry">
@@ -638,18 +667,7 @@ function renderDetail(job) {
       <h4>需人工处理的资源</h4>
       <ul>${assets.length ? assets.map(a => `<li class="mono">${escapeHtml(a.path)} <span class="reason">— ${escapeHtml(a.reason || '')}</span></li>`).join('') : '<li class="muted">(无)</li>'}</ul>
     </div>
-    ${job.has_local ? `<div class="section">
-      <h4>操作</h4>
-      <div class="actions">
-        <button onclick="actRetry('${job.bug_id}')">↻ 重试</button>
-        <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过</button>
-      </div>
-    </div>` : `<div class="section">
-      <h4>操作</h4>
-      <div class="actions">
-        <button class="ghost" onclick="actSkip('${job.bug_id}')">⏭ 跳过（不处理）</button>
-      </div>
-    </div>`}
+    ${actionHTML}
     ${job.has_local && job.changelist ? `<div class="section" data-qa="qa:feedback.form">
       <h4>人工修复结论</h4>
       <div class="feedback-grid">
@@ -740,20 +758,37 @@ $('agentHead').addEventListener('click', (e) => {
 
 async function actRetry(id) {
   const r = await api('/api/bugs/' + id + '/retry', 'POST', {});
-  if (r) {
-    toast('已重置为待处理；开启状态下会按优先级自动重新处理');
-    // 若正盯着「失败」筛选，切回全部，否则该行移组后直接消失、看起来像没生效
-    if ($('fState').value === 'failed') { $('fState').value = 'all'; }
-  }
-  refresh(); selectBug(id);
+  if (!r) return;
+  toast('已重置为待处理；开启状态下会按优先级自动重新处理');
+  // 若正盯着「失败」筛选，切回全部，否则该行移组后直接消失、看起来像没生效
+  if ($('fState').value === 'failed') { $('fState').value = 'all'; }
+  updateLocalJobState(id, 'pending');
+  await refresh();
 }
 async function actSkip(id) {
   const r = await api('/api/bugs/' + id + '/skip', 'POST', {});
-  if (r) {
-    toast('已跳过（不再自动处理）');
-    if ($('fState').value !== 'all' && $('fState').value !== 'skipped') { $('fState').value = 'all'; }
+  if (!r) return;
+  toast('已跳过（不再自动处理）；可在“跳过”区域恢复');
+  if ($('fState').value !== 'all' && $('fState').value !== 'skipped') { $('fState').value = 'all'; }
+  updateLocalJobState(id, 'skipped');
+  await refresh();
+}
+async function actRestore(id) {
+  const r = await api('/api/bugs/' + id + '/retry', 'POST', {});
+  if (!r) return;
+  toast('已从跳过恢复为待处理');
+  // 从「跳过」筛选恢复后任务会移出该筛选，切回全部让用户继续看到它。
+  if ($('fState').value === 'skipped') { $('fState').value = 'all'; }
+  updateLocalJobState(id, 'pending');
+  await refresh();
+}
+function updateLocalJobState(id, state) {
+  const item = (SNAPSHOT.items || []).find(it => String(it.bug_id) === String(id));
+  if (item) {
+    item.agent_state = state;
+    item.finished_at = state === 'skipped' ? new Date().toISOString() : null;
   }
-  refresh(); selectBug(id);
+  renderList();
 }
 async function submitFeedback(id) {
   const outcome = $('feedbackOutcome').value;
@@ -786,8 +821,10 @@ $('btnRetryFailed').onclick = async () => {
 // 仅非运行状态可用（renderStatus 已按控制态禁用；此处再守一道，防 SSE 快照延迟的竞态）
 $('btnResync').onclick = async () => {
   const st0 = SNAPSHOT.status || {};
-  if (st0.control === 'running') {
-    toast('运行中不可清除同步：请先「⏹ 关闭」停止自动处理', true);
+  if (st0.control === 'running' || st0.current_bug) {
+    toast(st0.control === 'running'
+      ? '运行中不可清除同步：请先「⏹ 关闭」停止自动处理'
+      : `当前 bug ${st0.current_bug} 仍在停止中，请稍候`, true);
     return;
   }
   const st = SNAPSHOT.status || {};
