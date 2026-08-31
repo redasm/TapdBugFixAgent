@@ -4,7 +4,7 @@
  *
  * 两种传输：
  * - streamable-http：url 填腾讯云托管 MCP 的专属连接地址（tapd.mcp.url），可选 token
- * - stdio：本地启动服务端（command+args，如 npx -y @xihe-lab/tapd-mcp-server），
+ * - stdio：本地启动服务端（command+args，如 npx --no-install @xihe-lab/tapd-mcp-server），
  *   通过 env 传入 TAPD_ACCESS_TOKEN
  *
  * 用官方 @modelcontextprotocol/sdk 的 Client，连接后运行时 listTools() 自动发现工具，

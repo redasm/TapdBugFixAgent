@@ -9,6 +9,8 @@
  */
 
 import { loadConfig, priorityRank, validateConfig, webToken } from "./config.js";
+import { effectiveAgentModel, selectedAgentBackend } from "./agentBackend.js";
+import { enabledMcpServerNames } from "./mcpServers.js";
 import { StateStore } from "./state.js";
 import { Worker } from "./worker.js";
 import { createTapdClient } from "./tapd.js";
@@ -65,6 +67,22 @@ function parseArgs(argv: string[]): CliArgs {
 function make(configPath: string, dbPath: string): { config: ReturnType<typeof loadConfig>; store: StateStore; worker: Worker } {
   const config = loadConfig(configPath);
   for (const problem of validateConfig(config)) console.log(`[配置警告] ${problem}`);
+  const backend = selectedAgentBackend(config);
+  const model = effectiveAgentModel(config, backend) || "(后端默认模型)";
+  const mcpNames = enabledMcpServerNames(config.mcp_servers);
+  console.log(`[启动] Agent backend=${backend}, model=${model}`);
+  const p4IgnorePaths = config.workspaces.flatMap((workspace) => workspace.repos.flatMap((repo) => repo.ignore_paths ?? []));
+  console.log(`[启动] P4 server=${String(config.p4.port ?? "(默认)")}, client=${String(config.p4.client ?? "(默认)")}, user=${String(config.p4.user ?? "(默认)")}, ignore_paths=${p4IgnorePaths.length ? p4IgnorePaths.join(", ") : "(无)"}`);
+  for (const repo of config.workspaces.flatMap((workspace) => workspace.repos)) {
+    for (const dir of repo.additional_dirs ?? []) {
+      const ignored = dir.ignore_paths ?? [];
+      console.log(
+        `[启动] Git ${dir.name}=${dir.path}, base=${dir.base_branch}, ignore_paths=${ignored.length ? ignored.join(", ") : "(无)"}`,
+      );
+    }
+  }
+  console.log(`[启动] MCP enabled=${mcpNames.length ? mcpNames.join(", ") : "(无)"}`);
+  console.log(`[启动] 工作区=${config.workspaces.flatMap((workspace) => workspace.repos.map((repo) => repo.path)).join(", ") || "(无)"}`);
   const store = new StateStore(dbPath);
   const worker = new Worker(config, store);
   return { config, store, worker };
@@ -119,6 +137,9 @@ async function cmdRun(args: CliArgs): Promise<number> {
 
 async function cmdServe(args: CliArgs): Promise<number> {
   const { config, store, worker } = make(args.config, args.db);
+  // 服务重启不能沿用数据库里上次遗留的 running，否则页面尚未打开就会立刻跑 P4/Agent，
+  // 与下方“默认关闭”的提示相矛盾，也容易和人工清除同步发生竞态。
+  store.setControl("stopped");
   worker.startLoop();
 
   const { createApp } = await import("./web/app.js");
@@ -128,7 +149,7 @@ async function cmdServe(args: CliArgs): Promise<number> {
   const token = webToken(config);
   console.log(`管理台: http://${host}:${port}`);
   if (token) {
-    console.log(`token: ${token}（URL 加 ?token= 或页面顶部填入）`);
+    console.log("Web token 已配置（为安全起见不在控制台显示）");
   } else {
     console.log("提示: 未配置 WEB_TOKEN，管理台无鉴权（仅建议本机使用）");
   }

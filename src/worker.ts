@@ -1,20 +1,35 @@
 /** 编排工作线程：调查、修复、验证、评审、pending changelist 与 Tapd 回写。 */
 
-import type { Config, WorkspaceConfig } from "./config.js";
+import type { AdditionalDirConfig, Config, RepoConfig, WorkspaceConfig } from "./config.js";
 import { priorityRank } from "./config.js";
 import type { AgentResult, Bug, RetryEvidenceEntry } from "./models.js";
 import { bugUrl, dumps, hasCodeChanges, hasManualAssets, loads } from "./models.js";
 import type { OpenedFile } from "./p4.js";
-import { P4Client, P4Error } from "./p4.js";
+import {
+  ensureP4IgnoreFile,
+  P4CancelledError,
+  P4Client,
+  P4ConnectionError,
+  P4Error,
+  P4SyncTimeoutError,
+} from "./p4.js";
 import { buildDescription } from "./descgen.js";
 import {
   assessPatchScope,
   assessPlannedScope,
   checkAndPrepareP4,
+  p4ReconcileTargets,
   runVerificationPipeline,
   VerificationError,
 } from "./verify.js";
-import { AgentCancelledError, CancelEvent, formatRetryEvidence } from "./agent.js";
+import {
+  AgentCancelledError,
+  AgentInfrastructureError,
+  AgentInvestigationLimitError,
+  AgentTimeoutError,
+  CancelEvent,
+  formatRetryEvidence,
+} from "./agent.js";
 import {
   createCodingAgent,
   effectiveAgentModel,
@@ -24,8 +39,17 @@ import {
 import { nowStr, type StateStore } from "./state.js";
 import { assessFixability } from "./quality.js";
 import {
+  automatableManualKeywords,
+  configuredManualKeywords,
+  enabledMcpServerNames,
+  mcpServerNamesMatchingText,
+} from "./mcpServers.js";
+import {
+  IMPLEMENTATION_OUTPUT_SCHEMA,
+  INVESTIGATION_OUTPUT_SCHEMA,
   buildImplementationPrompt,
   buildInvestigationPrompt,
+  buildInvestigationRecoveryPrompt,
   parseInvestigation,
   type InvestigationResult,
 } from "./repairWorkflow.js";
@@ -36,6 +60,37 @@ import {
   type ReviewResult,
 } from "./review.js";
 import { createTapdClient, type TapdBackend, TapdError } from "./tapd.js";
+import {
+  GitWorkspace,
+  type GitBranchSession,
+  type GitFinalizeResult,
+} from "./git.js";
+
+const REVIEW_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    approved: { type: "boolean" },
+    note: { type: "string" },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          severity: { type: "string", enum: ["low", "medium", "high"] },
+          title: { type: "string" },
+          file: { type: "string" },
+          line: { type: ["integer", "null"] },
+          evidence: { type: "string" },
+          required_action: { type: "string" },
+        },
+        required: ["severity", "title", "file", "line", "evidence", "required_action"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["approved", "note", "findings"],
+  additionalProperties: false,
+} as const;
 
 // 终态：已处理（不会自动重新处理）
 const _TERMINAL_STATES = new Set([
@@ -49,6 +104,21 @@ const _MAX_EVIDENCE_ENTRIES = 6; // 重试证据最多保留最近 6 次失败
 
 /** 工作区中存在无法安全归属当前 Bug 的改动；这是操作阻塞，不应消耗模型修复次数。 */
 class WorkspaceBlockedError extends Error {}
+
+/** 调查在有限预算内无法收敛；保留证据并等待人工补充，不重复跑相同搜索。 */
+class InvestigationBlockedError extends Error {}
+
+const _AGENT_COMMAND_BUDGET = 100;
+const _AGENT_REPEAT_LIMIT = 3;
+const _READ_ONLY_COMMAND_BUDGET = 50;
+
+interface GitAttempt {
+  config: AdditionalDirConfig;
+  workspace: GitWorkspace;
+  session: GitBranchSession;
+  finalized?: GitFinalizeResult;
+  settled?: boolean;
+}
 
 /** 递归把 BigInt 转 number（SQLite safeIntegers 下 INTEGER 列返回 BigInt，JSON.stringify 无法序列化）。
  *  仅供 web 输出前清洗内部数值列（attempts / 事件自增 id / changelist 等）；bug_id 等大整数已在源头转字符串。 */
@@ -75,6 +145,7 @@ export class Worker {
   private stopRequested = false;
   private loopTask: Promise<void> | null = null;
   private wakeResolvers: Array<() => void> = [];
+  private cleanP4Baselines = new Set<string>();
 
   constructor(config: Config, store: StateStore) {
     this.config = config;
@@ -356,7 +427,7 @@ export class Worker {
   // ------------------------------------------------------------------
   // 单个 bug 处理
   // ------------------------------------------------------------------
-  private resolveRepo(bug: Bug): { name: string; path: string; verify_cmds: string[] } | undefined {
+  private resolveRepo(bug: Bug): RepoConfig | undefined {
     const ws = this.workspaceOf(bug);
     const repos = ws.repos;
     if (!repos.length) return undefined;
@@ -373,16 +444,119 @@ export class Worker {
     return repos[0];
   }
 
+  private workspaceRoots(repo: RepoConfig) {
+    return [
+      { alias: "project", name: repo.name, path: repo.path, vcs: "p4" as const },
+      ...(repo.additional_dirs ?? []).map((dir) => ({
+        alias: dir.name.toLowerCase(), name: dir.name, path: dir.path, vcs: "git" as const,
+      })),
+    ];
+  }
+
+  private additionalPaths(repo: RepoConfig): string[] {
+    return (repo.additional_dirs ?? []).map((dir) => dir.path);
+  }
+
+  private verificationCommands(repo: RepoConfig): string[] {
+    return [
+      ...repo.verify_cmds.map((command) => `[project] ${command}`),
+      ...(repo.additional_dirs ?? []).flatMap((dir) =>
+        dir.verify_cmds.map((command) => `[${dir.name.toLowerCase()}] ${command}`)),
+    ];
+  }
+
+  private async prepareGitAttempts(repo: RepoConfig, ws: WorkspaceConfig): Promise<GitAttempt[]> {
+    const attempts: GitAttempt[] = [];
+    try {
+      for (const config of repo.additional_dirs ?? []) {
+        this.store.addEvent(
+          `Git ${config.name}: 开始检查附加仓库（${config.path}，基线 ${config.base_branch}）`,
+          "info",
+          this.currentBugId ?? undefined,
+        );
+        const workspace = new GitWorkspace(config.path, config.ignore_paths ?? []);
+        const author = config.author.trim() || String(this.config.p4.user ?? "").trim() || ws.owner.trim();
+        const session = await workspace.prepareBranch(config.base_branch, author);
+        attempts.push({ config, workspace, session });
+        this.store.addEvent(
+          `Git ${config.name}: 仓库连接及状态检查成功，已创建分支 ${session.branch}`,
+          "info",
+          this.currentBugId ?? undefined,
+        );
+        if (config.ignore_paths?.length) {
+          this.store.addEvent(
+            `Git ${config.name}: 已忽略本地生成路径 ${config.ignore_paths.join(", ")}`,
+            "info",
+            this.currentBugId ?? undefined,
+          );
+        }
+      }
+      return attempts;
+    } catch (error) {
+      for (const attempt of attempts.reverse()) {
+        try { await attempt.workspace.rollback(attempt.session); } catch { /* 保留原始异常 */ }
+      }
+      throw error;
+    }
+  }
+
+  private async rollbackGitAttempts(attempts: GitAttempt[]): Promise<void> {
+    const failures: string[] = [];
+    for (const attempt of [...attempts].reverse()) {
+      try {
+        if (attempt.settled && !attempt.finalized) continue;
+        if (attempt.finalized) {
+          await attempt.workspace.discardFinalized(attempt.session, attempt.finalized);
+        } else {
+          await attempt.workspace.rollback(attempt.session);
+        }
+      } catch (error) {
+        failures.push(`${attempt.config.name}: ${String(error)}`);
+      }
+    }
+    if (failures.length) throw new WorkspaceBlockedError(`Git 自动分支清理失败: ${failures.join("；")}`);
+  }
+
   private async verifyCandidate(
     p4: P4Client,
-    repo: { name: string; path: string; verify_cmds: string[] },
+    repo: RepoConfig,
+    gitAttempts: GitAttempt[],
     opened?: OpenedFile[] | null,
     plannedFiles?: string[],
-  ): Promise<{ opened: OpenedFile[]; diff: string; summary: string; verified: boolean }> {
-    const actualOpened = opened?.length ? opened : await checkAndPrepareP4(p4);
+  ): Promise<{ opened: OpenedFile[]; gitFiles: string[]; diff: string; summary: string; verified: boolean }> {
+    let actualOpened = opened?.length ? opened : [];
+    if (!actualOpened.length) {
+      const p4Opened = await p4.opened("default");
+      if (p4Opened.length) {
+        actualOpened = p4Opened;
+      } else {
+        const reconcileTargets = p4ReconcileTargets(plannedFiles ?? []);
+        const p4Preview = await p4.reconcilePreview(reconcileTargets);
+        if (p4Preview.trim()) {
+          actualOpened = await checkAndPrepareP4(p4, reconcileTargets);
+        } else {
+          const elsewhere = (await p4.opened()).filter((item) => item.changelist !== "default");
+          if (elsewhere.length) {
+            throw new VerificationError(
+              `Agent 把文件打开到了编号 changelist: ${elsewhere.map((item) => item.depot).join(", ")}`,
+            );
+          }
+        }
+      }
+    }
+    const gitChanges = await Promise.all(gitAttempts.map(async (attempt) => ({
+      attempt,
+      files: await attempt.workspace.changedFiles(attempt.session.baseCommit),
+      diff: await attempt.workspace.diff(attempt.session.baseCommit),
+    })));
+    const rootedP4Files = actualOpened.map((item) => `project:${item.depot}`);
+    const rootedGitFiles = gitChanges.flatMap(({ attempt, files }) =>
+      files.map((file) => `${attempt.config.name.toLowerCase()}:${file}`));
+    const allFiles = [...rootedP4Files, ...rootedGitFiles];
+    if (!allFiles.length) throw new VerificationError("Agent 未在 P4 或 Git 工作目录产生任何代码改动");
     if (plannedFiles) {
       const plannedScope = assessPlannedScope(
-        actualOpened.map((item) => item.depot),
+        allFiles,
         plannedFiles,
       );
       if (!plannedScope.ok) {
@@ -391,27 +565,46 @@ export class Worker {
         );
       }
     }
-    const diff = await p4.diffUnified(actualOpened.map((item) => item.depot));
+    const p4Diff = actualOpened.length
+      ? await p4.diffUnified(actualOpened.map((item) => item.depot))
+      : "";
+    const diff = [
+      p4Diff ? `### project (Perforce)\n${p4Diff}` : "",
+      ...gitChanges.filter((item) => item.diff).map(({ attempt, diff: gitDiff }) =>
+        `### ${attempt.config.name.toLowerCase()} (Git: ${attempt.session.branch})\n${gitDiff}`),
+    ].filter(Boolean).join("\n\n");
     const scope = assessPatchScope(
-      actualOpened.map((item) => item.depot),
+      allFiles,
       diff,
       this.config.quality.max_changed_files,
       this.config.quality.max_diff_lines,
     );
     if (!scope.ok) throw new VerificationError(scope.reasons.join("；"));
-    const verification = await runVerificationPipeline(
-      repo.path,
-      repo.verify_cmds,
-      this.config.quality.require_verification,
-    );
-    if (!verification.ok && verification.configured) {
-      throw new Error("测试未通过: " + verification.summary.slice(-1000));
+    const pipelines = [
+      { name: "project", result: await runVerificationPipeline(
+        repo.path, repo.verify_cmds, this.config.quality.require_verification,
+      ) },
+    ];
+    for (const attempt of gitAttempts) {
+      pipelines.push({
+        name: attempt.config.name.toLowerCase(),
+        result: await runVerificationPipeline(
+          attempt.config.path,
+          attempt.config.verify_cmds,
+          this.config.quality.require_verification,
+        ),
+      });
+    }
+    const failed = pipelines.find(({ result }) => !result.ok);
+    if (failed) {
+      throw new Error(`测试未通过 (${failed.name}): ${failed.result.summary.slice(-1000)}`);
     }
     return {
       opened: actualOpened,
+      gitFiles: rootedGitFiles,
       diff,
-      summary: verification.summary,
-      verified: verification.ok && verification.configured,
+      summary: pipelines.map(({ name, result }) => `[${name}] ${result.summary}`).join("\n"),
+      verified: pipelines.every(({ result }) => result.ok && result.configured),
     };
   }
 
@@ -422,14 +615,19 @@ export class Worker {
     investigation: InvestigationResult,
     diff: string,
     verificationSummary: string,
+    additionalDirs: string[],
   ): Promise<ReviewResult> {
     const result = await reviewer.run({
       prompt: buildReviewPrompt({ bug, investigation, diff, verificationSummary }),
       repoDir: p4.path,
+      additionalDirs,
       timeoutS: Math.min(this.config.agent_timeout_s, 600),
       tools: ["read", "grep", "find", "ls"],
       sandboxMode: "read-only",
+      outputSchema: REVIEW_OUTPUT_SCHEMA,
       model: this.config.review.model || undefined,
+      maxCommandExecutions: _READ_ONLY_COMMAND_BUDGET,
+      repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
       cancelEvent: this.cancelEvent,
       onProgress: (msg) => this.store.addEvent(`Reviewer ${msg}`, "debug", bug.id),
     });
@@ -443,14 +641,28 @@ export class Worker {
     this.store.upsertJob(bug, { agent_state: "in_progress", started_at: nowStr() });
     this.store.addEvent(`开始处理 bug ${bug.id}: ${bug.title}`, "info", bug.id);
     let p4: P4Client | null = null;
+    let activeRepo: RepoConfig | null = null;
+    let gitAttempts: GitAttempt[] = [];
     let lastResult: AgentResult | null = null;
     try {
       const repo = this.resolveRepo(bug);
       if (!repo) {
         throw new Error("未配置该 bug 对应的仓库映射（workspaces[].repos[]）");
       }
+      activeRepo = repo;
 
-      const admission = assessFixability(bug, this.config.quality.admission);
+      const mcpManualKeywords = configuredManualKeywords(this.config.mcp_servers);
+      const admission = assessFixability(
+        bug,
+        {
+          ...this.config.quality.admission,
+          manual_keywords: [...new Set([
+            ...this.config.quality.admission.manual_keywords,
+            ...mcpManualKeywords,
+          ])],
+        },
+        automatableManualKeywords(this.config.mcp_servers),
+      );
       this.store.updateJob(bug.id, { admission_score: admission.score });
       if (!admission.eligible) {
         const state = admission.disposition === "needs_info"
@@ -472,7 +684,27 @@ export class Worker {
       const model = effectiveAgentModel(this.config, backend);
       this.store.updateJob(bug.id, { agent: backend, model });
 
-      p4 = new P4Client(repo.path, this.config.p4);
+      const generatedP4Ignore = ensureP4IgnoreFile(repo.path, repo.ignore_paths ?? []);
+      if (generatedP4Ignore) this.config.p4.ignore = generatedP4Ignore;
+      p4 = new P4Client(
+        repo.path,
+        this.config.p4,
+        (level, message) => this.store.addEvent(message, level, bug.id),
+        this.cancelEvent,
+        repo.ignore_paths ?? [],
+      );
+      this.store.addEvent(
+        `P4: 开始检查连接与工作区（server=${String(this.config.p4.port ?? "(默认)")}，client=${String(this.config.p4.client ?? "(默认)")}）`,
+        "info",
+        bug.id,
+      );
+      if (repo.ignore_paths?.length) {
+        this.store.addEvent(
+          `P4: 已跳过本地生成路径 ${repo.ignore_paths.join(", ")}`,
+          "info",
+          bug.id,
+        );
+      }
 
       // ---- 重试/恢复：先撤销上一次尝试遗留的打开文件（只撤销 default changelist），从干净工作区开始 ----
       const stale = await this.cleanupStaleAttempt(bug.id, p4);
@@ -480,23 +712,57 @@ export class Worker {
         this.store.addEvent(`已撤销上一次尝试遗留的打开文件 ${stale.length} 项`, "warn", bug.id);
       }
       // 其它 Bug 遗留的 default 文件既不能擅自撤销，也绝不能混入当前补丁；阻塞并等待人工清理。
-      const debris = (await p4.opened("default")).map((o) => o.depot).filter((f) => !stale.includes(f));
+      const defaultOpened = await p4.opened("default", true);
+      this.store.addEvent(
+        `P4: 连接成功，default changelist 当前打开 ${defaultOpened.length} 个文件`,
+        "info",
+        bug.id,
+      );
+      const debris = defaultOpened.map((o) => o.depot).filter((f) => !stale.includes(f));
       if (debris.length) {
         throw new WorkspaceBlockedError(
           `default changelist 不干净，存在 ${debris.length} 个无法归属当前 Bug 的打开文件；` +
             `请人工清理后重试: ${debris.join(", ").slice(0, 500)}`,
         );
       }
-      const untrackedChanges = (await p4.reconcilePreview()).trim();
-      if (untrackedChanges) {
-        throw new WorkspaceBlockedError(
-          "工作区存在未登记的本地改动；请人工确认、revert 或归入正确 changelist 后重试: " +
-            untrackedChanges.replace(/\s+/g, " ").slice(0, 500),
+      const baselineKey = repo.path.replace(/\\/g, "/").toLowerCase();
+      const preflightMode = repo.preflight_reconcile ?? "never";
+      const shouldScan = preflightMode === "always"
+        || (preflightMode === "once" && !this.cleanP4Baselines.has(baselineKey));
+      if (shouldScan) {
+        this.store.addEvent("P4: 开始扫描仓库目录内未登记的本地改动（reconcile -n ./...）", "debug", bug.id);
+        const reconcileStarted = Date.now();
+        const untrackedChanges = (await p4.reconcilePreview()).trim();
+        this.store.addEvent(
+          `P4: 本地改动扫描完成（耗时 ${Math.round((Date.now() - reconcileStarted) / 1000)}s）`,
+          "info",
+          bug.id,
+        );
+        if (untrackedChanges) {
+          throw new WorkspaceBlockedError(
+            "工作区存在未登记的本地改动；请人工确认、revert 或归入正确 changelist 后重试: " +
+              untrackedChanges.replace(/\s+/g, " ").slice(0, 500),
+          );
+        }
+        if (preflightMode === "once") this.cleanP4Baselines.add(baselineKey);
+      } else {
+        this.store.addEvent(
+          preflightMode === "never"
+            ? "P4: 专用工作区已关闭启动前未登记改动扫描"
+            : "P4: 专用工作区基线已确认，本次跳过重复 reconcile 扫描",
+          "debug",
+          bug.id,
         );
       }
 
-      await p4.sync();
-      this.store.addEvent("p4 sync 完成", "info", bug.id);
+      gitAttempts = await this.prepareGitAttempts(repo, this.workspaceOf(bug));
+      for (const attempt of gitAttempts) {
+        this.store.addEvent(
+          `Git ${attempt.config.name} 已从 ${attempt.session.baseBranch} 创建分支 ${attempt.session.branch}`,
+          "info",
+          bug.id,
+        );
+      }
 
       // ---- 带证据的重试：把之前的失败记录压缩成提示，喂给全新上下文的 Agent ----
       const retryText = formatRetryEvidence(this.retryEvidenceEntries(bug.id));
@@ -506,25 +772,115 @@ export class Worker {
       const reviewer = this.config.review.enabled
         ? createCodingAgent(this.config, reviewerBackend)
         : null;
+      const mcpServerNames = enabledMcpServerNames(this.config.mcp_servers);
+      const bugEvidenceText = [
+        admission.context.title,
+        admission.context.module,
+        admission.context.description,
+        admission.context.reproduction_steps,
+        admission.context.expected_result,
+        admission.context.actual_result,
+        ...admission.context.logs,
+        ...admission.context.comments,
+        ...admission.context.attachments,
+      ].join("\n");
+      const resourceMcpServers = mcpServerNamesMatchingText(
+        this.config.mcp_servers,
+        bugEvidenceText,
+      );
+      const resourceMcpEnabled = resourceMcpServers.length > 0;
+      const investigationMcpServers = [...new Set([
+        ...(admission.context.diagnostic_links.length ? ["chrome_devtools"] : []),
+        ...resourceMcpServers,
+      ])];
+      const workspaceRoots = this.workspaceRoots(repo);
+      const additionalDirs = this.additionalPaths(repo);
+      if (mcpServerNames.length) {
+        this.store.addEvent(
+          `MCP: 已向 ${backend} Agent 注入配置：${mcpServerNames.join(", ")}；实际连接状态将在 Agent 启动/调用时继续输出`,
+          "info",
+          bug.id,
+        );
+      }
       this.store.addEvent("调用只读调查 Agent：定位根因、证据与最小修改范围", "info", bug.id);
-      const investigated = await agent.run({
-        prompt: buildInvestigationPrompt(bug, repo.name, repo.path),
+      const investigationPrompt = buildInvestigationPrompt(
+        bug, repo.name, repo.path, resourceMcpEnabled, workspaceRoots,
+      );
+      const investigationRunOptions = {
         repoDir: repo.path,
-        timeoutS: Math.min(this.config.agent_timeout_s, 900),
+        additionalDirs,
+        timeoutS: Math.min(this.config.agent_timeout_s, 600),
         tools: ["read", "grep", "find", "ls"],
-        sandboxMode: "read-only",
-        onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
+        sandboxMode: "read-only" as const,
+        outputSchema: INVESTIGATION_OUTPUT_SCHEMA,
+        requiredMcpServers: investigationMcpServers,
+        maxCommandExecutions: _READ_ONLY_COMMAND_BUDGET,
+        repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
+        onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
-      });
+      };
+      let investigated: AgentResult;
+      try {
+        investigated = await agent.run({
+          prompt: investigationPrompt,
+          ...investigationRunOptions,
+        });
+      } catch (error) {
+        if (error instanceof AgentInfrastructureError) {
+          throw new WorkspaceBlockedError(error.message);
+        }
+        if (error instanceof AgentInvestigationLimitError) {
+          throw new InvestigationBlockedError(error.message);
+        }
+        if (error instanceof AgentTimeoutError) {
+          throw new InvestigationBlockedError(error.message);
+        }
+        throw error;
+      }
       if (!investigated.ok) {
         throw new Error(`调查 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`);
       }
-      const investigation: InvestigationResult = parseInvestigation(
+      let investigation: InvestigationResult = parseInvestigation(
         investigated.raw_output || investigated.log || investigated.summary,
+        admission.context.diagnostic_links,
       );
+      if (!investigation.ok && !investigation.blocked_reasons.length) {
+        this.store.addEvent(
+          "调查 Agent 仅返回过程说明或结构化结果不完整，正在原线程强制收敛（不计入 Bug 重试）",
+          "warn",
+          bug.id,
+        );
+        try {
+          investigated = await agent.run({
+            prompt: buildInvestigationRecoveryPrompt(
+              investigationPrompt,
+              investigated.raw_output || investigated.log || investigated.summary,
+              investigation.validation_errors,
+            ),
+            ...investigationRunOptions,
+          });
+        } catch (error) {
+          if (error instanceof AgentInfrastructureError) throw new WorkspaceBlockedError(error.message);
+          if (error instanceof AgentInvestigationLimitError || error instanceof AgentTimeoutError) {
+            throw new InvestigationBlockedError(error.message);
+          }
+          throw error;
+        }
+        if (!investigated.ok) {
+          throw new InvestigationBlockedError(
+            `调查 Agent 补充轮异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`,
+          );
+        }
+        investigation = parseInvestigation(
+          investigated.raw_output || investigated.log || investigated.summary,
+          admission.context.diagnostic_links,
+        );
+      }
       if (!investigation.ok) {
         const reason = [...investigation.blocked_reasons, ...investigation.validation_errors].join("；");
-        throw new Error("调查阶段未形成可靠修复证据: " + (reason || "输出不可解析"));
+        throw new InvestigationBlockedError(
+          "调查阶段未形成可靠修复证据: " + (reason || "输出不可解析"),
+        );
       }
       this.store.addEvent(
         `调查完成：置信度 ${investigation.confidence}，计划修改 ${investigation.planned_files.length} 个文件`,
@@ -532,14 +888,35 @@ export class Worker {
         bug.id,
       );
       this.store.updateJob(bug.id, { investigation });
+      const p4Targets = p4ReconcileTargets(investigation.planned_files);
+      if (p4Targets.length) {
+        try {
+          await p4.sync(p4Targets);
+        } catch (error) {
+          if (error instanceof P4SyncTimeoutError) {
+            throw new WorkspaceBlockedError(
+              `P4 精确同步超时，未进入修改阶段；请检查 P4 服务或工作区后人工重试: ${error.message}`,
+            );
+          }
+          throw error;
+        }
+      } else {
+        this.store.addEvent(
+          "P4: planned_files 不包含 project 路径，本次无需同步 P4 文件",
+          "debug",
+          bug.id,
+        );
+      }
       const prompt = buildImplementationPrompt({
         bug,
         repoName: repo.name,
         repoPath: repo.path,
-        verifyCommands: repo.verify_cmds,
+        verifyCommands: this.verificationCommands(repo),
         investigation,
         retryEvidence: retryText,
         reviewerFeedback: "",
+        unrealMcpEnabled: resourceMcpEnabled,
+        workspaceRoots,
       });
       this.store.addEvent(
         retryText
@@ -551,8 +928,13 @@ export class Worker {
       let result = await agent.run({
         prompt,
         repoDir: repo.path,
+        additionalDirs,
         timeoutS: this.config.agent_timeout_s,
         sandboxMode: "workspace-write",
+        outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
+        requiredMcpServers: resourceMcpServers,
+        maxCommandExecutions: _AGENT_COMMAND_BUDGET,
+        repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
         onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
       });
@@ -573,12 +955,16 @@ export class Worker {
       let testOut = "";
       let verificationPassed = false;
       let reviewPassed = false;
-      if (!hasCodeChanges(result) && !hasManualAssets(result)) {
+      if (!hasCodeChanges(result)) {
         // 回归：Agent 实际改了代码，但最终输出没按格式给出可解析的 FINAL_RESULT
         // （网关把原生工具调用协议泄进文本、代码块未闭合等）时，曾被直接判「未产出
         // 任何改动」而失败，已完成的修复被丢在 default changelist 里无人认领。
-        // 这里按 p4 事实采纳改动，保住已完成的工作。
-        opened = await checkAndPrepareP4(p4).catch(() => null);
+        // 这里按 P4/Git 事实采纳改动，保住已完成的工作。即使同时报告了人工资源，
+        // 也不能把已经产生的代码改动误归类为 manual_only。
+        opened = await checkAndPrepareP4(
+          p4,
+          p4ReconcileTargets(investigation.planned_files),
+        ).catch(() => null);
         if (opened && opened.length) {
           result.changed_files = opened.map((o) => o.depot);
           result.summary =
@@ -589,11 +975,29 @@ export class Worker {
             bug.id,
           );
         }
+        const gitFiles = (await Promise.all(gitAttempts.map(async (attempt) =>
+          (await attempt.workspace.changedFiles(attempt.session.baseCommit)).map((file) =>
+            `${attempt.config.name.toLowerCase()}:${file}`)))).flat();
+        if (gitFiles.length) {
+          result.changed_files = [...new Set([...result.changed_files, ...gitFiles])];
+          result.summary = result.summary
+            || "(Agent 最终输出未解析出结构化结果，改动清单按 Git 工作区事实采纳)";
+          this.store.addEvent(
+            "Agent 输出缺少可解析的 FINAL_RESULT，已按 Git 工作区改动采纳",
+            "warn",
+            bug.id,
+          );
+        }
       }
       if (hasCodeChanges(result)) {
-        opened = opened && opened.length ? opened : await checkAndPrepareP4(p4);
-        let verified = await this.verifyCandidate(p4, repo, opened, investigation.planned_files);
+        let verified = await this.verifyCandidate(
+          p4, repo, gitAttempts, opened, investigation.planned_files,
+        );
         opened = verified.opened;
+        result.changed_files = [
+          ...opened.map((item) => `project:${item.depot}`),
+          ...verified.gitFiles,
+        ];
         testOut = verified.summary;
         verificationPassed = verified.verified;
         this.store.updateJob(bug.id, { verification: verified });
@@ -605,6 +1009,7 @@ export class Worker {
             investigation,
             verified.diff,
             verified.summary,
+            additionalDirs,
           );
           this.store.updateJob(bug.id, { review_findings: review });
           let fixRound = 0;
@@ -617,14 +1022,21 @@ export class Worker {
                 bug,
                 repoName: repo.name,
                 repoPath: repo.path,
-                verifyCommands: repo.verify_cmds,
+                verifyCommands: this.verificationCommands(repo),
                 investigation,
                 retryEvidence: retryText,
-                reviewerFeedback: feedback,
-              }),
+            reviewerFeedback: feedback,
+            unrealMcpEnabled: resourceMcpEnabled,
+            workspaceRoots,
+          }),
               repoDir: repo.path,
+              additionalDirs,
               timeoutS: this.config.agent_timeout_s,
               sandboxMode: "workspace-write",
+              outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
+              requiredMcpServers: resourceMcpServers,
+              maxCommandExecutions: _AGENT_COMMAND_BUDGET,
+              repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
               onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
               cancelEvent: this.cancelEvent,
             });
@@ -641,8 +1053,14 @@ export class Worker {
               throw new VerificationError("Reviewer 修正阶段未产出代码改动: "
                 + (result.blocked_reasons.join("；") || result.summary || "无输出"));
             }
-            verified = await this.verifyCandidate(p4, repo, null, investigation.planned_files);
+            verified = await this.verifyCandidate(
+              p4, repo, gitAttempts, null, investigation.planned_files,
+            );
             opened = verified.opened;
+            result.changed_files = [
+              ...opened.map((item) => `project:${item.depot}`),
+              ...verified.gitFiles,
+            ];
             testOut = verified.summary;
             verificationPassed = verified.verified;
             this.store.updateJob(bug.id, { verification: verified });
@@ -653,6 +1071,7 @@ export class Worker {
               investigation,
               verified.diff,
               verified.summary,
+              additionalDirs,
             );
             this.store.updateJob(bug.id, { review_findings: review });
           }
@@ -682,11 +1101,30 @@ export class Worker {
       // 列表只允许 default 里的文件，编号 changelist 的文件混进来 p4 change -i 必报
       // "Can't include file(s) not already opened"
       const files = [...new Set((opened ?? []).map((o) => o.depot))];
+      const gitResults: Array<{ name: string; result: GitFinalizeResult }> = [];
+      for (const attempt of gitAttempts) {
+        const finalized = await attempt.workspace.finalize(
+          attempt.session,
+          `【b${bug.id}】${bug.title.trim() || `修复 Bug ${bug.id}`}`,
+        );
+        attempt.settled = true;
+        if (finalized) {
+          attempt.finalized = finalized;
+          gitResults.push({ name: attempt.config.name, result: finalized });
+          this.store.addEvent(
+            `Git ${attempt.config.name} 已本地提交 ${finalized.commit.slice(0, 12)}（${finalized.branch}）`,
+            "info",
+            bug.id,
+          );
+        }
+      }
       const desc = buildDescription(bug, result, testOut, [
         "本 changelist 由 TapdBugFixAgent 自动生成，请人工 review 后提交",
+        ...gitResults.map(({ name, result: gitResult }) =>
+          `Git ${name}: ${gitResult.branch} @ ${gitResult.commit}（仅本地提交，未 push）`),
       ]);
       let cl: number | null = null;
-      if (["candidate", "candidate_partial", "verified", "review_pending"].includes(state)) {
+      if (files.length && ["candidate", "candidate_partial", "verified", "review_pending"].includes(state)) {
         // 只把 default changelist 里本次收集到的文件放进新 changelist
         cl = await p4.createPending(desc, files);
         this.store.addEvent(`已创建 pending changelist ${cl}`, "info", bug.id);
@@ -696,7 +1134,11 @@ export class Worker {
         agent_state: state,
         changelist: cl,
         generated_description: desc,
-        files: dumps(files),
+        files: dumps([
+          ...files.map((file) => `project:${file}`),
+          ...gitResults.flatMap(({ name, result: gitResult }) =>
+            gitResult.files.map((file) => `${name.toLowerCase()}:${file}`)),
+        ]),
         manual_assets: dumps(result.manual_assets),
         agent: backend,
         failure_reason: null,
@@ -706,18 +1148,53 @@ export class Worker {
       });
 
       // ---- Tapd 回写 ----
-      await this.notifyTapd(bug, state, cl, result);
-      this.store.addEvent(`完成（${state}）` + (cl ? `，changelist ${cl}` : ""), "info", bug.id);
+      await this.notifyTapd(bug, state, cl, result, gitResults);
+      this.store.addEvent(
+        `完成（${state}）`
+          + (cl ? `，changelist ${cl}` : "")
+          + (gitResults.length ? `，Git 分支 ${gitResults.map((item) => item.result.branch).join(", ")}` : ""),
+        "info",
+        bug.id,
+      );
     } catch (exc) {
-      if (exc instanceof WorkspaceBlockedError) {
-        const reason = exc.message.slice(0, 1000);
+      // 失败或人工中断可能留下未登记文件；下一次重新做一次完整基线扫描。
+      if (activeRepo && activeRepo.preflight_reconcile === "once") {
+        this.cleanP4Baselines.delete(activeRepo.path.replace(/\\/g, "/").toLowerCase());
+      }
+      let failure = exc;
+      if (failure instanceof P4ConnectionError) {
+        failure = new WorkspaceBlockedError(
+          `P4 服务当前不可用，可能处于休眠恢复、VPN/网络重连或服务维护期间；` +
+          `本次不消耗 Bug 修复重试，请恢复连接后人工重试: ${failure.message}`,
+        );
+      }
+      if (gitAttempts.length) {
+        try {
+          await this.rollbackGitAttempts(gitAttempts);
+          this.store.addEvent("已清理本次尝试创建的 Git 分支", "warn", bug.id);
+        } catch (cleanupError) {
+          failure = new WorkspaceBlockedError(`${String(exc)}；${String(cleanupError)}`);
+        }
+      }
+      if (failure instanceof WorkspaceBlockedError) {
+        const reason = failure.message.slice(0, 1000);
         this.store.updateJob(bug.id, {
           agent_state: "blocked_workspace",
           failure_reason: reason,
           finished_at: nowStr(),
         });
         this.store.addEvent(`工作区阻塞: ${reason}`, "warn", bug.id);
-      } else if (exc instanceof AgentCancelledError) {
+      } else if (failure instanceof InvestigationBlockedError
+          || failure instanceof AgentInvestigationLimitError
+          || failure instanceof AgentTimeoutError) {
+        const reason = failure.message.slice(0, 1000);
+        this.store.updateJob(bug.id, {
+          agent_state: "needs_info",
+          failure_reason: reason,
+          finished_at: nowStr(),
+        });
+        this.store.addEvent(`Agent 未在执行预算内收敛，已停止自动重试: ${reason}`, "warn", bug.id);
+      } else if (failure instanceof AgentCancelledError || failure instanceof P4CancelledError) {
         // 人工暂停/关闭/重试/跳过中断了本次尝试。只有状态仍是 in_progress（全局暂停/
         // 关闭）才回退 pending；人工重试/跳过已先把状态改成 pending/skipped，尊重人工
         // 设置，绝不能覆盖（回归：跳过正在跑的 bug 后，跑完的写回曾把 skipped 盖掉）。
@@ -730,14 +1207,18 @@ export class Worker {
           this.store.addEvent(`处理被人工中断，保留人工设置的状态（${st}）`, "warn", bug.id);
         }
       } else {
-        await this.handleFailure(bug, exc, p4, lastResult);
+        await this.handleFailure(bug, failure, p4, lastResult);
       }
     }
   }
 
   /** Tapd 回写：只发评论，绝不自动修改单子状态——状态由人工 review 并 submit 后自行处理。 */
   private async notifyTapd(
-    bug: Bug, state: string, cl: number | null, result: AgentResult,
+    bug: Bug,
+    state: string,
+    cl: number | null,
+    result: AgentResult,
+    gitResults: Array<{ name: string; result: GitFinalizeResult }> = [],
   ): Promise<void> {
     const ws = this.workspaceOf(bug);
     const client = this.tapd(ws);
@@ -748,6 +1229,11 @@ export class Worker {
     else if (state === "review_pending") lines.push("结果: 机器验证和独立评审通过，等待人工最终确认");
     else if (state === "manual_only") lines.push("结果: 该单为资源类修改，需人工处理（无代码改动）");
     if (cl) lines.push(`Perforce pending changelist: ${cl}（请 review 后人工 submit）`);
+    for (const { name, result: gitResult } of gitResults) {
+      lines.push(
+        `Git ${name}: 分支 ${gitResult.branch}，commit ${gitResult.commit}（仅本地提交，请 review 后人工 push）`,
+      );
+    }
     lines.push("Tapd 状态未修改：请 review 代码并提交后自行更新单子状态。");
     if (result.manual_assets.length) {
       lines.push("需人工处理的资源:");
@@ -1007,8 +1493,13 @@ export class Worker {
       return true;
     }
     if (this.currentBugId === bugId) this.cancelCurrentAttempt(); // 正在跑：先中断本次尝试
+    const wasSkipped = job.agent_state === "skipped";
     this.resetJobForRetry(bugId);
-    this.store.addEvent(`人工触发重试 bug ${bugId}`, "info", bugId);
+    this.store.addEvent(
+      wasSkipped ? `人工从跳过恢复 bug ${bugId}（已重置为待处理）` : `人工触发重试 bug ${bugId}`,
+      "info",
+      bugId,
+    );
     return true;
   }
 
@@ -1034,6 +1525,9 @@ export class Worker {
   async resyncFromTapd(): Promise<{ cleared: number; synced: number }> {
     if (this.state === "running") {
       throw new Error("运行中不可清除同步：请先停止自动处理（⏹ 关闭）");
+    }
+    if (this.currentBugId !== null) {
+      throw new Error(`当前 bug ${this.currentBugId} 仍在停止中，请等待其退出后再清除同步`);
     }
     const cleared = this.store.deleteAllJobs();
     this.resetTapdClients(); // 清缓存 + 断开旧 MCP 连接，强制下一次真实拉取

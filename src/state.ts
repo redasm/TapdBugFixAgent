@@ -357,9 +357,23 @@ export class StateStore {
 
   // ---------- events ----------
   addEvent(msg: string, level = "info", bugId?: string): void {
+    const ts = nowStr();
     this.db
       .prepare("INSERT INTO events(ts, level, bug_id, msg) VALUES (?,?,?,?)")
-      .run(nowStr(), level, bugId ?? null, msg.slice(0, 2000));
+      .run(ts, level, bugId ?? null, msg.slice(0, 2000));
+
+    // Web 事件也是服务端最有价值的运行日志。同步输出到控制台，避免后台任务
+    // 在 P4 / Git / Agent 等长耗时步骤中表现成黑盒。仅控制台侧做敏感信息脱敏，
+    // 数据库仍保留原事件文本供管理台展示和问题追溯。
+    const safe = msg
+      .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
+      .replace(/([?&](?:token|api_key|access_token|password|passwd|secret)=)[^&\s]+/gi, "$1[REDACTED]")
+      .replace(/\b(token|api[_-]?key|access[_-]?token|password|passwd|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
+    const scope = bugId ? ` [bug:${bugId}]` : "";
+    const line = `[${ts}] [${level.toUpperCase()}]${scope} ${safe}`;
+    if (level === "error") console.error(line);
+    else if (level === "warn") console.warn(line);
+    else console.log(line);
   }
 
   listEvents(bugId?: string, limit = 200): Record<string, unknown>[] {
