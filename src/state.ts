@@ -355,6 +355,26 @@ export class StateStore {
     return n;
   }
 
+  /** 重新同步时保留已经产生候选/人工结论的任务，避免页面统计和 changelist 关联被清空。 */
+  deleteRetryableJobs(preservedStates: string[]): { cleared: number; preserved: number } {
+    const states = [...new Set(preservedStates.filter(Boolean))];
+    if (!states.length) return { cleared: this.deleteAllJobs(), preserved: 0 };
+    const placeholders = states.map(() => "?").join(",");
+    const preserved = Number((this.db.prepare(
+      `SELECT COUNT(*) AS n FROM jobs WHERE agent_state IN (${placeholders})`,
+    ).get(...states) as { n: number | bigint }).n);
+    const total = this.jobCount();
+    const tx = this.db.transaction(() => {
+      this.db.prepare(
+        `DELETE FROM events WHERE bug_id IS NULL OR bug_id IN (`
+          + `SELECT bug_id FROM jobs WHERE agent_state NOT IN (${placeholders}))`,
+      ).run(...states);
+      this.db.prepare(`DELETE FROM jobs WHERE agent_state NOT IN (${placeholders})`).run(...states);
+    });
+    tx();
+    return { cleared: total - preserved, preserved };
+  }
+
   // ---------- events ----------
   addEvent(msg: string, level = "info", bugId?: string): void {
     const ts = nowStr();

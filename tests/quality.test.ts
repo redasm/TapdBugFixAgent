@@ -268,6 +268,7 @@ describe("two-stage repair workflow", () => {
     expect(prompt).toContain("排除依据");
     expect(prompt).toContain("先阅读相关测试");
     expect(prompt).toContain("停止调查并写入 blocked_reasons");
+    expect(prompt).toContain("工具调用次数不设固定上限");
     expect(prompt).toContain("不得在 Perforce 根执行 git status/log/blame/diff");
     expect(prompt).toContain("p4 filelog");
     expect(prompt).toContain('git -C "根的绝对路径"');

@@ -25,6 +25,15 @@ export function effectiveAgentModel(
   return provider.model_id.includes("/") ? provider.model_id : `${provider.id}/${provider.model_id}`;
 }
 
+/** 评审模型允许只写模型 id；Pi 后端下自动继承 provider 前缀和认证配置。 */
+export function effectiveReviewModel(config: Config, backend: AgentBackend): string {
+  const configured = config.review.model.trim();
+  if (!configured) return effectiveAgentModel(config, backend);
+  if (backend === "codex" || configured.includes("/")) return configured;
+  const providerId = config.pi.provider?.id?.trim();
+  return providerId ? `${providerId}/${configured}` : configured;
+}
+
 export function createCodingAgent(config: Config, override?: string): CodingAgent {
   const backend = selectedAgentBackend(config, override);
   return backend === "codex" ? new CodexAgent(config) : new PiAgent(config);

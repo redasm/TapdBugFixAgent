@@ -44,6 +44,7 @@ import { TapdMcpClient } from "../src/tapdMcp.js";
 import {
   createCodingAgent,
   effectiveAgentModel,
+  effectiveReviewModel,
   selectedAgentBackend,
 } from "../src/agentBackend.js";
 import {
@@ -423,6 +424,19 @@ describe("Agent 后端选择", () => {
     expect(selectedAgentBackend(cfg)).toBe("codex");
     expect(effectiveAgentModel(cfg)).toBe("gpt-test");
     expect(createCodingAgent(cfg)).toBeInstanceOf(CodexAgent);
+  });
+
+  it("Pi Reviewer 的裸模型名自动继承 provider 前缀", () => {
+    const cfg = makeConfig();
+    cfg.pi.provider = {
+      id: "kuro", base_url: "https://example.test", api_key_env: "TEST_KEY",
+      auth_header: true, model_id: "deepseek-v4-pro", reasoning: true,
+      context_window: 1000000, max_tokens: 32000, skill_dirs: [],
+    };
+    cfg.review.model = "deepseek-v4-pro";
+    expect(effectiveReviewModel(cfg, "pi")).toBe("kuro/deepseek-v4-pro");
+    cfg.review.model = "other/model";
+    expect(effectiveReviewModel(cfg, "pi")).toBe("other/model");
   });
 
   it("Codex 事件转换为可读进度", () => {
@@ -2171,6 +2185,20 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     expect(w.store.getJob(bug.id)?.agent_state).toBe("pending"); // 没被误跳过
   });
 
+  it("回归：列表拉取失败且直拉返回空壳时保持 pending，不误判单据不存在", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug({ id: "1152729922001254287" });
+    stubTapd(w, {
+      listBugs: async () => { throw new Error("fetch failed"); },
+      getBug: async (id: string) => makeBug({ id, title: "", status: "" }),
+    } as unknown as FakeTapd);
+    w.store.upsertJob(bug, { agent_state: "pending" });
+
+    const actionable = await w.fetchActionable();
+    expect(actionable.map((b) => b.id)).toEqual([bug.id]);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("pending");
+  });
+
   it("列表显示本地有记录但不在 Tapd 列表的 bug（tapd_missing 标记）", async () => {
     const w = makeWorker();
     const bug = makeBug({ id: "1152729922001254287" });
@@ -2223,13 +2251,13 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     expect((await w.fetchActionable()).length).toBe(2);
   });
 
-  it("resyncFromTapd 清空全部本地记录并按最新 Tapd 列表重建待处理队列", async () => {
+  it("resyncFromTapd 保留候选/人工结论并按最新 Tapd 列表重建可重试队列", async () => {
     const w = makeWorker();
     const live1 = makeBug({ id: "1152729922001254287" }); // Tapd 上还在
     const live2 = makeBug({ id: "1152729922001254288", status: "resolved" }); // Tapd 终态 → 不同步
     const gone = makeBug({ id: "1152729922001254290" }); // 只有本地有（Tapd 列表外）→ 应被清掉
     stubMyBugs(w, [live1, live2]);
-    w.store.upsertJob(live1, { agent_state: "accepted", changelist: 777 }); // 历史被清
+    w.store.upsertJob(live1, { agent_state: "accepted", changelist: 777 }); // 人工结论保留
     w.store.upsertJob(gone, { agent_state: "failed" });
     w.store.recordFeedback(live1.id, {
       outcome: "accepted_unchanged",
@@ -2241,20 +2269,21 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     expect(w.store.jobCount()).toBe(2);
 
     const r = await w.resyncFromTapd();
-    expect(r.cleared).toBe(2);
+    expect(r.cleared).toBe(1);
+    expect(r.preserved).toBe(1);
     expect(r.synced).toBe(1); // resolved 的不同步
     expect(w.store.jobCount()).toBe(1);
     const job = w.store.getJob(live1.id);
-    expect(job?.agent_state).toBe("pending");
-    expect(job?.changelist).toBeNull(); // 历史关联已清
+    expect(job?.agent_state).toBe("accepted");
+    expect(job?.changelist).toBe(777);
     expect(w.store.getJob(gone.id)).toBeUndefined(); // Tapd 外的本地残留已清
-    // 队列 = 同步进来的那一单（resolved 的被排除）
+    // 已接受任务保留终态，不重新进入队列
     const actionable = await w.fetchActionable();
-    expect(actionable.map((b) => b.id)).toEqual([live1.id]);
-    // 事件表也清了，只剩本次同步的记录
+    expect(actionable).toEqual([]);
+    // 已保留任务的事件不丢失
     const evs = w.store.listEvents(undefined, 10);
     expect(evs.some((e) => String(e.msg).includes("重新同步"))).toBe(true);
-    expect(evs.some((e) => String(e.msg) === "旧事件")).toBe(false);
+    expect(evs.some((e) => String(e.msg) === "旧事件")).toBe(true);
     expect(w.store.listFeedback(live1.id)).toHaveLength(1); // 质量标签不是队列缓存，必须长期保留
     expect(w.store.qualityMetrics().accepted_unchanged).toBe(1);
   });
@@ -2274,7 +2303,8 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     w.store.setControl("stopped");
     const r = await w.resyncFromTapd();
     expect(r.synced).toBe(1);
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("pending");
+    expect(r.preserved).toBe(1);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("accepted");
   });
 
   it("停止后当前任务尚未退出时拒绝清除同步，避免删除运行中任务的状态和日志", async () => {
@@ -2527,6 +2557,76 @@ describe("worker 两阶段修复协议", () => {
     expect(comments.join("\n")).toContain("0123456789abcdef");
   });
 
+  it("普通 P4 Bug 调查时可读引擎仓库，但不创建 Git 分支且修改阶段不开放 Git 写目录", async () => {
+    const repo: RepoConfig = {
+      name: "game",
+      path: "C:\\project",
+      verify_cmds: [],
+      additional_dirs: [{
+        name: "engine",
+        path: "C:\\engine",
+        vcs: "git",
+        base_branch: "branch_0.7.0",
+        author: "yangfan",
+        verify_cmds: [],
+      }],
+    };
+    const w = makeWorker([repo]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      return calls.length === 1
+        ? makeInvestigation("project:TypeScript/Src/Login.ts")
+        : makeResult({ changed_files: ["project:TypeScript/Src/Login.ts"], summary: "修复客户端逻辑" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/TypeScript/Src/Login.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue(
+      "--- a/TypeScript/Src/Login.ts\n+++ b/TypeScript/Src/Login.ts\n-old\n+fixed",
+    );
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+    const prepareBranch = vi.spyOn(GitWorkspace.prototype, "prepareBranch");
+
+    await w.processBug(bug);
+
+    expect(calls[0].additionalDirs).toEqual(["C:\\engine"]);
+    expect(calls[1].additionalDirs).toEqual([]);
+    expect(prepareBranch).not.toHaveBeenCalled();
+    expect(w.store.listEvents(bug.id).some((event) =>
+      String(event.msg).includes("不创建 Git 分支"))).toBe(true);
+  });
+
+  it("仅把计划修改根的验证命令交给 Agent", () => {
+    const repo: RepoConfig = {
+      name: "game",
+      path: "C:\\project",
+      verify_cmds: ["project-test"],
+      additional_dirs: [{
+        name: "engine",
+        path: "C:\\engine",
+        vcs: "git",
+        base_branch: "main",
+        author: "yangfan",
+        verify_cmds: ["engine-test"],
+      }],
+    };
+    const w = makeWorker([repo]);
+    const verificationCommands = (w as unknown as {
+      verificationCommands: (r: RepoConfig, files?: string[]) => string[];
+    }).verificationCommands.bind(w);
+
+    expect(verificationCommands(repo, ["project:TypeScript/Src/Foo.ts"]))
+      .toEqual(["[project] project-test"]);
+    expect(verificationCommands(repo, ["engine:Engine/Source/Foo.cpp"]))
+      .toEqual(["[engine] engine-test"]);
+  });
+
   it("跨目录修复失败时回滚本次 Git 分支", async () => {
     const repo: RepoConfig = {
       name: "game",
@@ -2548,7 +2648,9 @@ describe("worker 两阶段修复协议", () => {
       baseBranch: "main", baseCommit: "base", branch: "main_yangfan20260707171730",
     });
     const rollback = vi.spyOn(GitWorkspace.prototype, "rollback").mockResolvedValue();
-    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({ ok: false, log: "agent failed" }));
+    vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeInvestigation("engine:Engine/Source/Foo.cpp"))
+      .mockResolvedValueOnce(makeResult({ ok: false, log: "agent failed" }));
 
     await w.processBug(bug);
 
@@ -2795,12 +2897,12 @@ describe("worker 两阶段修复协议", () => {
 
     expect(piRun).not.toHaveBeenCalled();
     expect(calls.map((call) => call.sandboxMode)).toEqual(["read-only", "workspace-write"]);
-    expect(calls.map((call) => call.timeoutS)).toEqual([600, 1800]);
-    expect(calls[0].maxCommandExecutions).toBe(50);
-    expect(calls[0].repeatedCommandLimit).toBe(3);
+    expect(calls.map((call) => call.timeoutS)).toEqual([1800, 1800]);
+    expect(calls[0].maxCommandExecutions).toBeUndefined();
+    expect(calls[0].repeatedCommandLimit).toBeUndefined();
     expect(calls[0].outputSchema).toBeDefined();
-    expect(calls[1].maxCommandExecutions).toBe(100);
-    expect(calls[1].repeatedCommandLimit).toBe(3);
+    expect(calls[1].maxCommandExecutions).toBeUndefined();
+    expect(calls[1].repeatedCommandLimit).toBeUndefined();
     expect(calls[1].outputSchema).toBeDefined();
     expect(w.store.getJob(bug.id)?.agent).toBe("codex");
     expect(w.store.getJob(bug.id)?.model).toBe("gpt-test");
@@ -3013,6 +3115,62 @@ describe("worker 两阶段修复协议", () => {
 });
 
 describe("worker 自动重试", () => {
+  it("最终验证失败但已有代码改动时保留到 pending changelist", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    w.store.upsertJob(bug);
+    w.store.updateJob(bug.id, { agent_state: "in_progress" });
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    const p4 = new P4Client("C:\\tmp", {});
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
+      { depot: "//depot/a.cpp", action: "edit", changelist: "default", type: "text" },
+    ]);
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4567);
+
+    await (w as unknown as {
+      handleFailure: (b: Bug, e: unknown, p: P4Client, r: AgentResult) => Promise<void>;
+    }).handleFailure(
+      bug,
+      new Error("测试未通过: 机器验证失败"),
+      p4,
+      makeResult({ changed_files: ["project:a.cpp"], summary: "已修复" }),
+    );
+
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("manual_review");
+    expect(job?.changelist).toBe(4567);
+    expect(job?.last_attempt_files).toBeNull();
+  });
+
+  it("Reviewer 基础设施异常时立即保留已验证候选，不遗留在 default", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    w.store.upsertJob(bug);
+    w.store.updateJob(bug.id, { agent_state: "in_progress" });
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    const p4 = new P4Client("C:\\tmp", {});
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
+      { depot: "//depot/a.ts", action: "edit", changelist: "default", type: "text" },
+    ]);
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4568);
+
+    await (w as unknown as {
+      handleFailure: (b: Bug, e: unknown, p: P4Client, r: AgentResult) => Promise<void>;
+    }).handleFailure(
+      bug,
+      new Error("Reviewer 异常退出(1): No API key found"),
+      p4,
+      makeResult({ changed_files: ["project:a.ts"], summary: "已通过机器验证" }),
+    );
+
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("manual_review");
+    expect(job?.changelist).toBe(4568);
+    expect(job?.attempts).toBe(1);
+    expect(job?.last_attempt_files).toBeNull();
+  });
+
   it("未耗尽重试次数回 pending，耗尽才 failed；重试前撤销遗留 default 文件", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.max_attempts = 2;
@@ -3462,6 +3620,17 @@ describe("web 前端 bug_id 内插引号", () => {
     expect(html).toContain("accepted_unchanged");
     expect(html).toContain("rejected_wrong_root_cause");
     expect(html).toContain("reopened");
+  });
+
+  it("SSE 刷新不替换正在编辑的人工结论控件，并保留表单草稿", () => {
+    expect(html).toContain("function feedbackEditorActive()");
+    expect(html).toContain("let FEEDBACK_EDITING = false");
+    expect(html).toMatch(/detailBody['"]\)\.addEventListener\(['"]pointerdown['"]/);
+    expect(html).toMatch(/FEEDBACK_EDITING \|\| isFeedbackEditor\(document\.activeElement\)/);
+    expect(html).toMatch(/sameJob && feedbackEditorActive\(\)/);
+    expect(html).toContain("function feedbackDraft()");
+    expect(html).toContain("restoreFeedbackDraft(draft)");
+    expect(html).toMatch(/const selectedId = SELECTED_ID;[\s\S]*SELECTED_ID === selectedId/);
   });
 
   it("顶部有「清除并重新同步」按钮并调 resync 接口（含确认弹窗与进行中状态）", () => {
