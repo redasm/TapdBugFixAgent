@@ -26,7 +26,7 @@ interface GitRunResult {
 const runGit = (
   cwd: string,
   args: string[],
-  timeout = 120000,
+  timeout = 300000,
 ): Promise<GitRunResult> => new Promise((resolve, reject) => {
   const child = spawn("git", args, { cwd, windowsHide: true });
   let stdout = "";
@@ -123,7 +123,9 @@ export class GitWorkspace {
 
   async assertClean(): Promise<void> {
     const dirty = (await this.run([
-      "status", "--porcelain", "--untracked-files=all", ...this.pathspec(),
+      // `all` 会把大型 UE 仓库中的每个未跟踪文件逐一展开，容易在分支准备阶段
+      // 超时；`normal` 仍能可靠判断工作树是否脏，但只报告未跟踪目录一次。
+      "status", "--porcelain", "--untracked-files=normal", ...this.pathspec(),
     ])).trim();
     if (dirty) {
       throw new GitWorkspaceError(
@@ -217,8 +219,8 @@ export class GitWorkspace {
     if (this.ignorePaths.length) {
       await this.run([
         "restore", "--source", session.baseCommit, "--staged", "--worktree", ...this.pathspec(),
-      ]);
-      await this.run(["clean", "-fd", ...this.pathspec()]);
+      ], 600000);
+      await this.run(["clean", "-fd", ...this.pathspec()], 600000);
     } else {
       await this.run(["reset", "--hard", session.baseCommit]);
       await this.run(["clean", "-fd"]);

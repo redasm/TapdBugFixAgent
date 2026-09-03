@@ -33,6 +33,7 @@ import {
 import {
   createCodingAgent,
   effectiveAgentModel,
+  effectiveReviewModel,
   selectedAgentBackend,
   type CodingAgent,
 } from "./agentBackend.js";
@@ -99,6 +100,10 @@ const _TERMINAL_STATES = new Set([
   "needs_info", "manual_review", "blocked_workspace",
   "manual_only", "failed", "skipped",
 ]);
+const _RESYNC_PRESERVED_STATES = [
+  "candidate", "candidate_partial", "verified", "review_pending", "manual_review", "manual_only",
+  "accepted", "accepted_modified", "rejected", "reopened",
+];
 const _FETCH_CACHE_MS = 60000;
 const _MAX_EVIDENCE_ENTRIES = 6; // 重试证据最多保留最近 6 次失败
 
@@ -107,10 +112,6 @@ class WorkspaceBlockedError extends Error {}
 
 /** 调查在有限预算内无法收敛；保留证据并等待人工补充，不重复跑相同搜索。 */
 class InvestigationBlockedError extends Error {}
-
-const _AGENT_COMMAND_BUDGET = 100;
-const _AGENT_REPEAT_LIMIT = 3;
-const _READ_ONLY_COMMAND_BUDGET = 50;
 
 interface GitAttempt {
   config: AdditionalDirConfig;
@@ -142,6 +143,8 @@ export class Worker {
   private clients: Record<string, TapdBackend> = {};
   private lastFetch = 0;
   private lastFetchResult: Bug[] | null = null;
+  /** 最近一次“我的 Bug”列表是否完整成功；失败时不能把空壳直拉结果判成单据不存在。 */
+  private lastFetchReliable = true;
   private stopRequested = false;
   private loopTask: Promise<void> | null = null;
   private wakeResolvers: Array<() => void> = [];
@@ -258,6 +261,7 @@ export class Worker {
     this.clients = {};
     this.lastFetch = 0;
     this.lastFetchResult = null;
+    this.lastFetchReliable = true;
   }
 
   // ------------------------------------------------------------------
@@ -309,10 +313,15 @@ export class Worker {
   ): Promise<{ kind: "found"; bug: Bug } | { kind: "missing" } | { kind: "unknown" }> {
     const inList = (await this.fetchMyBugs()).find((b) => b.id === bugId);
     if (inList) return { kind: "found", bug: inList };
+    const listReliable = this.lastFetchReliable;
     try {
       const ws = this.config.workspaces[0];
       const bug = await this.tapd(ws).getBug(bugId);
-      if (!bug.title.trim() && !bug.status.trim()) return { kind: "missing" };
+      if (!bug.title.trim() && !bug.status.trim()) {
+        // MCP 在上游 fetch 失败时可能也返回“只有 id 的空壳”，与真正不存在的单据形态相同。
+        // 只有列表查询本身成功时，才有足够证据把空壳判为 missing；否则保守保持 pending。
+        return listReliable ? { kind: "missing" } : { kind: "unknown" };
+      }
       return { kind: "found", bug };
     } catch {
       return { kind: "unknown" };
@@ -354,17 +363,20 @@ export class Worker {
       return this.lastFetchResult;
     }
     const bugs: Bug[] = [];
+    let reliable = true;
     for (const ws of this.config.workspaces) {
       try {
         const fetched = await this.tapd(ws).listBugs(ws.owner);
         for (const b of fetched) b.workspace_id = ws.workspace_id;
         bugs.push(...fetched);
       } catch (exc) {
+        reliable = false;
         this.store.addEvent(`workspace ${ws.workspace_id} 拉取失败: ${exc}`, "error");
       }
     }
     this.lastFetch = now;
     this.lastFetchResult = bugs;
+    this.lastFetchReliable = reliable;
     return bugs;
   }
 
@@ -457,22 +469,51 @@ export class Worker {
     return (repo.additional_dirs ?? []).map((dir) => dir.path);
   }
 
-  private verificationCommands(repo: RepoConfig): string[] {
+  private plannedRoots(plannedFiles: string[]): Set<string> {
+    return new Set(plannedFiles.map((file) => {
+      const normalized = file.trim().replace(/\\/g, "/");
+      const separator = normalized.indexOf(":");
+      return (separator >= 0 ? normalized.slice(0, separator) : "project").toLowerCase();
+    }));
+  }
+
+  private verificationCommands(repo: RepoConfig, plannedFiles?: string[]): string[] {
+    const plannedRoots = this.plannedRoots(plannedFiles ?? []);
     return [
-      ...repo.verify_cmds.map((command) => `[project] ${command}`),
+      ...(!plannedFiles || plannedRoots.has("project")
+        ? repo.verify_cmds.map((command) => `[project] ${command}`)
+        : []),
       ...(repo.additional_dirs ?? []).flatMap((dir) =>
-        dir.verify_cmds.map((command) => `[${dir.name.toLowerCase()}] ${command}`)),
+        plannedFiles && !plannedRoots.has(dir.name.toLowerCase())
+          ? []
+          : dir.verify_cmds.map((command) => `[${dir.name.toLowerCase()}] ${command}`)),
     ];
   }
 
-  private async prepareGitAttempts(repo: RepoConfig, ws: WorkspaceConfig): Promise<GitAttempt[]> {
+  private async prepareGitAttempts(
+    repo: RepoConfig,
+    ws: WorkspaceConfig,
+    plannedFiles: string[],
+    bugId?: string,
+  ): Promise<GitAttempt[]> {
     const attempts: GitAttempt[] = [];
+    const additionalDirs = repo.additional_dirs ?? [];
+    const plannedRoots = this.plannedRoots(plannedFiles);
+    const selectedDirs = additionalDirs.filter((config) =>
+      plannedRoots.has(config.name.toLowerCase()));
+    if (additionalDirs.length && !selectedDirs.length) {
+      this.store.addEvent(
+        "调查计划不涉及 Git 引擎代码，本 Bug 不创建 Git 分支",
+        "info",
+        bugId ?? this.currentBugId ?? undefined,
+      );
+    }
     try {
-      for (const config of repo.additional_dirs ?? []) {
+      for (const config of selectedDirs) {
         this.store.addEvent(
           `Git ${config.name}: 开始检查附加仓库（${config.path}，基线 ${config.base_branch}）`,
           "info",
-          this.currentBugId ?? undefined,
+          bugId ?? this.currentBugId ?? undefined,
         );
         const workspace = new GitWorkspace(config.path, config.ignore_paths ?? []);
         const author = config.author.trim() || String(this.config.p4.user ?? "").trim() || ws.owner.trim();
@@ -481,13 +522,13 @@ export class Worker {
         this.store.addEvent(
           `Git ${config.name}: 仓库连接及状态检查成功，已创建分支 ${session.branch}`,
           "info",
-          this.currentBugId ?? undefined,
+          bugId ?? this.currentBugId ?? undefined,
         );
         if (config.ignore_paths?.length) {
           this.store.addEvent(
             `Git ${config.name}: 已忽略本地生成路径 ${config.ignore_paths.join(", ")}`,
             "info",
-            this.currentBugId ?? undefined,
+            bugId ?? this.currentBugId ?? undefined,
           );
         }
       }
@@ -580,12 +621,18 @@ export class Worker {
       this.config.quality.max_diff_lines,
     );
     if (!scope.ok) throw new VerificationError(scope.reasons.join("；"));
-    const pipelines = [
-      { name: "project", result: await runVerificationPipeline(
+    const pipelines: Array<{
+      name: string;
+      result: Awaited<ReturnType<typeof runVerificationPipeline>>;
+    }> = [];
+    if (actualOpened.length) {
+      pipelines.push({ name: "project", result: await runVerificationPipeline(
         repo.path, repo.verify_cmds, this.config.quality.require_verification,
-      ) },
-    ];
+      ) });
+    }
     for (const attempt of gitAttempts) {
+      const changed = gitChanges.find((item) => item.attempt === attempt);
+      if (!changed?.files.length) continue;
       pipelines.push({
         name: attempt.config.name.toLowerCase(),
         result: await runVerificationPipeline(
@@ -610,6 +657,7 @@ export class Worker {
 
   private async reviewCandidate(
     reviewer: CodingAgent,
+    reviewerModel: string,
     p4: P4Client,
     bug: Bug,
     investigation: InvestigationResult,
@@ -621,13 +669,11 @@ export class Worker {
       prompt: buildReviewPrompt({ bug, investigation, diff, verificationSummary }),
       repoDir: p4.path,
       additionalDirs,
-      timeoutS: Math.min(this.config.agent_timeout_s, 600),
+      timeoutS: this.config.agent_timeout_s,
       tools: ["read", "grep", "find", "ls"],
       sandboxMode: "read-only",
       outputSchema: REVIEW_OUTPUT_SCHEMA,
-      model: this.config.review.model || undefined,
-      maxCommandExecutions: _READ_ONLY_COMMAND_BUDGET,
-      repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
+      model: reviewerModel || undefined,
       cancelEvent: this.cancelEvent,
       onProgress: (msg) => this.store.addEvent(`Reviewer ${msg}`, "debug", bug.id),
     });
@@ -755,20 +801,12 @@ export class Worker {
         );
       }
 
-      gitAttempts = await this.prepareGitAttempts(repo, this.workspaceOf(bug));
-      for (const attempt of gitAttempts) {
-        this.store.addEvent(
-          `Git ${attempt.config.name} 已从 ${attempt.session.baseBranch} 创建分支 ${attempt.session.branch}`,
-          "info",
-          bug.id,
-        );
-      }
-
       // ---- 带证据的重试：把之前的失败记录压缩成提示，喂给全新上下文的 Agent ----
       const retryText = formatRetryEvidence(this.retryEvidenceEntries(bug.id));
       const attempts = Number(this.store.getJob(bug.id)?.attempts ?? 0) + 1;
       const agent = createCodingAgent(this.config, backend);
       const reviewerBackend = selectedAgentBackend(this.config, this.config.review.backend);
+      const reviewerModel = effectiveReviewModel(this.config, reviewerBackend);
       const reviewer = this.config.review.enabled
         ? createCodingAgent(this.config, reviewerBackend)
         : null;
@@ -794,7 +832,7 @@ export class Worker {
         ...resourceMcpServers,
       ])];
       const workspaceRoots = this.workspaceRoots(repo);
-      const additionalDirs = this.additionalPaths(repo);
+      const investigationAdditionalDirs = this.additionalPaths(repo);
       if (mcpServerNames.length) {
         this.store.addEvent(
           `MCP: 已向 ${backend} Agent 注入配置：${mcpServerNames.join(", ")}；实际连接状态将在 Agent 启动/调用时继续输出`,
@@ -808,14 +846,12 @@ export class Worker {
       );
       const investigationRunOptions = {
         repoDir: repo.path,
-        additionalDirs,
-        timeoutS: Math.min(this.config.agent_timeout_s, 600),
+        additionalDirs: investigationAdditionalDirs,
+        timeoutS: this.config.agent_timeout_s,
         tools: ["read", "grep", "find", "ls"],
         sandboxMode: "read-only" as const,
         outputSchema: INVESTIGATION_OUTPUT_SCHEMA,
         requiredMcpServers: investigationMcpServers,
-        maxCommandExecutions: _READ_ONLY_COMMAND_BUDGET,
-        repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
       };
@@ -888,6 +924,22 @@ export class Worker {
         bug.id,
       );
       this.store.updateJob(bug.id, { investigation });
+      // 调查阶段可以只读查看所有附加 Git 仓库；只有调查明确计划修改某个 Git 根时，
+      // 才检查该仓库并创建修复分支。普通 P4/TypeScript Bug 不触碰任何 Git 分支。
+      gitAttempts = await this.prepareGitAttempts(
+        repo,
+        this.workspaceOf(bug),
+        investigation.planned_files,
+        bug.id,
+      );
+      for (const attempt of gitAttempts) {
+        this.store.addEvent(
+          `Git ${attempt.config.name} 已从 ${attempt.session.baseBranch} 创建分支 ${attempt.session.branch}`,
+          "info",
+          bug.id,
+        );
+      }
+      const implementationAdditionalDirs = gitAttempts.map((attempt) => attempt.config.path);
       const p4Targets = p4ReconcileTargets(investigation.planned_files);
       if (p4Targets.length) {
         try {
@@ -911,7 +963,7 @@ export class Worker {
         bug,
         repoName: repo.name,
         repoPath: repo.path,
-        verifyCommands: this.verificationCommands(repo),
+        verifyCommands: this.verificationCommands(repo, investigation.planned_files),
         investigation,
         retryEvidence: retryText,
         reviewerFeedback: "",
@@ -928,13 +980,11 @@ export class Worker {
       let result = await agent.run({
         prompt,
         repoDir: repo.path,
-        additionalDirs,
+        additionalDirs: implementationAdditionalDirs,
         timeoutS: this.config.agent_timeout_s,
         sandboxMode: "workspace-write",
         outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
         requiredMcpServers: resourceMcpServers,
-        maxCommandExecutions: _AGENT_COMMAND_BUDGET,
-        repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
         onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
       });
@@ -1004,12 +1054,13 @@ export class Worker {
         if (this.config.review.enabled && verificationPassed) {
           let review = await this.reviewCandidate(
             reviewer!,
+            reviewerModel,
             p4,
             bug,
             investigation,
             verified.diff,
             verified.summary,
-            additionalDirs,
+            implementationAdditionalDirs,
           );
           this.store.updateJob(bug.id, { review_findings: review });
           let fixRound = 0;
@@ -1022,7 +1073,7 @@ export class Worker {
                 bug,
                 repoName: repo.name,
                 repoPath: repo.path,
-                verifyCommands: this.verificationCommands(repo),
+                verifyCommands: this.verificationCommands(repo, investigation.planned_files),
                 investigation,
                 retryEvidence: retryText,
             reviewerFeedback: feedback,
@@ -1030,13 +1081,11 @@ export class Worker {
             workspaceRoots,
           }),
               repoDir: repo.path,
-              additionalDirs,
+              additionalDirs: implementationAdditionalDirs,
               timeoutS: this.config.agent_timeout_s,
               sandboxMode: "workspace-write",
               outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
               requiredMcpServers: resourceMcpServers,
-              maxCommandExecutions: _AGENT_COMMAND_BUDGET,
-              repeatedCommandLimit: _AGENT_REPEAT_LIMIT,
               onProgress: (msg) => this.store.addEvent(msg, "debug", bug.id),
               cancelEvent: this.cancelEvent,
             });
@@ -1066,12 +1115,13 @@ export class Worker {
             this.store.updateJob(bug.id, { verification: verified });
             review = await this.reviewCandidate(
               reviewer!,
+              reviewerModel,
               p4,
               bug,
               investigation,
               verified.diff,
               verified.summary,
-              additionalDirs,
+              implementationAdditionalDirs,
             );
             this.store.updateJob(bug.id, { review_findings: review });
           }
@@ -1331,6 +1381,51 @@ export class Worker {
       manual_assets: (lastResult?.manual_assets ?? []).map((a) => a.path),
     };
     const evidence = [...this.retryEvidenceEntries(bug.id), entry].slice(-_MAX_EVIDENCE_ENTRIES);
+    const reviewerInfrastructureFailure = /Reviewer 异常退出/.test(reason);
+    const preservableCandidateFailure = /测试未通过|独立代码评审未通过|Reviewer 异常退出/.test(reason);
+
+    // Agent 已经产出代码，但最终一次仅因机器验证/评审失败时，把改动安全地
+    // 移入编号 changelist 等待人工检查。不能让它们继续留在 default，阻塞
+    // 后续所有 Bug；也不能直接 revert 丢掉可能有效的修复。
+    if ((reviewerInfrastructureFailure || (!willRetry && preservableCandidateFailure))
+        && p4 && openedFiles.length
+        && lastResult && hasCodeChanges(lastResult)) {
+      try {
+        const desc = buildDescription(bug, lastResult, reason, [
+          "自动修复已产出代码，但机器验证或评审未通过",
+          "本 changelist 仅用于保留候选改动，请人工检查后决定修改、提交或 revert",
+        ]);
+        const cl = await p4.createPending(desc, openedFiles);
+        this.store.updateJob(bug.id, {
+          agent_state: "manual_review",
+          changelist: cl,
+          files: dumps(openedFiles),
+          failure_reason: reason,
+          attempts,
+          retry_evidence: dumps(evidence),
+          last_attempt_files: null,
+          finished_at: nowStr(),
+        });
+        this.store.addEvent(
+          `机器验证/评审未通过，但已保留候选改动到 pending changelist ${cl}，等待人工检查`,
+          "warn",
+          bug.id,
+        );
+        try {
+          await this.tapd(this.workspaceOf(bug)).addComment(
+            bug.id,
+            `[TapdBugFixAgent] 已产出候选代码，但机器验证或评审未通过。\n` +
+              `Perforce pending changelist: ${cl}（请人工检查后决定修改、提交或 revert）\n` +
+              `失败原因: ${reason}`,
+          );
+        } catch (commentError) {
+          this.store.addEvent(`回写候选保留评论出错: ${commentError}`, "error", bug.id);
+        }
+        return;
+      } catch (preserveError) {
+        this.store.addEvent(`保留失败候选到 pending changelist 失败: ${preserveError}`, "error", bug.id);
+      }
+    }
 
     this.store.updateJob(bug.id, {
       agent_state: willRetry ? "pending" : "failed",
@@ -1515,38 +1610,44 @@ export class Worker {
     return failed.length;
   }
 
-  /** 清空任务状态与事件并从 Tapd 强制重新同步（人工质量反馈保留）。
+  /** 清空可重试任务并从 Tapd 强制重新同步（候选产物、changelist 关联和人工质量反馈保留）。
    *  - 仅非运行状态可用（web 按钮已按控制态禁用；此处是后端的同一道闸，
    *    拦住绕过 UI 直调 API 的情况）
-   *  - 本地 jobs/events 全删；Tapd 缓存作废后立即重拉最新列表
+   *  - failed/pending/blocked 等可重试记录清除；已产出候选或已有人工结论的记录保留
    *  - 拉到的每个 bug 落一条 pending job（排除 Tapd 侧终态），worker 从头按优先级处理
-   *  返回 (清除的旧记录数, 新同步到的 bug 数)。p4 上已生成的 pending changelist
-   *  是服务器侧对象，不受影响；但本地与之关联的 changelist 号/描述记录会一并清掉。 */
-  async resyncFromTapd(): Promise<{ cleared: number; synced: number }> {
+   *  返回清除、保留和同步数量。 */
+  async resyncFromTapd(): Promise<{ cleared: number; preserved: number; synced: number }> {
     if (this.state === "running") {
       throw new Error("运行中不可清除同步：请先停止自动处理（⏹ 关闭）");
     }
     if (this.currentBugId !== null) {
       throw new Error(`当前 bug ${this.currentBugId} 仍在停止中，请等待其退出后再清除同步`);
     }
-    const cleared = this.store.deleteAllJobs();
+    const { cleared, preserved } = this.store.deleteRetryableJobs(_RESYNC_PRESERVED_STATES);
     this.resetTapdClients(); // 清缓存 + 断开旧 MCP 连接，强制下一次真实拉取
     this.lastFetch = 0;
     this.lastFetchResult = null;
+    this.lastFetchReliable = true;
 
     const bugs = await this.fetchMyBugs(); // 缓存已作废，这里是真实重拉
     let synced = 0;
     for (const bug of bugs) {
       if (this.config.exclude_status.includes(bug.status)) continue;
+      const existing = this.store.getJob(bug.id);
+      if (existing && _RESYNC_PRESERVED_STATES.includes(String(existing.agent_state))) {
+        synced += 1;
+        continue;
+      }
       this.store.upsertJob(bug, { agent_state: "pending" });
       synced += 1;
     }
     this.store.addEvent(
-      `人工清除并重新同步：清空 ${cleared} 条本地记录，从 Tapd 同步到 ${synced} 个 bug（已重置为待处理）`,
+      `人工重新同步：清空 ${cleared} 条可重试记录，保留 ${preserved} 条候选/人工结论，` +
+        `从 Tapd 同步到 ${synced} 个 bug`,
       "warn",
     );
     this.wake(); // 立即唤醒工作循环（若有正在 sleep 的轮询）
-    return { cleared, synced };
+    return { cleared, preserved, synced };
   }
 
   async skipBug(bugId: string): Promise<boolean> {

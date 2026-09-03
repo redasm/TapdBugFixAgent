@@ -182,7 +182,7 @@
     <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
     <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
     <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
-    <button id="btnResync" class="danger" title="停止自动处理并等待当前任务退出后，清空本地任务状态与事件日志（人工质量反馈保留），再从 Tapd 重新拉取最新 bug 列表。p4 上已生成的 pending changelist 不受影响">⟳ 清除并重新同步</button>
+    <button id="btnResync" class="danger" title="停止自动处理并等待当前任务退出后，保留候选产物、changelist 关联和人工结论，仅清除可重试状态，再从 Tapd 重新拉取最新 bug 列表">⟳ 重新同步待处理</button>
   </div>
 </header>
 
@@ -353,6 +353,7 @@ let TOKEN = new URLSearchParams(location.search).get('token') || localStorage.ge
 let SNAPSHOT = { status: { control:'stopped', counts:{} }, items: [], current_detail: null };
 let SELECTED_ID = null;
 let AGENT_PIN = true;   // Agent 输出区是否跟随最新输出（用户手动上翻时暂停跟随）
+let FEEDBACK_EDITING = false; // 从 pointerdown 起锁住详情 DOM，消除点击控件与 SSE 刷新的竞态
 
 function authHeaders() {
   const h = { 'Content-Type': 'application/json' };
@@ -484,7 +485,7 @@ function renderStatus() {
     ? '运行中不可用：请先「⏹ 关闭」停止自动处理，再清除并重新同步'
     : stopping
       ? `当前 bug ${st.current_bug} 仍在停止中，请等待其退出后再清除同步`
-    : '清空本地任务状态与事件日志（人工质量反馈保留），并从 Tapd 重新拉取最新 bug 列表重置为待处理。p4 上已生成的 pending changelist 不受影响';
+    : '保留候选产物、changelist 关联和人工结论，仅清除可重试状态并从 Tapd 重新拉取最新 bug 列表';
 }
 
 function filtered() {
@@ -577,8 +578,53 @@ function renderAgentPane() {
   if (AGENT_PIN) prog.scrollTop = prog.scrollHeight;
 }
 
+/** 详情区实时刷新不能替换正在操作的人工结论控件，否则原生 select 会立即收起。 */
+function isFeedbackEditor(el) {
+  const form = document.querySelector('[data-qa="qa:feedback.form"]');
+  return !!el && !!form && form.contains(el)
+    && ['SELECT', 'INPUT', 'TEXTAREA'].includes(el.tagName);
+}
+
+function feedbackEditorActive() {
+  return FEEDBACK_EDITING || isFeedbackEditor(document.activeElement);
+}
+
+// pointerdown 早于浏览器设置 activeElement；在这一阶段先加锁，避免恰逢 SSE 时控件被替换。
+$('detailBody').addEventListener('pointerdown', e => {
+  FEEDBACK_EDITING = isFeedbackEditor(e.target);
+}, true);
+$('detailBody').addEventListener('focusin', e => {
+  if (isFeedbackEditor(e.target)) FEEDBACK_EDITING = true;
+});
+$('detailBody').addEventListener('focusout', () => {
+  setTimeout(() => { FEEDBACK_EDITING = isFeedbackEditor(document.activeElement); }, 0);
+});
+
+function feedbackDraft() {
+  const outcome = $('feedbackOutcome');
+  if (!outcome) return null;
+  return {
+    outcome: outcome.value,
+    lines: $('feedbackLines')?.value ?? '0',
+    changelist: $('feedbackCl')?.value ?? '',
+    reason: $('feedbackReason')?.value ?? '',
+  };
+}
+
+function restoreFeedbackDraft(draft) {
+  if (!draft || !$('feedbackOutcome')) return;
+  $('feedbackOutcome').value = draft.outcome;
+  $('feedbackLines').value = draft.lines;
+  $('feedbackCl').value = draft.changelist;
+  $('feedbackReason').value = draft.reason;
+}
+
 function renderDetail(job) {
-  SELECTED_ID = String(job.bug_id);
+  const nextId = String(job.bug_id);
+  const sameJob = SELECTED_ID === nextId;
+  if (sameJob && feedbackEditorActive()) return;
+  const draft = sameJob ? feedbackDraft() : null;
+  SELECTED_ID = nextId;
   // 容错解析：历史脏数据里可能存字面字符串 "null"（JSON.parse 得 null），
   // 或任意 JSON；一律兜底为空数组，避免 .length 崩溃。
   const parseArr = (raw, def = []) => { try { const v = JSON.parse(raw || '[]'); return Array.isArray(v) ? v : def; } catch (e) { return def; } };
@@ -695,13 +741,14 @@ function renderDetail(job) {
       <ul class="events">${(job.events || []).map(e => `<li>${escapeHtml(e.ts)} [${escapeHtml(e.level)}] ${escapeHtml(e.msg)}</li>`).join('') || '<li>无</li>'}</ul>
     </div>`;
   $('detailBody').innerHTML = html;
+  restoreFeedbackDraft(draft);
   openDrawer();
   renderList();
 }
 
 // ---------- 抽屉 ----------
 function openDrawer() { $('drawer').classList.remove('closed'); }
-function closeDrawer() { $('drawer').classList.add('closed'); SELECTED_ID = null; renderList(); }
+function closeDrawer() { $('drawer').classList.add('closed'); SELECTED_ID = null; FEEDBACK_EDITING = false; renderList(); }
 
 async function selectBug(id) {
   const job = await api('/api/bugs/' + id);
@@ -817,7 +864,7 @@ $('btnRetryFailed').onclick = async () => {
   }
 };
 
-// 清除并重新同步：本地记录全清（含终态历史与事件日志），从 Tapd 拉最新列表重置为待处理。
+// 重新同步：保留候选产物/changelist/人工结论，仅清除可重试记录并从 Tapd 拉最新列表。
 // 仅非运行状态可用（renderStatus 已按控制态禁用；此处再守一道，防 SSE 快照延迟的竞态）
 $('btnResync').onclick = async () => {
   const st0 = SNAPSHOT.status || {};
@@ -830,11 +877,10 @@ $('btnResync').onclick = async () => {
   const st = SNAPSHOT.status || {};
   const counts = st.counts || {};
   if (!confirm(
-    `确定清除本地任务状态并从 Tapd 重新同步？\n` +
-    `· 将清空 ${st.jobs_total ?? '?'} 条任务记录（含待人工确认 ${counts.review_pending ?? 0} / 失败 ${counts.failed ?? 0} / 跳过 ${counts.skipped ?? 0} 的历史与全部事件日志，不可恢复）\n` +
-    `· 人工质量反馈及其统计指标会保留\n` +
-    `· 清空后立即从 Tapd 拉取最新「分配给我」的 bug 列表，全部重置为待处理；点「▶ 开启」后会从头按优先级重新处理\n` +
-    `· p4 上已生成的 pending changelist 不受影响，但其关联记录会被清除`
+    `确定保留候选产物并重新同步待处理任务？\n` +
+    `· 候选补丁、pending changelist 关联和人工结论会保留\n` +
+    `· 失败、阻塞、待处理等可重试记录会清除并从 Tapd 重新同步\n` +
+    `· 人工质量反馈及其统计指标会保留`
   )) return;
   const btn = $('btnResync');
   btn.disabled = true;
@@ -844,12 +890,12 @@ $('btnResync').onclick = async () => {
     if (r) {
       closeDrawer();
       $('fState').value = 'all';
-      toast(`已清除 ${r.cleared} 条本地记录，从 Tapd 同步到 ${r.synced} 个 bug（待处理）`);
+      toast(`已清除 ${r.cleared} 条可重试记录，保留 ${r.preserved || 0} 条候选/人工结论，同步 ${r.synced} 个 bug`);
       refresh();
     }
   } finally {
     btn.disabled = false;
-    btn.textContent = '⟳ 清除并重新同步';
+    btn.textContent = '⟳ 重新同步待处理';
   }
 };
 
@@ -876,7 +922,10 @@ function connectSSE() {
       renderAgentPane();
       // 实时刷新选中 bug 详情（含 Agent 进度事件）
       if (SELECTED_ID) {
-        api('/api/bugs/' + SELECTED_ID).then(j => { if (j) renderDetail(j); });
+        const selectedId = SELECTED_ID;
+        api('/api/bugs/' + selectedId).then(j => {
+          if (j && SELECTED_ID === selectedId) renderDetail(j);
+        });
       }
     } catch (err) { console.error(err); }
   });
