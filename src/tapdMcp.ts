@@ -19,8 +19,15 @@ import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { bugFromDict } from "./models.js";
 import type { Bug } from "./models.js";
 import { TapdError } from "./tapd.js";
+import {
+  extractTapdMediaReferences,
+  type AgentMediaInput,
+  type TapdMediaReference,
+} from "./media.js";
 
 const _BUG_HINTS = ["bug", "defect", "缺陷", "bugtrace", "bug_trace"];
+const MCP_CONNECT_TIMEOUT_MS = 20_000;
+const MEDIA_TOOL_TIMEOUT_MS = 15_000;
 
 // 已确认的官方 mcp-server-tapd / @xihe-lab/tapd-mcp-server 工具名（可被 config 覆盖）
 const _DEFAULT_TOOL_MAP: Record<string, string> = {
@@ -28,6 +35,9 @@ const _DEFAULT_TOOL_MAP: Record<string, string> = {
   get_bug: "tapd_get_bugs", // 传 id 取单个
   update_bug: "tapd_update_bug",
   add_comment: "tapd_create_comment", // 注意内容参数是 description
+  get_attachments: "tapd_get_attachments",
+  get_attachment_download_url: "tapd_get_attachment_download_url",
+  get_image_url: "tapd_get_image_url",
 };
 
 const _OP_VERBS: Record<string, string[]> = {
@@ -37,7 +47,56 @@ const _OP_VERBS: Record<string, string[]> = {
   add_comment: ["add", "create", "comment", "新增", "添加", "评论", "创建"],
 };
 
-const _TOOL_MAP_KEYS = ["list_bugs", "get_bug", "update_bug", "add_comment"] as const;
+const _TOOL_MAP_KEYS = [
+  "list_bugs", "get_bug", "update_bug", "add_comment",
+  "get_attachments", "get_attachment_download_url", "get_image_url",
+] as const;
+
+function firstHttpUrl(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return /https?:\/\/[^\s<>"']+/i.exec(value)?.[0]?.replace(/[),.;，。；]+$/g, "");
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = firstHttpUrl(item);
+      if (found) return found;
+    }
+  } else if (value && typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      const found = firstHttpUrl(item);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function attachmentReferences(value: unknown): TapdMediaReference[] {
+  const rows = extractList(value) ?? (Array.isArray(value) ? value : []);
+  const refs: TapdMediaReference[] = [];
+  for (const item of rows) {
+    if (!item || typeof item !== "object") continue;
+    const raw = item as Record<string, unknown>;
+    const nested = Object.values(raw).find((value) => value && typeof value === "object" && !Array.isArray(value));
+    const data = (nested && !("id" in raw) ? nested : raw) as Record<string, unknown>;
+    const name = String(data.filename ?? data.file_name ?? data.name ?? "").trim();
+    const mime = String(data.mime_type ?? data.content_type ?? "").trim();
+    const source = String(data.download_url ?? data.url ?? data.path ?? "").trim();
+    const probe = `${name} ${source} ${mime}`;
+    const kind = /(?:^|\s)image\//i.test(probe) || /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)(?:$|[?#\s])/i.test(probe)
+      ? "image"
+      : /(?:^|\s)video\//i.test(probe) || /\.(?:avi|m4v|mkv|mov|mp4|mpeg|mpg|webm)(?:$|[?#\s])/i.test(probe)
+        ? "video"
+        : undefined;
+    if (!kind) continue;
+    refs.push({
+      kind,
+      url: source,
+      name: name || undefined,
+      attachmentId: String(data.id ?? data.attachment_id ?? data.file_id ?? "").trim() || undefined,
+    });
+  }
+  return refs;
+}
 
 function lower(text: unknown): string {
   return String(text ?? "").toLowerCase();
@@ -232,21 +291,31 @@ export class TapdMcpClient {
   private async doConnect(): Promise<void> {
     const transport = this.makeTransport();
     const client = new Client({ name: "tapd-bugfix-agent", version: "0.2.0" });
-    await client.connect(transport);
-    const result = await client.listTools();
+    await client.connect(transport, {
+      timeout: MCP_CONNECT_TIMEOUT_MS,
+      maxTotalTimeout: MCP_CONNECT_TIMEOUT_MS,
+    });
+    const result = await client.listTools(undefined, {
+      timeout: MCP_CONNECT_TIMEOUT_MS,
+      maxTotalTimeout: MCP_CONNECT_TIMEOUT_MS,
+    });
     this.tools = {};
     for (const t of result.tools ?? []) this.tools[t.name] = t;
     this.client = client;
   }
 
-  private async call(name: string, arguments_: Record<string, unknown>, timeoutMs = 120000): Promise<{ text: string; data: unknown; isError: boolean }> {
+  private async call(
+    name: string,
+    arguments_: Record<string, unknown>,
+    timeoutMs = 120000,
+    signal?: AbortSignal,
+  ): Promise<{ text: string; data: unknown; isError: boolean }> {
     await this.connect();
-    const result = await Promise.race([
-      this.client!.callTool({ name, arguments: arguments_ }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new TapdError(`调用 MCP 工具 ${name} 超时(${Math.round(timeoutMs / 1000)}s)`)), timeoutMs),
-      ),
-    ]);
+    const result = await this.client!.callTool(
+      { name, arguments: arguments_ },
+      undefined,
+      { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal },
+    );
     return normalizeToolResult(result);
   }
 
@@ -379,6 +448,79 @@ export class TapdMcpClient {
       workspaceId: this.workspaceId,
     };
     return this.call(name, this.filterArgs(name, kwargs));
+  }
+
+  async resolveMediaInputs(bug: Bug, options: { signal?: AbortSignal } = {}): Promise<AgentMediaInput[]> {
+    await this.connect();
+    const refs = extractTapdMediaReferences(bug);
+    const listTool = this.tools[this.toolMap.get_attachments]
+      ? this.toolMap.get_attachments
+      : undefined;
+    if (listTool) {
+      try {
+        const result = await this.call(listTool, this.filterArgs(listTool, {
+          workspace_id: this.workspaceId,
+          entity_id: bug.id,
+          entity_type: "bug",
+          limit: 200,
+          page: 1,
+        }), MEDIA_TOOL_TIMEOUT_MS, options.signal);
+        if (!result.isError) refs.push(...attachmentReferences(result.data ?? result.text));
+      } catch {
+        // 附件列表权限或网络异常时，仍继续处理描述 HTML 中已有的媒体 URL。
+      }
+    }
+
+    const resolveOne = async (ref: TapdMediaReference): Promise<AgentMediaInput | undefined> => {
+      let url = ref.url;
+      try {
+        if (ref.attachmentId && this.tools[this.toolMap.get_attachment_download_url]) {
+          const tool = this.toolMap.get_attachment_download_url;
+          const result = await this.call(tool, this.filterArgs(tool, {
+            workspace_id: this.workspaceId,
+            id: ref.attachmentId,
+            filename: ref.name ?? "",
+          }), MEDIA_TOOL_TIMEOUT_MS, options.signal);
+          if (!result.isError) url = firstHttpUrl(result.data) ?? firstHttpUrl(result.text) ?? url;
+        } else {
+          let imagePath = "";
+          try {
+            const parsed = /^https?:\/\//i.test(url) ? new URL(url) : undefined;
+            imagePath = parsed?.pathname.startsWith("/tfl/")
+              ? `${parsed.pathname}${parsed.search}`
+              : url.startsWith("/tfl/") ? url : "";
+          } catch {
+            imagePath = url.startsWith("/tfl/") ? url : "";
+          }
+          if (ref.kind === "image" && imagePath && this.tools[this.toolMap.get_image_url]) {
+            const tool = this.toolMap.get_image_url;
+            const result = await this.call(tool, this.filterArgs(tool, {
+              workspace_id: this.workspaceId,
+              image_path: imagePath,
+            }), MEDIA_TOOL_TIMEOUT_MS, options.signal);
+            if (!result.isError) url = firstHttpUrl(result.data) ?? firstHttpUrl(result.text) ?? url;
+          }
+        }
+      } catch {
+        // 单个媒体解析失败不阻断 Bug；保留已有绝对 URL 作为文本/多模态降级输入。
+      }
+      if (!/^https?:\/\//i.test(url)) return undefined;
+      return { kind: ref.kind, url, name: ref.name };
+    };
+
+    // 临时 URL 相互独立，并行解析，避免 N 个附件把等待时间放大成 N * 单次超时。
+    const candidates = await Promise.all(refs.slice(0, 20).map(resolveOne));
+    const resolved: AgentMediaInput[] = [];
+    const seen = new Set<string>();
+    for (const item of candidates) {
+      if (!item) continue;
+      const { kind, url } = item;
+      const key = `${kind}\0${url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      resolved.push(item);
+    }
+    return resolved.slice(0, 20);
   }
 
   // ---------- 调试 ----------

@@ -9,6 +9,7 @@ import { bugFromDict } from "./models.js";
 import type { Bug } from "./models.js";
 import type { Config } from "./config.js";
 import { TapdMcpClient } from "./tapdMcp.js";
+import { extractTapdMediaReferences, type AgentMediaInput } from "./media.js";
 
 const BASE_URL = "https://api.tapd.cn";
 const PAGE_SIZE = 200;
@@ -23,6 +24,7 @@ export interface TapdBackend {
   getBug(bugId: string): Promise<Bug>;
   updateBug(bugId: string, fields: Record<string, unknown>): Promise<unknown>;
   addComment(bugId: string, content: string): Promise<unknown>;
+  resolveMediaInputs?(bug: Bug, options?: { signal?: AbortSignal }): Promise<AgentMediaInput[]>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -138,6 +140,12 @@ export class TapdClient implements TapdBackend {
       entry_id: bugId,
       content,
     });
+  }
+
+  async resolveMediaInputs(bug: Bug): Promise<AgentMediaInput[]> {
+    return extractTapdMediaReferences(bug)
+      .filter((item) => /^https?:\/\//i.test(item.url))
+      .map(({ kind, url, name }) => ({ kind, url, name }));
   }
 }
 

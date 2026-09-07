@@ -52,7 +52,7 @@ pi:
     model_id: "claude-opus-4-8"                       # 模型 id，构造 `--model custom/claude-opus-4-8`
     # reasoning: true                                 # 可选，默认 true
     # context_window: 200000                          # 可选，默认 200000
-    # max_tokens: 32000                               # 可选，默认 32000
+    # max_tokens: 32000                               # 可选，默认 32000；最大 131072
     # 说明：删掉 provider 段不会自动清掉 models.json 里已写入的项，想还原请手动删 ~/.pi/agent/models.json 对应条目。
   # 团队共享 skill 目录：pi 默认只认 <仓库>/.pi/skills，这里把仓库里的团队目录也挂给 pi。
   # 不配置时默认尝试仓库下的 .agents/skills （存在才挂载，--skill 可重复传）。
@@ -136,7 +136,7 @@ mcp_servers:
       - outline_doc
       - find_nodes
       - read_subtree
-    automates_manual_keywords: [场景, 关卡, 蓝图, actor, datatable]
+    automates_manual_keywords: [蓝图, actor, datatable, uasset, umap, 场景资源, 关卡资源]
     startup_timeout_sec: 20
     tool_timeout_sec: 60
 

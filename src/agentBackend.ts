@@ -29,8 +29,16 @@ export function effectiveAgentModel(
 export function effectiveReviewModel(config: Config, backend: AgentBackend): string {
   const configured = config.review.model.trim();
   if (!configured) return effectiveAgentModel(config, backend);
-  if (backend === "codex" || configured.includes("/")) return configured;
   const providerId = config.pi.provider?.id?.trim();
+  if (backend === "codex") {
+    // review.model 是跨 Pi/Codex 共用配置。Pi 使用 provider/model，Codex 自定义网关
+    // 通常只接受裸模型 id；切换主后端时不能把 Pi provider 前缀原样传给 Codex。
+    const piPrefix = providerId ? `${providerId}/` : "";
+    return piPrefix && configured.startsWith(piPrefix)
+      ? configured.slice(piPrefix.length)
+      : configured;
+  }
+  if (configured.includes("/")) return configured;
   return providerId ? `${providerId}/${configured}` : configured;
 }
 

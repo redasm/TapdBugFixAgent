@@ -27,14 +27,18 @@ import { VerificationError, checkAndPrepareP4, p4ReconcileTargets } from "../src
 import {
   AgentCancelledError,
   AgentInfrastructureError,
+  AgentInvestigationLimitError,
   AgentRuntimeError,
   AgentTimeoutError,
   CancelEvent,
+  WriteProgressGuard,
+  isFileWriteToolCall,
   PiAgent,
   effectivePiModel,
   ensurePiModels,
   extractFinalJson,
   extractFinalText,
+  extractPiProviderError,
   formatRetryEvidence,
   progressFromLine,
   resultFromOutput,
@@ -439,6 +443,19 @@ describe("Agent 后端选择", () => {
     expect(effectiveReviewModel(cfg, "pi")).toBe("other/model");
   });
 
+  it("Codex Reviewer 会移除共用配置里的 Pi provider 前缀", () => {
+    const cfg = makeConfig();
+    cfg.pi.provider = {
+      id: "custom",
+      base_url: "https://gateway.example.com",
+      model_id: "glm-test",
+    };
+    cfg.review.model = "custom/gpt-test";
+    expect(effectiveReviewModel(cfg, "codex")).toBe("gpt-test");
+    cfg.review.model = "other/gpt-test";
+    expect(effectiveReviewModel(cfg, "codex")).toBe("other/gpt-test");
+  });
+
   it("Codex 事件转换为可读进度", () => {
     const progress = progressFromCodexEvent({
       type: "item.completed",
@@ -568,6 +585,36 @@ describe("Agent 后端选择", () => {
     budget.observe("one");
     budget.observe("two");
     expect(() => budget.observe("three")).toThrow(/超过预算 2 次/);
+  });
+
+  it("实施阶段连续只读调用会在首次写入前熔断", () => {
+    const guard = new WriteProgressGuard(2);
+    expect(guard.hasWritten).toBe(false);
+    guard.observeTool("read", { path: "a.ts" });
+    guard.observeTool("grep", { pattern: "Foo" });
+    expect(() => guard.observeTool("read", { path: "b.ts" })).toThrow(/仍未修改文件/);
+  });
+
+  it("真实编辑解除首次落笔熔断，但 p4 edit 不算内容修改", () => {
+    expect(isFileWriteToolCall("Bash", { command: "p4 edit Source/Foo.cpp" })).toBe(false);
+    expect(isFileWriteToolCall("apply_patch", { patch: "..." })).toBe(true);
+    expect(isFileWriteToolCall("filesystem_write_file", { path: "a.ts" })).toBe(true);
+    expect(isFileWriteToolCall("update_plan", { plan: [] })).toBe(false);
+    expect(isFileWriteToolCall("Bash", { command: "apply_patch < fix.patch" })).toBe(true);
+    expect(isFileWriteToolCall("Bash", { command: "Set-Content a.ts fixed" })).toBe(true);
+    expect(isFileWriteToolCall("Bash", { command: "rg Foo Source 2>&1" })).toBe(false);
+    expect(isFileWriteToolCall("Bash", { command: "rg Foo Source >/dev/null 2>&1" })).toBe(false);
+    expect(isFileWriteToolCall("Bash", { command: "rg Foo Source >NUL 2>&1" })).toBe(false);
+
+    const guard = new WriteProgressGuard(2);
+    guard.observeTool("read", { path: "a.ts" });
+    guard.observeTool("Bash", { command: "p4 edit Source/Foo.cpp" });
+    expect(guard.hasWritten).toBe(false);
+    guard.observeTool("Edit", { path: "a.ts" });
+    expect(guard.hasWritten).toBe(true);
+    guard.observeTool("read", { path: "a.ts" });
+    guard.observeTool("read", { path: "b.ts" });
+    expect(() => guard.observeTool("read", { path: "c.ts" })).toThrow(/仍未修改文件/);
   });
 
   it("自定义 Codex 网关不自动套用 GPT 模型目录", () => {
@@ -1243,6 +1290,39 @@ describe("p4", () => {
     expect(calls).toBe(3);
   });
 
+  it("取消后的结束清点客户端不继承取消信号，并保留 P4 环境与忽略规则", async () => {
+    const cancel = new CancelEvent();
+    cancel.set();
+    const client = new P4Client(
+      "C:\\tmp",
+      { client: "test-client", port: "ssl:test:1666" },
+      undefined,
+      cancel,
+      ["Config/"],
+    );
+    const cleanup = client.forkForCleanup();
+    const run = vi.spyOn(P4Client.prototype, "run").mockImplementation(async function () {
+      const signal = (this as unknown as { cancelSignal?: { cancelled: boolean } }).cancelSignal;
+      if (signal?.cancelled) throw new P4CancelledError("人工取消 P4");
+      return [
+        "//depot/Config/Generated.ini#1 - edit default change (text)",
+        "//depot/Fix.ts#2 - edit default change (text)",
+      ].join("\n");
+    });
+
+    await expect(client.opened("default", true)).rejects.toBeInstanceOf(P4CancelledError);
+    await expect(cleanup.opened("default", true)).resolves.toEqual([{
+      depot: "//depot/Fix.ts",
+      action: "edit",
+      changelist: "default",
+      type: "text",
+    }]);
+    expect(cleanup.path).toBe(client.path);
+    expect(cleanup.env.P4CLIENT).toBe("test-client");
+    expect(cleanup.env.P4PORT).toBe("ssl:test:1666");
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
   it("diff 连接失败时单次降级，不重试也不中断已完成修复", async () => {
     const client = new P4Client("C:\\tmp", { client: "test-client" });
     let calls = 0;
@@ -1588,6 +1668,45 @@ describe("agent parsing", () => {
     expect(extractFinalText(lines)).toBe("修复完成");
   });
 
+  it("Pi provider 报错时不从 user prompt 回显解析 FINAL_RESULT 示例", () => {
+    const prompt = 'FINAL_RESULT: {"root_cause":"根因","planned_files":["project:相对路径"]}';
+    const lines = [
+      JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: prompt }] } }),
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Connection error." },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: [{ type: "text", text: prompt }] },
+          { role: "assistant", content: [], stopReason: "error", errorMessage: "Connection error." },
+        ],
+      }),
+    ];
+
+    expect(extractFinalText(lines)).toBe("");
+    expect(extractPiProviderError(lines)).toBe("Connection error.");
+    expect(resultFromOutput(extractFinalText(lines), 1).changed_files).toEqual([]);
+  });
+
+  it("Pi provider 自动重试后成功时忽略早先的错误事件", () => {
+    const lines = [
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "temporary" }],
+      }),
+      JSON.stringify({ type: "auto_retry_start", attempt: 1, errorMessage: "temporary" }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }],
+      }),
+    ];
+
+    expect(extractPiProviderError(lines)).toBeUndefined();
+    expect(extractFinalText(lines)).toBe("ok");
+  });
+
   it("progress_from_tool_execution_start", () => {
     const line = JSON.stringify({ type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } });
     const msg = progressFromLine(line);
@@ -1639,6 +1758,25 @@ function withFakePiOnPath(dir: string, fn: () => Promise<void>): Promise<void> {
 }
 
 describe("PiAgent 子进程控制", () => {
+  it("Pi 进程 exit=0 但 provider stopReason=error 时按基础设施失败处理", async () => {
+    const d = tmpdir();
+    const script = path.join(d, "provider-error.cjs");
+    fs.writeFileSync(script, `console.log(JSON.stringify({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: [{ type: "text", text: 'FINAL_RESULT: {"root_cause":"根因"}' }] },
+        { role: "assistant", content: [], stopReason: "error", errorMessage: "max_tokens 参数非法" },
+      ],
+    }));`);
+    writeFakePi(d, `node "${script}"`);
+    const agent = new PiAgent(makeConfig());
+
+    await withFakePiOnPath(d, async () => {
+      await expect(agent.run({ prompt: "x", repoDir: d, timeoutS: 60 }))
+        .rejects.toThrow(/max_tokens 参数非法/);
+    });
+  });
+
   it("只读调查统一挂载所有 Pi MCP 并限制为各自只读工具", async () => {
     const d = tmpdir();
     writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
@@ -1672,6 +1810,32 @@ describe("PiAgent 子进程控制", () => {
     expect(args).toContain("unreal_mcp_ping");
     expect(args).toContain("prefab_mcp2_lgui_ping");
     expect(args).not.toContain("unreal_mcp_execute_python");
+  });
+
+  it("显式传空 MCP 列表时不向普通代码 Bug 注入任何 MCP", async () => {
+    const d = tmpdir();
+    writeFakePi(d, "echo %* > args.txt & node -e \"console.log('done')\"");
+    const cfg = makeConfig();
+    cfg.mcp_servers = parseMcpServers({
+      chrome_devtools: { command: "node", cwd: "{repo}", read_only_tools: ["list_pages"] },
+      unreal_mcp: { command: "python", cwd: "{repo}", read_only_tools: ["ping"] },
+    });
+    const agent = new PiAgent(cfg);
+    await withFakePiOnPath(d, async () => {
+      await agent.run({
+        prompt: "x",
+        repoDir: d,
+        timeoutS: 60,
+        tools: ["read", "grep"],
+        sandboxMode: "read-only",
+        requiredMcpServers: [],
+      });
+    });
+
+    const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
+    expect(args).not.toContain("--extension");
+    expect(args).not.toContain("chrome_devtools_list_pages");
+    expect(args).not.toContain("unreal_mcp_ping");
   });
 
   it("只读阶段通过 --tools 限制为代码浏览工具，并可覆盖评审模型", async () => {
@@ -2354,6 +2518,35 @@ describe("worker 控制与取消", () => {
     expect(ev.some((e) => String(e.msg).includes("对账"))).toBe(true);
   });
 
+  it("进程启动对账：旧版本因 Agent 超时或工具预算误标的 needs_info 恢复为 pending", () => {
+    const w = makeWorker();
+    const timedOut = makeBug({ id: "1123456780001254290" });
+    const trulyBlocked = makeBug({ id: "1123456780001254291" });
+    const limited = makeBug({ id: "1123456780001254292" });
+    w.store.upsertJob(timedOut, {
+      agent_state: "needs_info",
+      failure_reason: "Agent 调用超时(1800s): pi",
+      finished_at: "2026-09-03 21:00:00",
+    });
+    w.store.upsertJob(trulyBlocked, {
+      agent_state: "needs_info",
+      failure_reason: "只读 Agent 明确无法定位问题",
+    });
+    w.store.upsertJob(limited, {
+      agent_state: "needs_info",
+      failure_reason: "Agent 命令调用超过预算 80 次，已停止继续执行",
+      finished_at: "2026-09-04 19:09:28",
+    });
+
+    (w as unknown as { reconcileStaleInProgress(): void }).reconcileStaleInProgress();
+
+    expect(w.store.getJob(timedOut.id)?.agent_state).toBe("pending");
+    expect(w.store.getJob(timedOut.id)?.failure_reason).toBeNull();
+    expect(w.store.getJob(trulyBlocked.id)?.agent_state).toBe("needs_info");
+    expect(w.store.getJob(limited.id)?.agent_state).toBe("pending");
+    expect(w.store.getJob(limited.id)?.failure_reason).toBeNull();
+  });
+
   it("agent 被取消时 bug 回到 pending，不算失败", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
@@ -2473,6 +2666,20 @@ describe("formatRetryEvidence", () => {
     expect(text).toContain("改了登录逻辑");
     expect(text).toContain("Assets/ui.prefab");
     expect(text).toContain("重新开始");
+  });
+
+  it("超时重试要求直接收敛，避免再次耗尽整轮预算", () => {
+    const text = formatRetryEvidence([{
+      attempt: 1,
+      at: "2026-09-04 18:11:41",
+      failure_reason: "Error: Agent 调用超时(1800s): pi",
+      opened_files: [],
+      agent_summary: "",
+      manual_assets: [],
+    }]);
+    expect(text).toContain("禁止重新从头做宽泛搜索");
+    expect(text).toContain("立即实施 planned_files 内的最小修改");
+    expect(text).toContain("blocked_reasons");
   });
 });
 
@@ -2807,7 +3014,7 @@ describe("worker 两阶段修复协议", () => {
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });
 
-  it("调查补充轮仍不完整时转 needs_info 且不消耗 Bug 重试", async () => {
+  it("调查补充轮仍不完整时自动重试，不误标 needs_info", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
@@ -2822,8 +3029,8 @@ describe("worker 两阶段修复协议", () => {
 
     expect(run).toHaveBeenCalledTimes(2);
     const job = w.store.getJob(bug.id);
-    expect(job?.agent_state).toBe("needs_info");
-    expect(Number(job?.attempts ?? 0)).toBe(0);
+    expect(job?.agent_state).toBe("pending");
+    expect(Number(job?.attempts ?? 0)).toBe(1);
     expect(String(job?.failure_reason)).toContain("调查结果缺少 root_cause");
   });
 
@@ -2897,16 +3104,103 @@ describe("worker 两阶段修复协议", () => {
 
     expect(piRun).not.toHaveBeenCalled();
     expect(calls.map((call) => call.sandboxMode)).toEqual(["read-only", "workspace-write"]);
-    expect(calls.map((call) => call.timeoutS)).toEqual([1800, 1800]);
-    expect(calls[0].maxCommandExecutions).toBeUndefined();
-    expect(calls[0].repeatedCommandLimit).toBeUndefined();
+    expect(calls.map((call) => call.timeoutS)).toEqual([600, 1800]);
+    expect(calls[0].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
+    expect(calls[0].repeatedCommandLimit).toBe(3);
+    expect(calls[0].maxReadOnlyExecutionsBeforeWrite).toBeUndefined();
+    expect(calls[0].completionGraceSeconds).toBe(30);
     expect(calls[0].outputSchema).toBeDefined();
-    expect(calls[1].maxCommandExecutions).toBeUndefined();
-    expect(calls[1].repeatedCommandLimit).toBeUndefined();
+    expect(calls[1].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
+    expect(calls[1].repeatedCommandLimit).toBe(3);
+    expect(calls[1].maxReadOnlyExecutionsBeforeWrite).toBe(Number.POSITIVE_INFINITY);
+    expect(calls[1].maxSecondsBeforeWrite).toBe(900);
     expect(calls[1].outputSchema).toBeDefined();
     expect(w.store.getJob(bug.id)?.agent).toBe("codex");
     expect(w.store.getJob(bug.id)?.model).toBe("gpt-test");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("编码阶段 900 秒未落笔时保留 1800 秒总上限，并只做一次 180 秒定向收尾", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.agent.backend = "codex";
+    w.config.agent_timeout_s = 1800;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) return makeInvestigation("Login.ts");
+      if (calls.length === 2) {
+        throw new AgentInvestigationLimitError(
+          "实施阶段 900s 内仍未产生文件写入，已停止无效停滞",
+          "已确认 Login.ts 中空值分支需要修改",
+        );
+      }
+      return makeResult({ changed_files: ["Login.ts"], summary: "定向完成修复" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    let openedCalls = 0;
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async () => {
+      openedCalls += 1;
+      return openedCalls >= 3
+        ? [{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }]
+        : [];
+    });
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(3);
+    expect(calls[1].timeoutS).toBe(1800);
+    expect(calls[1].maxSecondsBeforeWrite).toBe(900);
+    expect(calls[2].timeoutS).toBe(180);
+    expect(calls[2].maxSecondsBeforeWrite).toBe(90);
+    expect(calls[2].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
+    expect(calls[2].maxReadOnlyExecutionsBeforeWrite).toBe(Number.POSITIVE_INFINITY);
+    expect(calls[2].completionGraceSeconds).toBe(30);
+    expect(String(calls[2].prompt)).toContain("禁止重新调查整个仓库");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("编码达到预算但已有真实 diff 时继续验证并隔离到人工评审，不冒充成功", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.agent.backend = "codex";
+    w.config.agent_timeout_s = 1800;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) return makeInvestigation("Login.ts");
+      throw new AgentTimeoutError(
+        "Agent 调用超时(1800s): codex",
+        'FINAL_RESULT: {"summary":"已修改但未完成收尾","changed_files":["Login.ts"],"manual_assets":[],"blocked_reasons":[]}',
+        true,
+      );
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    let openedCalls = 0;
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async () => {
+      openedCalls += 1;
+      return openedCalls === 1
+        ? []
+        : [{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }];
+    });
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed");
+    const createPending = vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4322);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(2);
+    expect(createPending).toHaveBeenCalledWith(
+      expect.stringContaining("未能安全进入自动候选"),
+      ["//depot/Login.ts"],
+    );
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("manual_review");
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("不冒充自动修复成功");
   });
 
   it("诊断链接依赖 Chrome MCP，预检失败时阻塞且不消耗重试", async () => {
@@ -2934,7 +3228,7 @@ describe("worker 两阶段修复协议", () => {
     expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
   });
 
-  it("Agent 超时后转 needs_info 且不自动重试", async () => {
+  it("Agent 超时后强制收敛，仍失败则自动重试而不是 needs_info", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.agent.backend = "codex";
     w.config.max_attempts = 2;
@@ -2947,9 +3241,88 @@ describe("worker 两阶段修复协议", () => {
 
     await w.processBug(bug);
 
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("pending");
+    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(1);
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("超时");
+  });
+
+  it("调查达到工具预算后用已有轨迹强制收敛，不误标 needs_info", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) {
+        throw new AgentInvestigationLimitError(
+          "Agent 命令调用超过预算 48 次，已停止继续执行",
+          "已定位 MapMarkChooseView.ts 与 UIExtendToggle Hover 配置",
+        );
+      }
+      if (calls.length === 2) return makeInvestigation("project:MapMarkChooseView.ts");
+      return makeResult({ changed_files: ["project:MapMarkChooseView.ts"], summary: "修复 Hover 状态" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/MapMarkChooseView.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/MapMarkChooseView.ts\n+++ b/MapMarkChooseView.ts\n-old\n+fixed");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(3);
+    expect(String(calls[1].prompt)).toContain("调查阶段已到收敛点");
+    expect(String(calls[1].prompt)).toContain("MapMarkChooseView.ts");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("调查超时前已有结构化定位结果时直接进入修复阶段", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.agent.backend = "codex";
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) {
+        throw new AgentTimeoutError(
+          "Agent 调用超时(600s): codex",
+          makeInvestigation("Login.ts").raw_output,
+        );
+      }
+      return makeResult({ changed_files: ["Login.ts"], summary: "按超时前定位结果完成修复" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].sandboxMode).toBe("workspace-write");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("只读 Agent 明确无法从标题描述及代码定位时才转 needs_info", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(CodexAgent.prototype, "run").mockResolvedValue(makeResult({
+      raw_output: 'FINAL_RESULT: {"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":["无法根据标题、描述及现有代码定位问题"]}',
+    }));
+    w.config.agent.backend = "codex";
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+
+    await w.processBug(bug);
+
     expect(w.store.getJob(bug.id)?.agent_state).toBe("needs_info");
     expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
-    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("超时");
   });
 
   it("仅在机器验证实际通过后调用 Reviewer 并标记评审通过", async () => {
@@ -2987,7 +3360,7 @@ describe("worker 两阶段修复协议", () => {
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });
 
-  it("Agent 修改 planned_files 之外的文件时拒绝生成 changelist", async () => {
+  it("Agent 修改 planned_files 之外的文件时拒绝自动候选，但保留到人工评审 changelist", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3004,12 +3377,17 @@ describe("worker 两阶段修复协议", () => {
         { depot: "//depot/Unrelated.ts", action: "edit", changelist: "default", type: "text" },
       ]);
     vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
-    const createPending = vi.spyOn(P4Client.prototype, "createPending");
+    const createPending = vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4322);
 
     await w.processBug(bug);
 
-    expect(createPending).not.toHaveBeenCalled();
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("failed");
+    expect(createPending).toHaveBeenCalledWith(
+      expect.stringContaining("未能安全进入自动候选"),
+      ["//depot/Unrelated.ts"],
+    );
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("manual_review");
+    expect(w.store.getJob(bug.id)?.changelist).toBe(4322);
+    expect(w.store.getJob(bug.id)?.last_attempt_files).toBeNull();
     expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("超出调查阶段计划范围");
   });
 
@@ -3040,7 +3418,7 @@ describe("worker 两阶段修复协议", () => {
   it("Reviewer 拒绝后把结构化 finding 交回 Fixer，修正并复审通过", async () => {
     const w = makeWorker([{
       name: "r",
-      path: "C:\\tmp",
+      path: process.cwd(),
       verify_cmds: ['node -e "process.exit(0)"'],
     }]);
     w.config.review.enabled = true;
@@ -3101,7 +3479,7 @@ describe("worker 两阶段修复协议", () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.quality.admission.min_score = 55;
     w.config.quality.admission.require_reproduction_signal = true;
-    const bug = makeBug({ name: "功能异常", description: "不对", module: "" });
+    const bug = makeBug({ name: "功能异常", description: "", module: "" });
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const run = vi.spyOn(PiAgent.prototype, "run");
@@ -3115,6 +3493,124 @@ describe("worker 两阶段修复协议", () => {
 });
 
 describe("worker 自动重试", () => {
+  it("写入意图在进程退出前持久化，并可用相对路径匹配 P4 depot 文件", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\repo", verify_cmds: [] }]);
+    const bug = makeBug();
+    w.store.upsertJob(bug, { agent_state: "in_progress" });
+    const p4 = new P4Client("C:\\repo", {});
+    const workerPrivate = w as unknown as {
+      recordWriteIntent: (id: string, client: P4Client, planned: string[], file?: string) => void;
+      cleanupStaleAttempt: (id: string, client: P4Client) => Promise<string[]>;
+    };
+    workerPrivate.recordWriteIntent(
+      bug.id,
+      p4,
+      ["project:TypeScript/Src/Foo.ts"],
+      "C:\\repo\\TypeScript\\Src\\Bar.ts",
+    );
+    expect(JSON.parse(String(w.store.getJob(bug.id)?.last_attempt_files))).toEqual([
+      "TypeScript/Src/Foo.ts",
+      "TypeScript/Src/Bar.ts",
+    ]);
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([
+      { depot: "//depot/main/TypeScript/Src/Foo.ts", action: "edit", changelist: "default", type: "text" },
+      { depot: "//depot/main/TypeScript/Src/Bar.ts", action: "edit", changelist: "default", type: "text" },
+    ]);
+    const revert = vi.spyOn(P4Client.prototype, "revert").mockResolvedValue("");
+
+    await workerPrivate.cleanupStaleAttempt(bug.id, p4);
+
+    expect(revert).toHaveBeenCalledWith([
+      "//depot/main/TypeScript/Src/Foo.ts",
+      "//depot/main/TypeScript/Src/Bar.ts",
+    ]);
+  });
+
+  it("default 遗留文件可由写入事件唯一归属时自动隔离为人工评审", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\repo", verify_cmds: [] }]);
+    const owner = makeBug({ id: "1123456780001234991", name: "旧任务" });
+    const current = makeBug({ id: "1123456780001234992", name: "当前任务" });
+    w.store.upsertJob(owner, { agent_state: "pending" });
+    w.store.upsertJob(current, { agent_state: "in_progress" });
+    w.store.addEvent("Agent: edit C:\\repo\\TypeScript\\Src\\Foo.ts", "debug", owner.id);
+    const p4 = new P4Client("C:\\repo", {});
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- old\n+++ new\n-old\n+new");
+    const createPending = vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(9001);
+    const preserve = (w as unknown as {
+      preserveCrashOrphans: (client: P4Client, files: string[], currentId: string) => Promise<boolean>;
+    }).preserveCrashOrphans;
+
+    const handled = await preserve.call(
+      w,
+      p4,
+      ["//depot/main/TypeScript/Src/Foo.ts"],
+      current.id,
+    );
+
+    expect(handled).toBe(true);
+    expect(createPending).toHaveBeenCalledWith(
+      expect.stringContaining("进程在写入后异常中断"),
+      ["//depot/main/TypeScript/Src/Foo.ts"],
+    );
+    expect(w.store.getJob(owner.id)?.agent_state).toBe("manual_review");
+    expect(w.store.getJob(owner.id)?.changelist).toBe(9001);
+  });
+
+  it("人工取消后仍登记本次 default 文件，下一次只精确撤销该文件", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug({ id: "1123456780001260396" });
+    w.store.upsertJob(bug, { agent_state: "in_progress" });
+    const p4 = new P4Client("C:\\tmp", {}, undefined, w.cancelEvent);
+    w.cancelEvent.set();
+    const current = [
+      { depot: "//depot/RecruitMinePanel.ts", action: "edit", changelist: "default", type: "text" },
+      { depot: "//depot/OtherBug.ts", action: "edit", changelist: "737700", type: "text" },
+    ];
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async function (cl?: string) {
+      const signal = (this as unknown as { cancelSignal?: { cancelled: boolean } }).cancelSignal;
+      if (signal?.cancelled) throw new P4CancelledError("人工取消 P4");
+      return current.filter((o) => !cl || o.changelist === cl);
+    });
+    const revertCalls: Array<{ files: string[]; changelist?: string }> = [];
+    vi.spyOn(P4Client.prototype, "revert").mockImplementation(async (files, changelist) => {
+      revertCalls.push({ files, changelist });
+      return "";
+    });
+
+    await (w as unknown as {
+      recordAttemptEnd: (bugId: string, client: P4Client) => Promise<string[]>;
+    }).recordAttemptEnd(bug.id, p4);
+    expect(JSON.parse(String(w.store.getJob(bug.id)?.last_attempt_files))).toEqual([
+      "//depot/RecruitMinePanel.ts",
+    ]);
+
+    const nextAttempt = p4.forkForCleanup();
+    await (w as unknown as {
+      cleanupStaleAttempt: (bugId: string, client: P4Client) => Promise<string[]>;
+    }).cleanupStaleAttempt(bug.id, nextAttempt);
+    expect(revertCalls).toEqual([{
+      files: ["//depot/RecruitMinePanel.ts"],
+      changelist: undefined,
+    }]);
+    expect(w.store.getJob(bug.id)?.last_attempt_files).toBeNull();
+  });
+
+  it("结束清点失败时不把已有遗留记录覆盖为空", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    w.store.upsertJob(bug, {
+      last_attempt_files: dumps(["//depot/known.ts"]),
+    });
+    const p4 = new P4Client("C:\\tmp");
+    vi.spyOn(P4Client.prototype, "opened").mockRejectedValue(new P4ConnectionError("P4 offline"));
+
+    await (w as unknown as {
+      recordAttemptEnd: (bugId: string, client: P4Client) => Promise<string[]>;
+    }).recordAttemptEnd(bug.id, p4);
+
+    expect(JSON.parse(String(w.store.getJob(bug.id)?.last_attempt_files))).toEqual(["//depot/known.ts"]);
+  });
+
   it("最终验证失败但已有代码改动时保留到 pending changelist", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
@@ -3440,10 +3936,11 @@ describe("ensurePiModels", () => {
     expect(p.apiKey).toBe("ANTHROPIC_AUTH_TOKEN"); // 环境变量名，不是密钥值
     expect(p.authHeader).toBe(true);
     expect(p.models).toHaveLength(1);
-    expect(p.models[0]).toMatchObject({
-      id: "claude-opus-4-8",
-      reasoning: true,
-      contextWindow: 200000,
+      expect(p.models[0]).toMatchObject({
+        id: "claude-opus-4-8",
+        reasoning: true,
+        input: ["text", "image"],
+        contextWindow: 200000,
       maxTokens: 32000,
     });
   });
@@ -3472,6 +3969,22 @@ describe("ensurePiModels", () => {
       contextWindow: 100000,
       maxTokens: 8000,
     });
+  });
+
+  it("max_tokens 超过 Pi 网关上限时自动钳制为 131072", () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "models.json");
+    ensurePiModels({
+      provider: {
+        id: "custom",
+        base_url: "https://gateway.example.com",
+        model_id: "glm-5.3",
+        max_tokens: 384000,
+      },
+    }, file);
+
+    const model = JSON.parse(fs.readFileSync(file, "utf-8")).providers.custom.models[0];
+    expect(model.maxTokens).toBe(131072);
   });
 
   it("合并写入时保留已有其它 provider", () => {
@@ -3573,6 +4086,28 @@ describe("TapdMcpClient 首次调用可发现工具", () => {
     mcpMockState.tools = [];
     const client = new TapdMcpClient("12345678", { transport: "stdio" });
     await expect(client.listBugs("me")).rejects.toThrow(/未找到适配 list_bugs/);
+  });
+
+  it("通过 TAPD MCP 把描述图片路径解析为 300 秒临时 URL", async () => {
+    mcpMockState.tools = [{
+      name: "tapd_get_image_url",
+      description: "获取图片 URL",
+      inputSchema: {
+        type: "object",
+        properties: { workspace_id: { type: "number" }, image_path: { type: "string" } },
+      },
+    }];
+    mcpMockState.callResult = {
+      structuredContent: { result: { data: { download_url: "https://tapd.example/temp.png?expires=300" } } },
+      content: [],
+    } as never;
+    const client = new TapdMcpClient("12345678", { transport: "stdio" });
+    const bug = makeBug({ description: '<p>现象</p><img src="/tfl/captures/a.png">' });
+
+    const media = await client.resolveMediaInputs(bug);
+
+    expect(mcpMockState.calledTools).toContain("tapd_get_image_url");
+    expect(media).toEqual([{ kind: "image", url: "https://tapd.example/temp.png?expires=300" }]);
   });
 });
 

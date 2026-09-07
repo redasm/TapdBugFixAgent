@@ -247,6 +247,20 @@ export class P4Client {
     this.ignorePaths = ignorePaths.map((value) => value.trim()).filter(Boolean);
   }
 
+  /**
+   * 创建一个不继承任务取消信号的只读清点客户端。
+   *
+   * 人工暂停/关闭会置位原客户端持有的 cancelSignal，但任务结束时仍必须查询
+   * default changelist，才能把本次遗留文件登记给下一次精确清理。复用原客户端
+   * 会令 opened() 立即抛 P4CancelledError，最终把遗留文件误记为空。
+   */
+  forkForCleanup(): P4Client {
+    const client = new P4Client(this.path, {}, this.onLog, undefined, this.ignorePaths);
+    // env 可能包含构造后补入的 P4 配置（例如自动生成的 P4IGNORE），完整复制。
+    client.env = { ...this.env };
+    return client;
+  }
+
   private filterReconcileOutput(output: string): string {
     let ignoredEntry = false;
     return output.split(/\r?\n/).filter((line) => {

@@ -25,6 +25,11 @@ import {
   resolveMcpServers,
 } from "./mcpServers.js";
 import type { AgentResult, RetryEvidenceEntry } from "./models.js";
+import {
+  isMediaCapabilityError,
+  mediaLinksPrompt,
+  type AgentMediaInput,
+} from "./media.js";
 
 export class AgentRuntimeError extends Error {}
 
@@ -33,11 +38,27 @@ export class AgentCancelledError extends AgentRuntimeError {}
 /** 外部运行依赖不可用；应等待环境恢复，不消耗 Bug 自动重试次数。 */
 export class AgentInfrastructureError extends AgentRuntimeError {}
 
-/** Agent 已出现重复命令或超出工具预算；继续重试同一提示不会增加证据。 */
-export class AgentInvestigationLimitError extends AgentRuntimeError {}
+/** Agent 已出现重复命令或超出工具预算；partialOutput 用于强制收敛已有证据。 */
+export class AgentInvestigationLimitError extends AgentRuntimeError {
+  constructor(
+    message: string,
+    readonly partialOutput = "",
+    readonly wroteFile = false,
+  ) {
+    super(message);
+  }
+}
 
-/** Agent 已耗尽本阶段时间预算；自动重复同一任务通常只会再次超时。 */
-export class AgentTimeoutError extends AgentRuntimeError {}
+/** Agent 已耗尽本阶段时间预算；partialOutput 保留超时前已经取得的调查轨迹。 */
+export class AgentTimeoutError extends AgentRuntimeError {
+  constructor(
+    message: string,
+    readonly partialOutput = "",
+    readonly wroteFile = false,
+  ) {
+    super(message);
+  }
+}
 
 export class CommandExecutionGuard {
   private count = 0;
@@ -63,6 +84,81 @@ export class CommandExecutionGuard {
         `同一 Agent 命令重复超过 ${this.repeatedCommandLimit} 次，已停止循环: ${command.slice(0, 240)}`,
       );
     }
+  }
+}
+
+const toolCommand = (args: unknown): string => {
+  if (!args || typeof args !== "object") return "";
+  const data = args as Record<string, unknown>;
+  for (const key of ["command", "cmd", "script"]) {
+    if (typeof data[key] === "string") return data[key];
+  }
+  return "";
+};
+
+const toolWritePath = (args: unknown): string | undefined => {
+  if (!args || typeof args !== "object") return undefined;
+  const data = args as Record<string, unknown>;
+  for (const key of ["path", "file_path", "file", "target_path", "destination"]) {
+    if (typeof data[key] === "string" && data[key].trim()) return data[key].trim();
+  }
+  return undefined;
+};
+
+/** 判断一次工具调用是否会实际写入文件；`p4 edit` 只打开文件，不算内容修改。 */
+export function isFileWriteToolCall(toolName: string, args: unknown): boolean {
+  const normalizedName = toolName.trim().toLowerCase().replace(/^.*[/:]/, "");
+  if (normalizedName === "update_plan") return false;
+  if (/(?:^|_)(?:edit|write|apply_patch|patch|create|update|set|modify|save|delete|remove|rename|move|copy)(?:_|$)/.test(normalizedName)) {
+    return true;
+  }
+  const command = toolCommand(args);
+  if (!command) return false;
+  // `>/dev/null` / `>NUL` 只是丢弃只读命令输出。旧逻辑把它当文件写入，
+  // 导致一次 `rg ... >/dev/null` 就永久解除“首次落笔”守卫，Agent 随后可继续
+  // 宽泛读取直到耗尽全部命令预算。
+  const effectiveCommand = command.replace(
+    /(?:^|\s)\d*>{1,2}\s*(?:"?\/dev\/null"?|"?nul"?|\$null)(?=\s|$)/gi,
+    " ",
+  );
+  if (/(?:^|[\s;&|])apply_patch(?:\.exe)?(?:\s|$)/i.test(effectiveCommand)) return true;
+  if (/\b(?:Set-Content|Add-Content|Out-File|Copy-Item|Move-Item|Rename-Item)\b/i.test(effectiveCommand)) return true;
+  if (/(?:^|[\s;&|])(?:sed\s+-i|perl\s+-pi|cp|mv)(?:\s|$)/i.test(effectiveCommand)) return true;
+  if (/(?:^|[\s;&|])\d*>{1,2}(?![>&])\s*\S/.test(effectiveCommand)) return true;
+  if (/(?:^|\s)p4\s+edit(?:\s|$)/i.test(effectiveCommand)) return false;
+  return false;
+}
+
+/**
+ * 实施阶段不允许长期连续只读。真实写入会重置计数，使修改后的定向验证仍可继续，
+ * 但随后再次陷入长时间只读循环时仍会熔断。
+ */
+export class WriteProgressGuard {
+  private readOnlyExecutions = 0;
+  private wroteFile = false;
+
+  constructor(private readonly maxReadOnlyExecutionsBeforeWrite = Number.POSITIVE_INFINITY) {}
+
+  observeTool(toolName: string, args: unknown): void {
+    if (isFileWriteToolCall(toolName, args)) {
+      this.observeWrite();
+      return;
+    }
+    this.readOnlyExecutions += 1;
+    if (this.readOnlyExecutions > Math.max(1, this.maxReadOnlyExecutionsBeforeWrite)) {
+      throw new AgentInvestigationLimitError(
+        `实施阶段连续 ${this.readOnlyExecutions} 次工具调用仍未修改文件，已停止无效搜索/读取`,
+      );
+    }
+  }
+
+  observeWrite(): void {
+    this.wroteFile = true;
+    this.readOnlyExecutions = 0;
+  }
+
+  get hasWritten(): boolean {
+    return this.wroteFile;
   }
 }
 
@@ -227,7 +323,12 @@ function extractFinalTextFromEvent(d: Record<string, unknown>): string | undefin
   return out || undefined;
 }
 
-/** 从累计的 stdout 行里取最后一个 agent_end 事件的最终文本。 */
+/** 从累计的 stdout 行里取最后一个 assistant 最终文本。
+ *
+ * 不能把整段 JSONL 当模型输出解析：pi 会在 message_start/message_end 中
+ * 回显 user prompt，而 prompt 本身包含 FINAL_RESULT 示例。上游报错且没有
+ * assistant 文本时，若回退到 outLines.join("\n")，就会把示例中的
+ * “根因 / 相对路径”误当成真实调查结果。 */
 export function extractFinalText(lines: string[]): string {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
@@ -242,7 +343,46 @@ export function extractFinalText(lines: string[]): string {
       // 非 JSON 行，忽略
     }
   }
-  return "";
+  // 兼容简单 wrapper/测试脚本的纯文本 stdout；JSON 事件不在此回退，
+  // 因为其中包含不可信的 user prompt 回显。
+  return lines.filter((line) => {
+    const value = line.trim();
+    if (!value) return false;
+    try {
+      JSON.parse(value);
+      return false;
+    } catch {
+      return true;
+    }
+  }).join("\n").trim();
+}
+
+/** 提取 pi JSONL 中的 provider/model 错误。pi 遇到这类错误时进程仍可能 exit=0。 */
+export function extractPiProviderError(lines: string[]): string | undefined {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event.type === "auto_retry_end" && event.success === false) {
+        return String(event.finalError ?? "Pi provider auto-retry failed").trim();
+      }
+      if (event.type !== "agent_end") continue;
+      const messages = Array.isArray(event.messages) ? event.messages : [];
+      const assistant = [...messages].reverse().find((item) =>
+        item && typeof item === "object" && (item as Record<string, unknown>).role === "assistant") as
+          Record<string, unknown> | undefined;
+      const error = String(assistant?.errorMessage ?? "").trim();
+      const stopReason = String(assistant?.stopReason ?? "").trim().toLowerCase();
+      if (error) return error;
+      if (stopReason === "error") return "Pi provider returned stopReason=error";
+      // 只以最后一次 agent_end 为准；前面可能是 Pi 内置自动重试的失败记录。
+      return undefined;
+    } catch {
+      // 非 JSON 行不是 provider 事件
+    }
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +543,14 @@ export function formatRetryEvidence(entries: RetryEvidenceEntry[]): string {
     if (e.opened_files?.length) lines.push(`  当时改动/打开过的文件: ${e.opened_files.join(", ")}`);
     if (e.manual_assets?.length) lines.push(`  当时识别到的需人工资源: ${e.manual_assets.join(", ")}`);
   }
-  lines.push("请结合以上线索继续排查并修复，避免重复同样的错误做法。");
+  lines.push("请结合以上线索继续修复，避免重复同样的错误做法。");
+  if (es.some((e) => /超时|timeout/i.test(e.failure_reason || ""))) {
+    lines.push(
+      "上次尝试已经因超时终止：禁止重新从头做宽泛搜索、反复读取/裁剪同一附件或长时间停留在调查阶段；"
+      + "优先采用本提示中的已确认调查结论，完成少量必要检查后立即实施 planned_files 内的最小修改。"
+      + "如果证据不足以安全落笔，请尽快返回 blocked_reasons，不要耗尽整个时间预算。",
+    );
+  }
   return lines.join("\n");
 }
 
@@ -432,6 +579,16 @@ export interface AgentRunOptions {
   maxCommandExecutions?: number;
   /** 同一规范化命令允许执行的最大次数。 */
   repeatedCommandLimit?: number;
+  /** 实施阶段两次实际写入之间允许的最大连续只读工具调用数；调查阶段不设置。 */
+  maxReadOnlyExecutionsBeforeWrite?: number;
+  /** 实施阶段首次真实文件写入前允许的秒数；不限制已开始落笔的复杂修复。 */
+  maxSecondsBeforeWrite?: number;
+  /** 到达阶段总时限时，若模型仍在连续输出，允许完成最终结果的最大额外秒数。 */
+  completionGraceSeconds?: number;
+  /** Agent 发起真实文件写入时立即登记路径，供进程崩溃后的工作区清理归属使用。 */
+  onFileWrite?: (path?: string) => void;
+  /** 远程图片/视频 URL；Pi 在 provider 请求层注入，失败时自动降级为普通文本链接。 */
+  media?: AgentMediaInput[];
 }
 
 // ---------------------------------------------------------------------------
@@ -473,9 +630,11 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
         id: modelId,
         name: modelId,
         reasoning: p.reasoning ?? true,
-        input: ["text"],
+        input: ["text", "image"],
         contextWindow: p.context_window ?? 200000,
-        maxTokens: p.max_tokens ?? 32000,
+        // Pi 的 anthropic-messages provider 及当前公司网关都要求 max_tokens <= 131072。
+        // 配置过大时网关返回 400，但 pi 进程仍可能 exit=0，因此在请求发出前钳制。
+        maxTokens: Math.min(Math.max(1, p.max_tokens ?? 32000), 131072),
       },
     ],
   };
@@ -537,6 +696,17 @@ export class PiAgent {
     return undefined;
   }
 
+  private mediaUrlExtensionPath(): string | undefined {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    for (const candidate of [
+      path.join(here, "piExtensions", "mediaUrl.js"),
+      path.join(here, "piExtensions", "mediaUrl.ts"),
+    ]) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
   async run(opts: AgentRunOptions): Promise<AgentResult> {
     // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）
     try {
@@ -552,11 +722,14 @@ export class PiAgent {
       );
     }
 
+    const requestedMcpServers = opts.requiredMcpServers === undefined
+      ? undefined
+      : new Set(opts.requiredMcpServers);
     const mcpServers = resolveMcpServers(
       this.config.mcp_servers,
       opts.repoDir,
       opts.sandboxMode === "read-only",
-    );
+    ).filter((server) => requestedMcpServers === undefined || requestedMcpServers.has(server.name));
     const requiredMcpServers = new Set(opts.requiredMcpServers ?? []);
     if (requiredMcpServers.size) {
       const configured = new Set(mcpServers.map((server) => server.name));
@@ -581,12 +754,15 @@ export class PiAgent {
     // （表现为 Agent 无头绪乱转 / 零输出 / 跑满超时）。
     // 因此 Windows 上把 prompt 写入临时文件，用 pi 的 @file 语法传引用：参数本身无换行，
     // cmd 不会再拆；同时彻底规避 cmd 8191 字符命令行长度上限。POSIX execve 无此问题，直接传参。
-    let promptArg = opts.prompt;
+    const media = [...new Map((opts.media ?? []).map((item) => [`${item.kind}\0${item.url}`, item])).values()];
+    const mediaText = mediaLinksPrompt(media);
+    const effectivePrompt = mediaText ? `${opts.prompt}\n\n${mediaText}` : opts.prompt;
+    let promptArg = effectivePrompt;
     let promptTmpDir: string | undefined;
     if (process.platform === "win32") {
       promptTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompt-"));
       const promptFile = path.join(promptTmpDir, "prompt.md");
-      fs.writeFileSync(promptFile, opts.prompt, "utf-8");
+      fs.writeFileSync(promptFile, effectivePrompt, "utf-8");
       promptArg = `@${promptFile}`;
     }
 
@@ -612,6 +788,11 @@ export class PiAgent {
       if (!extension) throw new AgentRuntimeError("未找到 Pi MCP 代理扩展构建产物");
       args.push("--extension", extension);
     }
+    if (media.length) {
+      const extension = this.mediaUrlExtensionPath();
+      if (!extension) throw new AgentRuntimeError("未找到 Pi 多媒体 URL 注入扩展构建产物");
+      args.push("--extension", extension);
+    }
 
     opts.onProgress?.(
       `Pi: 准备调用模型 ${model || "(Pi 默认模型)"}（sandbox=${opts.sandboxMode ?? "workspace-write"}，timeout=${opts.timeoutS}s）`,
@@ -635,6 +816,9 @@ export class PiAgent {
           ...p4EnvFromConfig(this.config.p4),
           ...(mcpServers.length
             ? { TAPD_BUGFIX_MCP_SERVERS: JSON.stringify(mcpServers) }
+            : {}),
+          ...(media.length
+            ? { TAPD_BUGFIX_MEDIA_INPUTS: JSON.stringify(media) }
             : {}),
         },
         shell: isWin, // Windows: cmd.exe 解析，才能执行 .cmd shim（npm 全局装的 pi.cmd）
@@ -672,29 +856,45 @@ export class PiAgent {
     // 文本增量合并：message_update 的 text_delta 每个 token 一条，逐条上报会把事件表
     // 刷爆（一次修复 2 万条 debug 事件）。攒到换行或 120 字符再发；工具事件直接透传。
     let textBuf = "";
+    const progressTrace: string[] = [];
+    let lastProgressAt = Date.now();
+    const rememberProgress = (message: string) => {
+      lastProgressAt = Date.now();
+      progressTrace.push(message);
+      if (progressTrace.length > 500) progressTrace.shift();
+      opts.onProgress?.(message);
+    };
     const commandGuard = new CommandExecutionGuard(
       opts.maxCommandExecutions,
       opts.repeatedCommandLimit,
+    );
+    const writeProgressGuard = new WriteProgressGuard(
+      opts.maxReadOnlyExecutionsBeforeWrite,
     );
     let guardFailure: AgentInvestigationLimitError | undefined;
     const flushText = () => {
       const t = textBuf.replace(/\s+/g, " ").trim();
       textBuf = "";
-      if (t) opts.onProgress?.(`Agent: ${t.slice(-160)}`);
+      if (t) rememberProgress(`Agent: ${t.slice(-500)}`);
     };
     const onLine = (line: string) => {
       outLines.push(line);
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
         if (event.type === "tool_execution_start") {
-          commandGuard.observe(JSON.stringify({
-            toolName: event.toolName ?? "",
-            args: event.args ?? {},
-          }));
+          const toolName = typeof event.toolName === "string" ? event.toolName : "";
+          const args = event.args ?? {};
+          commandGuard.observe(JSON.stringify({ toolName, args }));
+          if (isFileWriteToolCall(toolName, args)) opts.onFileWrite?.(toolWritePath(args));
+          writeProgressGuard.observeTool(toolName, args);
         }
       } catch (error) {
         if (error instanceof AgentInvestigationLimitError) {
-          guardFailure = error;
+          guardFailure = new AgentInvestigationLimitError(
+            error.message,
+            [...progressTrace, ...outLines.slice(-80)].join("\n").slice(-32000),
+            writeProgressGuard.hasWritten,
+          );
           killProcessTree(proc);
           return;
         }
@@ -709,7 +909,7 @@ export class PiAgent {
           if (textBuf.includes("\n") || textBuf.length >= 120) flushText();
         } else {
           flushText();
-          opts.onProgress(p.msg);
+          rememberProgress(p.msg);
         }
       } catch {
         // 进度回调失败不影响主流程
@@ -719,6 +919,11 @@ export class PiAgent {
     rl.on("line", onLine);
 
     const deadline = Date.now() + opts.timeoutS * 1000;
+    const completionGraceMs = Math.max(0, opts.completionGraceSeconds ?? 0) * 1000;
+    const hardDeadline = deadline + completionGraceMs;
+    const firstWriteDeadline = opts.maxSecondsBeforeWrite
+      ? Date.now() + opts.maxSecondsBeforeWrite * 1000
+      : Number.POSITIVE_INFINITY;
     const result = await new Promise<AgentResult>((resolve, reject) => {
       const watchdog = setInterval(() => {
         if (opts.cancelEvent?.cancelled) {
@@ -731,10 +936,28 @@ export class PiAgent {
           clearInterval(watchdog);
           return; // close 事件会负责 resolve
         }
-        if (Date.now() > deadline) {
+        const now = Date.now();
+        const outputStillProgressing = completionGraceMs > 0
+          && now - lastProgressAt <= 10_000
+          && now <= hardDeadline;
+        if (now > deadline && !outputStillProgressing) {
           killProcessTree(proc);
           clearInterval(watchdog);
-          reject(new AgentTimeoutError(`Agent 调用超时(${opts.timeoutS}s): pi`));
+          reject(new AgentTimeoutError(
+            `Agent 调用超时(${opts.timeoutS}s): pi`,
+            [...progressTrace, ...outLines.slice(-80)].join("\n").slice(-32000),
+            writeProgressGuard.hasWritten,
+          ));
+          return;
+        }
+        if (!writeProgressGuard.hasWritten && Date.now() > firstWriteDeadline) {
+          killProcessTree(proc);
+          clearInterval(watchdog);
+          reject(new AgentInvestigationLimitError(
+            `实施阶段 ${opts.maxSecondsBeforeWrite}s 内仍未产生文件写入，已停止无效停滞`,
+            [...progressTrace, ...outLines.slice(-80)].join("\n").slice(-32000),
+            false,
+          ));
         }
       }, 200);
       proc.on("error", (err) => {
@@ -761,15 +984,24 @@ export class PiAgent {
           // ignore
         }
         const finalText = extractFinalText(outLines);
-        const ar = resultFromOutput(finalText || outLines.join("\n"), code ?? -1);
-        ar.log = (errChunks.join("").slice(-1000) + "\n" + (finalText || outLines.join("\n")).slice(-2500)).trim();
+        const providerError = extractPiProviderError(outLines);
+        // pi 在 provider 连接/协议错误时仍可能以 0 退出。此时必须以事件
+        // 中的错误为准，且只解析 assistant 文本，绝不从 user prompt 回显取 JSON。
+        const effectiveExitCode = providerError && (code ?? 0) === 0 ? 1 : (code ?? -1);
+        const ar = resultFromOutput(finalText, effectiveExitCode);
+        ar.log = [
+          errChunks.join("").slice(-1000),
+          providerError ? `Pi provider error: ${providerError}` : "",
+          finalText.slice(-2500),
+        ].filter(Boolean).join("\n").trim();
         opts.onProgress?.(`Pi: 进程结束（exit=${code ?? -1}）`);
         resolve(ar);
       });
     });
 
+    let completed: AgentResult;
     try {
-      return await result;
+      completed = await result;
     } finally {
       // 清理 Windows 临时 prompt 文件
       if (promptTmpDir) {
@@ -780,5 +1012,13 @@ export class PiAgent {
         }
       }
     }
+    if (!completed.ok && media.length && isMediaCapabilityError(completed.log)) {
+      opts.onProgress?.("Pi: 当前接口拒绝或无法抓取多媒体 URL，自动降级为普通链接重试");
+      return this.run({ ...opts, media: undefined, prompt: effectivePrompt });
+    }
+    if (!completed.ok && completed.log.includes("Pi provider error:")) {
+      throw new AgentInfrastructureError(completed.log);
+    }
+    return completed;
   }
 }

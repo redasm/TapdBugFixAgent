@@ -171,9 +171,9 @@ mcp_servers:
 
 本地 server 使用 `command/args/cwd/env/env_vars`；远程 Streamable HTTP server 可改用 `url/bearer_token_env_var/http_headers/env_http_headers`。路径和值支持 `{repo}` / `${repo}`（当前 Bug 仓库根）及 `{agent}` / `${agent}`（本工具安装目录）占位符。`enabled`、`required`、`enabled_tools` 和 `disabled_tools` 对齐 Codex；`approval_mode` 会映射成 Codex 的 `default_tools_approval_mode`，默认 `approve`，避免自动任务的 `approval_policy: never` 拒绝已显式开放的 MCP 工具；`read_only_tools` 是本项目为调查与 Reviewer 增加的安全白名单。资源关键词直接配置在对应 MCP 的 `automates_manual_keywords`：server 禁用时保持人工门禁，启用后才允许自动处理，因此不必在全局 `manual_keywords` 重复填写。Codex 直接使用原生 MCP 配置，Pi 通过通用代理动态发现和注册工具；非 `required` 服务启动失败时会跳过，不阻塞纯代码 Bug；但当前 Bug 含诊断链接或命中某个资源关键词时，对应 MCP 会被动态视为必需，预检失败直接阻塞且不消耗修复重试。TAPD MCP 属于编排器数据源，继续单独配置在 `tapd.mcp`，不会加载给编码 Agent。
 
-`chrome_devtools` 使用项目中固定安装的 `chrome-devtools-mcp`，不会临时联网下载。项目代理会自动启动并复用同一个官方 daemon；因此调查、修复、Reviewer 或下一个 Bug 即使重新创建 stdio MCP，也不会重新建立 Chrome 调试连接。首次使用（以及 Chrome、Windows 或 daemon 重启后）需在 Chrome 144+ 的 `chrome://inspect/#remote-debugging` 开启远程调试，并在 Chrome 弹出的连接授权中允许一次；daemon 与 Chrome 持续运行期间后续任务无需重复授权。该安全确认由 Chrome 控制，不能在项目中永久绕过。不要改成 `--isolated`，否则会启动不带现有登录态的临时浏览器。调查阶段发现外部诊断链接时必须读取页面；登录失效、权限不足或页面不可达会明确阻塞该 Bug，而不是根据标题猜测。
+`chrome_devtools` 使用项目中固定安装的 `chrome-devtools-mcp`，不会临时联网下载。项目代理会自动启动并复用同一个官方 daemon；因此调查、修复、Reviewer 或下一个 Bug 即使重新创建 stdio MCP，也不会重新建立 Chrome 调试连接。首次使用（以及 Chrome、Windows 或 daemon 重启后）需在 Chrome 144+ 的 `chrome://inspect/#remote-debugging` 开启远程调试，并在 Chrome 弹出的连接授权中允许一次；daemon 与 Chrome 持续运行期间后续任务无需重复授权。该安全确认由 Chrome 控制，不能在项目中永久绕过。不要改成 `--isolated`，否则会启动不带现有登录态的临时浏览器。调查阶段会尝试读取外部诊断链接；登录失效、权限不足或页面不可达时如实记录，但只要标题、描述、附件或源码已经能定位相关代码，就继续修复。
 
-只读调查最多运行 10 分钟、执行 50 条命令；编码阶段最多执行 100 条命令；所有 Agent 阶段同一规范化命令最多重复 3 次。命令预算、重复循环或阶段超时触发后任务转为 `needs_info`，不会再用相同提示自动重试。
+Agent 工具调用总次数和同一工具次数均不设置固定上限，`find`、`read`、`grep` 等可按调查需要反复使用；只由各阶段总超时兜底。只读调查最长使用 10 分钟搜索，随后用最多 3 分钟根据已有轨迹强制收敛；超时或结构化输出不完整会自动重试，不再误标为 `needs_info`。只有只读 Agent 明确无法根据标题、描述及现有代码定位任何相关模块、文件或符号时，才进入 `needs_info`。
 
 自定义网关仍可用 `codex.context_window` / `codex.auto_compact_token_limit` 设置窗口与压缩阈值；`codex.model_catalog_json` 只应指向与实际模型工具协议匹配的显式目录。不要从 GPT 模型复制目录给 GLM/DeepSeek 等兼容网关模型，否则 Codex 会采用错误的工具调用协议，表现为只输出“我会先调查”而不真正调用工具。`Model metadata ... not found` 的提示对这类兼容网关是可接受的回退信息。
 
@@ -222,6 +222,7 @@ P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Rev
 ### 准确率门禁
 
 - **结构化 Bug 上下文**：从 TAPD 原始字段整理复现步骤、预期/实际结果、环境、日志、评论和附件。
+- **图片/视频证据**：通过 TAPD MCP 把描述内图片和附件换成 300 秒临时 URL；Pi 和使用兼容网关的 Codex 都会在请求层发送原生图片/视频内容块，不下载媒体，也不按模型名称硬编码能力。不支持该格式或抓取失败时自动降级为普通 URL 文本。
 - **自动修复准入**：描述过短、缺少复现信号时进入 `needs_info`；可由已启用 Unreal MCP 处理的资源类进入自动调查，其余资源类进入 `manual_only`；支付、账号、
   存档、协议等高风险项进入 `manual_review`。
 - **严格验证**：未配置 `verify_cmds` 时只能生成 `candidate`，不会标记为“已验证”。

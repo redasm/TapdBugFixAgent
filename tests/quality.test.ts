@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -18,6 +19,15 @@ import {
 } from "../src/repairWorkflow.js";
 import { assessPatchScope, assessPlannedScope, runVerificationPipeline } from "../src/verify.js";
 import { buildReviewPrompt, formatReviewerFeedback, parseReviewResult } from "../src/review.js";
+import {
+  extractTapdMediaReferences,
+  injectMediaIntoCodexPayload,
+  injectMediaIntoProviderPayload,
+  isMediaCapabilityError,
+  mediaLinksPrompt,
+} from "../src/media.js";
+import { startCodexMediaProxy } from "../src/codexMediaProxy.js";
+import { assessFixabilityWithNarrative } from "../src/admission.js";
 
 const makeBug = (over: Partial<Bug> = {}): Bug => ({
   id: "1123456780000000001",
@@ -125,7 +135,139 @@ describe("BugContextBuilder", () => {
   });
 });
 
+describe("TAPD 多媒体输入", () => {
+  it("从描述 HTML 和附件中保留图片、视频引用", () => {
+    const bug = makeBug({
+      description: '<p>现象</p><img src="/tfl/captures/a.png"><video src="https://tapd.example/demo.mp4"></video>',
+      raw: {
+        description: '<p>现象</p><img src="/tfl/captures/a.png"><video src="https://tapd.example/demo.mp4"></video>',
+        attachments: [{ id: "7", file_name: "screen.webp" }, { id: "8", filename: "trace.log" }],
+      },
+    });
+
+    expect(extractTapdMediaReferences(bug)).toEqual([
+      { kind: "image", url: "/tfl/captures/a.png", attachmentId: undefined },
+      { kind: "video", url: "https://tapd.example/demo.mp4", attachmentId: undefined },
+      { kind: "image", url: "", name: "screen.webp", attachmentId: "7" },
+    ]);
+  });
+
+  it("向 Anthropic 网关请求注入远程图片和视频内容块", () => {
+    const payload = { messages: [{ role: "user", content: "分析这个 Bug" }] };
+    const injected = injectMediaIntoProviderPayload(payload, [
+      { kind: "image", url: "https://tapd.example/a.png" },
+      { kind: "video", url: "https://tapd.example/a.mp4" },
+    ], "anthropic-messages") as { messages: Array<{ content: unknown[] }> };
+
+    expect(injected.messages[0].content).toEqual([
+      { type: "text", text: "分析这个 Bug" },
+      { type: "image", source: { type: "url", url: "https://tapd.example/a.png" } },
+      { type: "video_url", video_url: { url: "https://tapd.example/a.mp4" } },
+    ]);
+  });
+
+  it("按 Codex Responses 请求协议注入远程图片和视频，不判断模型名", () => {
+    const payload = {
+      model: "any-compatible-model",
+      input: [{ role: "user", content: [{ type: "input_text", text: "分析这个 Bug" }] }],
+    };
+    const injected = injectMediaIntoCodexPayload(payload, [
+      { kind: "image", url: "https://tapd.example/a.png" },
+      { kind: "video", url: "https://tapd.example/a.mp4" },
+    ]) as { input: Array<{ content: unknown[] }> };
+
+    expect(injected.input[0].content).toEqual([
+      { type: "input_text", text: "分析这个 Bug" },
+      { type: "input_image", image_url: "https://tapd.example/a.png" },
+      { type: "video_url", video_url: { url: "https://tapd.example/a.mp4" } },
+    ]);
+  });
+
+  it("Codex 网关拒绝媒体块时使用原请求自动重试", async () => {
+    const received: unknown[] = [];
+    const upstream = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+      received.push(payload);
+      if (received.length === 1) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "unsupported video content" } }));
+      } else {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true }));
+      }
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("test upstream failed to listen");
+    const proxy = await startCodexMediaProxy(`http://127.0.0.1:${address.port}/v1`, [
+      { kind: "video", url: "https://tapd.example/a.mp4" },
+    ]);
+    try {
+      const result = await fetch(`${proxy.baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ input: "分析这个 Bug" }),
+      });
+      expect(result.status).toBe(200);
+      expect(proxy.degraded()).toBe(true);
+      expect(received).toHaveLength(2);
+      expect(JSON.stringify(received[0])).toContain("video_url");
+      expect(received[1]).toEqual({ input: "分析这个 Bug" });
+    } finally {
+      await proxy.close();
+      await new Promise<void>((resolve, reject) =>
+        upstream.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("多模态不支持时仍可退回普通 URL 文本", () => {
+    const media = [{ kind: "video" as const, url: "https://tapd.example/a.mp4" }];
+    expect(mediaLinksPrompt(media)).toContain("https://tapd.example/a.mp4");
+    expect(isMediaCapabilityError("400 unsupported video content")).toBe(true);
+  });
+});
+
 describe("FixabilityAdmission", () => {
+  it.each([
+    [
+      "【招募系统】需要补充招募入队申请的筛选功能，存在功能遗漏",
+      "需要补充招募入队申请的筛选功能，存在功能遗漏",
+    ],
+    [
+      "【招募系统】点击申请会导致之前已申请的按钮重新变为申请",
+      "点击申请会导致之前已申请的按钮重新变为申请，然后还会触发刷新冷却提示，需要对已申请的队伍按钮保持为已申请",
+    ],
+    [
+      "【招募系统】我的招募列表清理存在延迟",
+      "列表清理存在延迟，导致已经被服务端销毁的申请记录无法清理，需要清理已经失效的招募申请记录",
+    ],
+  ])("自然语言描述已包含故障和目标时不误报缺少补充信息: %s", (title, description) => {
+    const result = assessFixabilityWithNarrative(makeBug({ title, description, raw: { description } }), policy);
+    expect(result.eligible).toBe(true);
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("识别简写的复现标签", () => {
+    const result = assessFixabilityWithNarrative(makeBug({
+      description: "复现：打开地图，放置并删除自定义标记，观察右侧 UI 显示",
+      raw: { description: "复现：打开地图，放置并删除自定义标记，观察右侧 UI 显示" },
+    }), policy);
+    expect(result.context.reproduction_steps).toContain("打开地图");
+  });
+
+  it("描述无需包含预设关键词或固定格式也可进入只读调查", () => {
+    const description = "点击左侧入口后，页面停留在上一状态，相关上下文见工单附件。";
+    const result = assessFixabilityWithNarrative(makeBug({
+      title: "【界面】入口操作后的状态与记录不一致",
+      description,
+      raw: { description },
+    }), policy);
+    expect(result.eligible).toBe(true);
+    expect(result.reasons).toEqual([]);
+  });
+
   it("证据充分的局部代码 Bug 允许进入自动修复", () => {
     const result = assessFixability(makeBug(), policy);
 
@@ -135,7 +277,7 @@ describe("FixabilityAdmission", () => {
   });
 
   it("完整写在标题里的操作和故障现象可进入只读调查", () => {
-    const result = assessFixability(
+    const result = assessFixabilityWithNarrative(
       makeBug({
         title: "【关卡】【地图】点击吸附在边缘的标记会异常触发预放置状态",
         description: "",
@@ -268,7 +410,13 @@ describe("two-stage repair workflow", () => {
     expect(prompt).toContain("排除依据");
     expect(prompt).toContain("先阅读相关测试");
     expect(prompt).toContain("停止调查并写入 blocked_reasons");
-    expect(prompt).toContain("工具调用次数不设固定上限");
+    expect(prompt).not.toContain("工具调用次数不设固定上限");
+    expect(prompt).toContain("fd <name> <目录>");
+    expect(prompt).toContain("rg --files");
+    expect(prompt).toContain("搜索文件内容只使用");
+    expect(prompt).toContain("连续 3 次搜索或读取没有产生新的");
+    expect(prompt).toContain("预算使用到约 60%");
+    expect(prompt).toContain("不要用 `find`");
     expect(prompt).toContain("不得在 Perforce 根执行 git status/log/blame/diff");
     expect(prompt).toContain("p4 filelog");
     expect(prompt).toContain('git -C "根的绝对路径"');
@@ -285,11 +433,12 @@ describe("two-stage repair workflow", () => {
     expect(prompt).toContain("用 `new_page` 为每个链接创建独立页面");
     expect(prompt).toContain("完整堆栈");
     expect(prompt).toContain("跳转登录页");
-    expect(prompt).toContain("必须在 blocked_reasons 中写明");
+    expect(prompt).toContain("在 diagnostic_pages 中如实记录");
+    expect(prompt).toContain("不得因此写入 blocked_reasons");
     expect(prompt).toContain('"diagnostic_pages"');
   });
 
-  it("存在外部诊断链接时拒绝未实际读取页面的调查结果", () => {
+  it("外部诊断链接读取失败不覆盖已有代码定位结果", () => {
     const url = "https://crashsight.qq.com/crash-reporting/crashes/app/issue/report";
     const base = {
       root_cause: "空指针",
@@ -300,7 +449,7 @@ describe("two-stage repair workflow", () => {
       blocked_reasons: [],
     };
 
-    expect(parseInvestigation(`FINAL_RESULT: ${JSON.stringify(base)}`, [url]).ok).toBe(false);
+    expect(parseInvestigation(`FINAL_RESULT: ${JSON.stringify(base)}`, [url]).ok).toBe(true);
     const read = parseInvestigation(`FINAL_RESULT: ${JSON.stringify({
       ...base,
       diagnostic_pages: [{
@@ -374,6 +523,10 @@ describe("two-stage repair workflow", () => {
     expect(prompt).toContain("上次测试失败");
     expect(prompt).toContain("修复守则");
     expect(prompt).toContain("清理必须达到完全停稳");
+    expect(prompt).toContain("禁止重新进行全仓扫描");
+    expect(prompt).toContain("编辑前原则上最多进行 8 次");
+    expect(prompt).toContain("立即执行实际内容修改");
+    expect(prompt).toContain("`p4 edit` 只是在 Perforce 中打开文件，不算已经落笔");
   });
 
   it("实施 Prompt 定义完成标准、编辑前校验和诚实的分层验证", () => {

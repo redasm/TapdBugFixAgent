@@ -16,12 +16,15 @@ import {
   AgentInvestigationLimitError,
   AgentRuntimeError,
   AgentTimeoutError,
+  WriteProgressGuard,
   type AgentRunOptions,
   resultFromOutput,
 } from "./agent.js";
 import path from "node:path";
 import { PROJECT_ROOT, type Config } from "./config.js";
 import type { AgentResult } from "./models.js";
+import { mediaLinksPrompt } from "./media.js";
+import { startCodexMediaProxy, type CodexMediaProxy } from "./codexMediaProxy.js";
 import { p4EnvFromConfig } from "./p4.js";
 import {
   codexMcpConfig,
@@ -50,7 +53,7 @@ const isRipgrepCommand = (command: string): boolean =>
 const hasRipgrepError = (output: string): boolean =>
   /(?:^|\r?\n)\s*(?:rg(?:\.exe)?:|regex parse error:)/i.test(output);
 
-export { CommandExecutionGuard } from "./agent.js";
+export { CommandExecutionGuard, WriteProgressGuard } from "./agent.js";
 
 /** 仅加载用户明确提供的模型目录；不能把 GPT 的工具协议元数据套到兼容网关模型上。 */
 export function ensureCodexModelCatalog(
@@ -159,13 +162,13 @@ export class CodexAgent {
     return probe;
   }
 
-  private clientFor(servers: ResolvedMcpServer[], model: string): Codex {
+  private clientFor(servers: ResolvedMcpServer[], model: string, baseUrl?: string): Codex {
     const cfg = this.config.codex;
     const apiKey = cfg.api_key_env ? process.env[cfg.api_key_env] : undefined;
     const modelCatalog = ensureCodexModelCatalog(this.config, model);
     return new Codex({
       codexPathOverride: cfg.codex_path || undefined,
-      baseUrl: cfg.base_url || undefined,
+      baseUrl: baseUrl || cfg.base_url || undefined,
       apiKey,
       env: { ...processEnv(), ...p4EnvFromConfig(this.config.p4) },
       config: {
@@ -183,15 +186,16 @@ export class CodexAgent {
     opts: AgentRunOptions,
     sandboxMode: SandboxMode,
     servers: ResolvedMcpServer[],
+    baseUrl?: string,
   ): { key: string; thread: Thread } {
     const model = opts.model?.trim() || this.config.codex.model || "";
     const mcpKey = JSON.stringify(servers.map(mcpServerConnectionKey));
     const codexKey = JSON.stringify(this.config.codex);
     const additionalDirectories = [...new Set(opts.additionalDirs ?? [])].sort();
-    const key = `${opts.repoDir}\0${additionalDirectories.join("\0")}\0${sandboxMode}\0${model}\0${mcpKey}\0${codexKey}`;
+    const key = `${opts.repoDir}\0${additionalDirectories.join("\0")}\0${sandboxMode}\0${model}\0${mcpKey}\0${codexKey}\0${baseUrl ?? ""}`;
     let thread = this.threads.get(key);
     if (!thread) {
-      thread = this.clientFor(servers, model).startThread(
+      thread = this.clientFor(servers, model, baseUrl).startThread(
         codexThreadOptions(opts, this.config.codex, sandboxMode),
       );
       this.threads.set(key, thread);
@@ -203,11 +207,14 @@ export class CodexAgent {
     const sandboxMode: SandboxMode = opts.sandboxMode
       ?? (opts.tools?.length ? "read-only" : "workspace-write");
     const model = opts.model?.trim() || this.config.codex.model || "(Codex 默认模型)";
+    const requestedMcpServers = opts.requiredMcpServers === undefined
+      ? undefined
+      : new Set(opts.requiredMcpServers);
     const servers = resolveMcpServers(
       this.config.mcp_servers,
       opts.repoDir,
       sandboxMode === "read-only",
-    );
+    ).filter((server) => requestedMcpServers === undefined || requestedMcpServers.has(server.name));
     const requiredMcpServers = new Set(opts.requiredMcpServers ?? []);
     let endpoint = "OpenAI 默认服务";
     if (this.config.codex.base_url) {
@@ -222,7 +229,8 @@ export class CodexAgent {
         `MCP: Codex 配置已注入 ${servers.length} 个服务：${servers.map((server) => server.name).join(", ")}`,
       );
     }
-    let prompt = opts.prompt;
+    const mediaText = mediaLinksPrompt(opts.media ?? []);
+    let prompt = mediaText ? `${opts.prompt}\n\n${mediaText}` : opts.prompt;
     let usableServers = servers;
     if (!servers.length && requiredMcpServers.size) {
       throw new AgentInfrastructureError(
@@ -268,18 +276,42 @@ export class CodexAgent {
         opts.onProgress?.(`MCP: 本次跳过不可用的可选服务：${[...unusableNames].join(", ")}`);
       }
       const guidance = mcpToolGuidance(inspections);
-      if (guidance) prompt = `${opts.prompt}\n\n${guidance}`;
+      if (guidance) prompt = `${prompt}\n\n${guidance}`;
     }
-    const { key, thread } = this.threadFor(opts, sandboxMode, usableServers);
+    let mediaProxy: CodexMediaProxy | undefined;
+    if (opts.media?.length && this.config.codex.base_url.trim()) {
+      mediaProxy = await startCodexMediaProxy(this.config.codex.base_url, opts.media);
+      opts.onProgress?.(`Codex: 将 ${opts.media.length} 个远程媒体 URL 注入网关请求`);
+    }
+    const { key, thread } = this.threadFor(opts, sandboxMode, usableServers, mediaProxy?.baseUrl);
     const controller = new AbortController();
-    let stoppedBy: "cancel" | "timeout" | undefined;
+    let stoppedBy: "cancel" | "timeout" | "no_write" | undefined;
     const deadline = Date.now() + opts.timeoutS * 1000;
+    const completionGraceMs = Math.max(0, opts.completionGraceSeconds ?? 0) * 1000;
+    const hardDeadline = deadline + completionGraceMs;
+    let lastProgressAt = Date.now();
+    const commandGuard = new CommandExecutionGuard(
+      opts.maxCommandExecutions,
+      opts.repeatedCommandLimit,
+    );
+    const writeProgressGuard = new WriteProgressGuard(
+      opts.maxReadOnlyExecutionsBeforeWrite,
+    );
+    const firstWriteDeadline = opts.maxSecondsBeforeWrite
+      ? Date.now() + opts.maxSecondsBeforeWrite * 1000
+      : Number.POSITIVE_INFINITY;
     const watchdog = setInterval(() => {
       if (opts.cancelEvent?.cancelled) {
         stoppedBy = "cancel";
         controller.abort();
-      } else if (Date.now() > deadline) {
+      } else if (Date.now() > deadline
+          && !(completionGraceMs > 0
+            && Date.now() - lastProgressAt <= 10_000
+            && Date.now() <= hardDeadline)) {
         stoppedBy = "timeout";
+        controller.abort();
+      } else if (!writeProgressGuard.hasWritten && Date.now() > firstWriteDeadline) {
+        stoppedBy = "no_write";
         controller.abort();
       }
     }, 200);
@@ -288,10 +320,6 @@ export class CodexAgent {
     const changedFiles = new Set<string>();
     const log: string[] = [];
     const started = Date.now();
-    const commandGuard = new CommandExecutionGuard(
-      opts.maxCommandExecutions,
-      opts.repeatedCommandLimit,
-    );
     try {
       const { events } = await thread.runStreamed(prompt, {
         signal: controller.signal,
@@ -300,6 +328,7 @@ export class CodexAgent {
       for await (const event of events) {
         const progress = progressFromCodexEvent(event);
         if (progress) {
+          lastProgressAt = Date.now();
           opts.onProgress?.(progress);
           log.push(progress);
         }
@@ -312,14 +341,46 @@ export class CodexAgent {
         if (event.type === "item.completed") {
           if (event.item.type === "agent_message") finalResponse = event.item.text;
           if (event.item.type === "file_change" && event.item.status === "completed") {
-            for (const change of event.item.changes) changedFiles.add(change.path);
+            writeProgressGuard.observeWrite();
+            for (const change of event.item.changes) {
+              changedFiles.add(change.path);
+              opts.onFileWrite?.(change.path);
+            }
           }
         }
         if (event.type === "item.started" && event.item.type === "command_execution") {
           try {
             commandGuard.observe(event.item.command);
+            writeProgressGuard.observeTool("command_execution", { command: event.item.command });
           } catch (error) {
             controller.abort();
+            if (error instanceof AgentInvestigationLimitError) {
+              throw new AgentInvestigationLimitError(
+                error.message,
+                [...log, finalResponse].filter(Boolean).join("\n").slice(-32000),
+                writeProgressGuard.hasWritten,
+              );
+            }
+            throw error;
+          }
+        }
+        if (event.type === "item.started" && event.item.type === "mcp_tool_call") {
+          try {
+            const toolName = event.item.tool;
+            commandGuard.observe(JSON.stringify({
+              server: event.item.server,
+              toolName,
+            }));
+            writeProgressGuard.observeTool(toolName, {});
+          } catch (error) {
+            controller.abort();
+            if (error instanceof AgentInvestigationLimitError) {
+              throw new AgentInvestigationLimitError(
+                error.message,
+                [...log, finalResponse].filter(Boolean).join("\n").slice(-32000),
+                writeProgressGuard.hasWritten,
+              );
+            }
             throw error;
           }
         }
@@ -328,6 +389,9 @@ export class CodexAgent {
       if (!result.changed_files.length && changedFiles.size) result.changed_files = [...changedFiles];
       result.log = log.slice(-30).join("\n");
       opts.onProgress?.(`Codex: 结果解析完成（耗时 ${Math.round((Date.now() - started) / 1000)}s）`);
+      if (mediaProxy?.degraded()) {
+        opts.onProgress?.("Codex: 当前接口拒绝多媒体内容块，已自动降级为普通 URL 并完成重试");
+      }
       return result;
     } catch (error) {
       this.threads.delete(key);
@@ -337,13 +401,29 @@ export class CodexAgent {
       }
       if (stoppedBy === "timeout") {
         opts.onProgress?.(`Codex: 调用超时（${opts.timeoutS}s）`);
-        throw new AgentTimeoutError(`Agent 调用超时(${opts.timeoutS}s): codex`);
+        throw new AgentTimeoutError(
+          `Agent 调用超时(${opts.timeoutS}s): codex`,
+          [...log, finalResponse].filter(Boolean).join("\n").slice(-32000),
+          writeProgressGuard.hasWritten,
+        );
+      }
+      if (stoppedBy === "no_write") {
+        opts.onProgress?.(`Codex: ${opts.maxSecondsBeforeWrite}s 内仍未产生文件写入，停止无效停滞`);
+        throw new AgentInvestigationLimitError(
+          `实施阶段 ${opts.maxSecondsBeforeWrite}s 内仍未产生文件写入，已停止无效停滞`,
+          [...log, finalResponse].filter(Boolean).join("\n").slice(-32000),
+          false,
+        );
       }
       opts.onProgress?.(`Codex: 调用异常 · ${(error as Error).message}`);
       if (error instanceof AgentRuntimeError) throw error;
       throw new AgentRuntimeError(`Codex Agent 执行失败: ${(error as Error).message}`);
     } finally {
       clearInterval(watchdog);
+      if (mediaProxy) {
+        this.threads.delete(key);
+        await mediaProxy.close();
+      }
     }
   }
 }
