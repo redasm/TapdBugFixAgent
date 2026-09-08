@@ -43,7 +43,7 @@ import {
   progressFromLine,
   resultFromOutput,
 } from "../src/agent.js";
-import { Worker } from "../src/worker.js";
+import { Worker, requireExistingPlannedFiles } from "../src/worker.js";
 import { TapdMcpClient } from "../src/tapdMcp.js";
 import {
   createCodingAgent,
@@ -1235,6 +1235,28 @@ describe("p4", () => {
     expect(o[2]).toEqual({ depot: "//project/branch_0.7.0/c.ts", action: "add", changelist: "default", type: "text" });
   });
 
+  it("edit() 由编排器把已有计划文件打开到 default changelist", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: string[][] = [];
+    (client as unknown as { run: (a: string[]) => Promise<string> }).run = async (args: string[]) => {
+      calls.push(args);
+      return "";
+    };
+    await client.edit(["./a.ts", "./a.ts", "./b.ts"]);
+    expect(calls).toEqual([["edit", "-c", "default", "./a.ts", "./b.ts"]]);
+  });
+
+  it("revertUnchanged() 只清理 default 中没有内容变化的预打开文件", async () => {
+    const client = new P4Client("C:\\tmp", { client: "test-client" });
+    const calls: string[][] = [];
+    (client as unknown as { run: (a: string[]) => Promise<string> }).run = async (args: string[]) => {
+      calls.push(args);
+      return "";
+    };
+    await client.revertUnchanged(["./a.ts"]);
+    expect(calls).toEqual([["revert", "-a", "-c", "default", "./a.ts"]]);
+  });
+
   it("opened() 排除 P4 ignore_paths 中已受控的文件", async () => {
     const client = new P4Client("C:\\tmp", {}, undefined, undefined, ["Config/"]);
     (client as unknown as { run: () => Promise<string> }).run = async () => [
@@ -1477,6 +1499,40 @@ describe("p4", () => {
     };
     await expect(client.sync(["./..."], 600000, 2, 0)).rejects.toBeInstanceOf(P4Error);
     expect(lastErr).not.toBeNull();
+  });
+});
+
+describe("planned_files 工作区校验", () => {
+  const investigation = (file: string, evidence: string[] = ["[观察] 文件定位", "[推断] 根因"]): any => ({
+    ok: true,
+    root_cause: "测试根因",
+    evidence,
+    reproduction: { command: "", before: "失败" },
+    diagnostic_pages: [],
+    planned_files: [file],
+    confidence: 0.9,
+    blocked_reasons: [],
+    validation_errors: [],
+  });
+
+  it("不存在的计划路径触发调查恢复，避免把旧路径交给编码 Agent", () => {
+    const repo = tmpdir();
+    const checked = requireExistingPlannedFiles(
+      investigation("project:TypeScript/Src/Old/Moved.ts"),
+      [{ alias: "project", path: repo }],
+    );
+    expect(checked.ok).toBe(false);
+    expect(checked.validation_errors.join("\n")).toContain("实际文件路径");
+  });
+
+  it("明确标记为新文件时允许 planned_files 尚不存在", () => {
+    const repo = tmpdir();
+    const file = "project:tests/new-regression.test.ts";
+    const checked = requireExistingPlannedFiles(
+      investigation(file, [`[新文件] 新建测试文件 ${file}`, "[观察] 现有行为", "[推断] 根因"]),
+      [{ alias: "project", path: repo }],
+    );
+    expect(checked.ok).toBe(true);
   });
 });
 
@@ -3203,8 +3259,10 @@ describe("worker 两阶段修复协议", () => {
     expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("不冒充自动修复成功");
   });
 
-  it("诊断链接依赖 Chrome MCP，预检失败时阻塞且不消耗重试", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+  it("诊断链接只选择 Chrome MCP，但不把它作为强制健康门禁", async () => {
+    const repoDir = tmpdir();
+    fs.writeFileSync(path.join(repoDir, "Login.ts"), "export const login = true;\n");
+    const w = makeWorker([{ name: "r", path: repoDir, verify_cmds: [] }]);
     w.config.agent.backend = "codex";
     w.config.max_attempts = 2;
     const bug = makeBug({
@@ -3214,18 +3272,22 @@ describe("worker 两阶段修复协议", () => {
     const calls: Array<Record<string, unknown>> = [];
     vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
       calls.push(opts as unknown as Record<string, unknown>);
-      throw new AgentInfrastructureError("required MCP 预检失败: chrome_devtools: Connection closed");
+      return calls.length === 1
+        ? makeInvestigation("project:Login.ts")
+        : makeResult({ manual_assets: [{ path: "Login.ts", reason: "测试结束" }] });
     });
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "edit").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "revertUnchanged").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
     vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
 
     await w.processBug(bug);
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0].requiredMcpServers).toEqual(["chrome_devtools"]);
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
-    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].mcpServers).toEqual(["chrome_devtools"]);
+    expect(calls[0].requiredMcpServers).toEqual([]);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("manual_only");
   });
 
   it("Agent 超时后强制收敛，仍失败则自动重试而不是 needs_info", async () => {
@@ -3416,9 +3478,11 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("Reviewer 拒绝后把结构化 finding 交回 Fixer，修正并复审通过", async () => {
+    const repoDir = tmpdir();
+    fs.writeFileSync(path.join(repoDir, "Settings.ts"), "export const setting = true;\n");
     const w = makeWorker([{
       name: "r",
-      path: process.cwd(),
+      path: repoDir,
       verify_cmds: ['node -e "process.exit(0)"'],
     }]);
     w.config.review.enabled = true;
@@ -3450,6 +3514,8 @@ describe("worker 两阶段修复协议", () => {
       return makeResult({ raw_output: 'FINAL_RESULT: {"approved":true,"note":"问题已修复","findings":[]}' });
     });
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "edit").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "revertUnchanged").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "opened")
       .mockResolvedValueOnce([])
       .mockResolvedValue([
@@ -3464,6 +3530,10 @@ describe("worker 两阶段修复协议", () => {
     await w.processBug(bug);
 
     expect(calls).toHaveLength(5);
+    expect(String(calls[1].prompt)).toContain("编排器已在 default changelist 中打开");
+    expect(String(calls[1].prompt)).toContain("禁止执行任何 p4 命令");
+    expect(String(calls[1].prompt)).toContain("编排器会在 Agent 完成后统一执行 p4 add");
+    expect(String(calls[1].prompt)).not.toContain("只使用 default changelist");
     expect(calls[2].tools).toEqual(["read", "grep", "find", "ls"]);
     expect(calls[2].outputSchema).toBeDefined();
     expect(String(calls[3].prompt)).toContain("失败分支必须显示错误并返回");
@@ -3915,7 +3985,7 @@ describe("worker 自动重试", () => {
 // ensurePiModels / effectivePiModel：config.yaml pi.provider → ~/.pi/agent/models.json 注入
 // ---------------------------------------------------------------------------
 describe("ensurePiModels", () => {
-  it("provider 段完整时写入 models.json（apiKey 引用环境变量名，不落盘密钥）", () => {
+  it("provider 段完整时写入 models.json（apiKey 使用 Pi 0.85+ 的 $ENV_VAR 引用）", () => {
     const dir = tmpdir();
     const file = path.join(dir, "models.json");
     const pi: Config["pi"] = {
@@ -3933,7 +4003,7 @@ describe("ensurePiModels", () => {
     const p = root.providers.custom;
     expect(p.baseUrl).toBe("https://gateway.example.com");
     expect(p.api).toBe("anthropic-messages");
-    expect(p.apiKey).toBe("ANTHROPIC_AUTH_TOKEN"); // 环境变量名，不是密钥值
+    expect(p.apiKey).toBe("$ANTHROPIC_AUTH_TOKEN"); // 显式环境变量引用，不是密钥值
     expect(p.authHeader).toBe(true);
     expect(p.models).toHaveLength(1);
       expect(p.models[0]).toMatchObject({
@@ -3969,6 +4039,21 @@ describe("ensurePiModels", () => {
       contextWindow: 100000,
       maxTokens: 8000,
     });
+  });
+
+  it("未显式配置 key 时引用 ANTHROPIC_API_KEY", () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "models.json");
+    ensurePiModels({
+      provider: {
+        id: "proxy",
+        base_url: "https://proxy.example.com",
+        model_id: "proxy-model",
+      },
+    }, file);
+
+    const p = JSON.parse(fs.readFileSync(file, "utf-8")).providers.proxy;
+    expect(p.apiKey).toBe("$ANTHROPIC_API_KEY");
   });
 
   it("max_tokens 超过 Pi 网关上限时自动钳制为 131072", () => {

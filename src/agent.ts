@@ -575,6 +575,8 @@ export interface AgentRunOptions {
   additionalDirs?: string[];
   /** 本次任务必须可用的 MCP；即使 server 的全局 required=false 也会 fail closed。 */
   requiredMcpServers?: string[];
+  /** 本次任务要注入的 MCP；与 requiredMcpServers 分离，允许 Chrome 等增强能力失败后降级。 */
+  mcpServers?: string[];
   /** 本阶段命令预算；达到后立即中止，避免无效循环跑满总超时。 */
   maxCommandExecutions?: number;
   /** 同一规范化命令允许执行的最大次数。 */
@@ -607,8 +609,8 @@ export function effectivePiModel(pi: PiConfig): string {
 
 /** 把 config.yaml 的 pi.provider 段合并写入 ~/.pi/agent/models.json（仅配置了 provider 时）。
  *  - 只覆盖 providers.<id> 这一项，保留用户已配置的其它 provider / 内置 provider。
- *  - apiKey 优先取 p.api_key，否则取 p.api_key_env 的环境变量**名**（运行期由 pi 解析，
- *    密钥不落盘）。两者都缺则退化为 "ANTHROPIC_API_KEY"。
+ *  - apiKey 优先取 p.api_key，否则把 p.api_key_env 写成 `$ENV_VAR`（运行期由 pi 解析，
+ *    密钥不落盘）。两者都缺则退化为 `$ANTHROPIC_API_KEY`。
  *  - 模型 id 取 p.model_id（带 "/" 时取最后一段，与 effectivePiModel 的 --model 值对应）；
  *    缺 model_id 则不写（交给 pi 报错）。
  *  modelsPath 参数仅测试用。
@@ -620,7 +622,7 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
   const modelId = rawModel.includes("/") ? rawModel.split("/").pop() ?? "" : rawModel;
   if (!modelId) return;
 
-  const apiKey = p.api_key ?? p.api_key_env ?? "ANTHROPIC_API_KEY";
+  const apiKey = p.api_key ?? `$${p.api_key_env ?? "ANTHROPIC_API_KEY"}`;
   const entry: Record<string, unknown> = {
     baseUrl: p.base_url,
     api: "anthropic-messages",
@@ -722,9 +724,10 @@ export class PiAgent {
       );
     }
 
-    const requestedMcpServers = opts.requiredMcpServers === undefined
+    const selectedMcpServers = opts.mcpServers ?? opts.requiredMcpServers;
+    const requestedMcpServers = selectedMcpServers === undefined
       ? undefined
-      : new Set(opts.requiredMcpServers);
+      : new Set(selectedMcpServers);
     const mcpServers = resolveMcpServers(
       this.config.mcp_servers,
       opts.repoDir,

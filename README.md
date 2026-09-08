@@ -9,7 +9,7 @@
 **安全约定**：永不 `p4 submit`、永不 `git push`、永不修改 Tapd 单子状态——P4 代码停在 pending changelist，Git 代码停在本地修复分支，由你 review 后人工 submit/push。
 配置 Unreal MCP 后，Agent 可通过受控工具读取、修改并验证 Unreal/LGUI 资源；未命中或 MCP 未启用的二进制资源仍列入「需人工处理资源」。
 
-主体为 TypeScript（Node ≥ 20）并使用 SQLite 状态库；仅启用 Unreal MCP 时需要 Python。
+主体为 TypeScript（Node ≥ 22.19）并使用 SQLite 状态库；仅启用 Unreal MCP 时需要 Python。
 
 ---
 
@@ -28,11 +28,11 @@
 ```bash
 git clone <本仓库> && cd TapdBugFixAgent
 
-# 1. 装依赖（Node ≥ 20）
+# 1. 装依赖（Node ≥ 22.19）
 npm install
 
 # 2. 装 Pi 编码 Agent（仅使用 Pi 后端时需要）
-npm install -g @earendil-works/pi-coding-agent
+npm install -g @earendil-works/pi-coding-agent@0.85.1
 
 # 3. 生成配置
 cp config.example.yaml config.yaml
@@ -52,8 +52,8 @@ npm start -- serve
 
 | 依赖 | 说明 |
 |---|---|
-| Node.js ≥ 20 | 运行本体与 Tapd MCP（官方包已锁定为项目依赖，stdio 模式经 `npx --no-install` 启动） |
-| 编码 Agent | Pi：全局安装 `@earendil-works/pi-coding-agent`；Codex：项目依赖已包含官方 `@openai/codex-sdk` |
+| Node.js ≥ 22.19 | 运行本体、Pi 0.85.1 与 Tapd MCP（官方包已锁定为项目依赖，stdio 模式经 `npx --no-install` 启动） |
+| 编码 Agent | Pi：全局安装 `@earendil-works/pi-coding-agent@0.85.1`；Codex：项目依赖已包含官方 `@openai/codex-sdk` |
 | p4 命令行 | 在 PATH 中；为 Agent 建一个**专用 client workspace**（如 `tapd-agent_<你>`），别与日常开发共用 |
 | Tapd 凭据 | **个人访问令牌**（推荐，个人设置 → 个人访问令牌 创建）或 API 账号 |
 | Unreal MCP（可选） | 目标仓库包含 `Plugins/UnrealMCP`；Unreal Editor 已加载插件并启动桥接；本机 Python 可启动两个 MCP server |

@@ -207,9 +207,10 @@ export class CodexAgent {
     const sandboxMode: SandboxMode = opts.sandboxMode
       ?? (opts.tools?.length ? "read-only" : "workspace-write");
     const model = opts.model?.trim() || this.config.codex.model || "(Codex 默认模型)";
-    const requestedMcpServers = opts.requiredMcpServers === undefined
+    const selectedMcpServers = opts.mcpServers ?? opts.requiredMcpServers;
+    const requestedMcpServers = selectedMcpServers === undefined
       ? undefined
-      : new Set(opts.requiredMcpServers);
+      : new Set(selectedMcpServers);
     const servers = resolveMcpServers(
       this.config.mcp_servers,
       opts.repoDir,

@@ -437,6 +437,13 @@ export class P4Client {
   }
 
   // ---------- 写操作（编排器专用）----------
+  /** 在启动写入 Agent 前由编排器统一打开已有文件，避免 Agent 沙箱无法访问 P4 网络。 */
+  async edit(files: string[]): Promise<string> {
+    const targets = [...new Set(files.map((file) => file.trim()).filter(Boolean))];
+    if (!targets.length) return "";
+    return this.run(["edit", "-c", "default", ...targets]);
+  }
+
   async reconcile(preview?: string): Promise<string> {
     const filtered = preview === undefined ? await this.reconcilePreview() : this.filterReconcileOutput(preview);
     if (!filtered) return "";
@@ -450,6 +457,13 @@ export class P4Client {
   async revert(files: string[], changelist = "default"): Promise<string> {
     if (!files.length) return "";
     return this.run(["revert", "-c", changelist, ...files]);
+  }
+
+  /** 只关闭内容未变化的文件，保留 Agent 已产生的真实修改。 */
+  async revertUnchanged(files: string[], changelist = "default"): Promise<string> {
+    const targets = [...new Set(files.map((file) => file.trim()).filter(Boolean))];
+    if (!targets.length) return "";
+    return this.run(["revert", "-a", "-c", changelist, ...targets]);
   }
 
   async changeSpec(cl?: number): Promise<string> {

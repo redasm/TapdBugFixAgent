@@ -1,5 +1,8 @@
 /** 编排工作线程：调查、修复、验证、评审、pending changelist 与 Tapd 回写。 */
 
+import fs from "node:fs";
+import path from "node:path";
+
 import type { AdditionalDirConfig, Config, RepoConfig, WorkspaceConfig } from "./config.js";
 import { priorityRank } from "./config.js";
 import type { AgentResult, Bug, RetryEvidenceEntry } from "./models.js";
@@ -136,6 +139,22 @@ ${partialOutput.trim().slice(-32000) || "（没有保留下可用轨迹）"}
 禁止重新调查整个仓库、重新读取附件或扩大搜索范围。只允许对调查阶段的 planned_files 做少量必要确认，然后立即实施最小修复并运行最小相关验证。
 如果现有调查结论不足以安全修改，请立即在 blocked_reasons 中说明具体缺失证据；不要继续消耗时间等待外层超时。最后必须输出完整 FINAL_RESULT。`;
 
+const withPreopenedP4Files = (prompt: string): string => prompt
+  .replace(
+    `1. project（Perforce）中修改已有文件前执行 p4 edit；新建文件后执行 p4 add。
+2. 禁止 p4 submit / p4 revert / p4 sync / p4 change，只使用 default changelist。`,
+    `1. 编排器已在 default changelist 中打开所有实际存在的 project（Perforce）计划文件；Agent 沙箱无法连接 Perforce，禁止执行任何 p4 命令（包括 p4 edit/sync/change/opened/diff/status/filelog/annotate/add）。只需直接编辑已有文件；确需新建 planned_files 中明确列出的文件时直接创建，编排器会在 Agent 完成后统一执行 p4 add。
+2. Perforce 状态、diff、reconcile、changelist 创建与清理均由编排器在 Agent 返回后执行；不得因 Agent 侧无法连接 P4 而写入 blocked_reasons。`,
+  )
+  .replace(
+    "6. 禁止在 Perforce 根执行 git status/log/blame/diff；Perforce 历史与差异只使用 p4 filelog、p4 annotate、p4 diff。",
+    "6. 禁止在 Perforce 根执行 git status/log/blame/diff，也禁止在 Agent 内执行 p4 历史、状态或差异命令；所需完整 diff 由编排器在 Agent 返回后生成。",
+  )
+  .replace(
+    "- `p4 edit` 只是在 Perforce 中打开文件，不算已经落笔；必须随后使用编辑工具或补丁实际修改内容。宿主会在实施阶段长期只有只读调用而没有真实写入时提前终止。",
+    "- project 计划文件已由编排器预打开；必须使用编辑工具或补丁实际修改内容。宿主会在实施阶段长期只有只读调用而没有真实写入时提前终止。",
+  );
+
 /** 工作区中存在无法安全归属当前 Bug 的改动；这是操作阻塞，不应消耗模型修复次数。 */
 class WorkspaceBlockedError extends Error {}
 
@@ -162,6 +181,46 @@ const requireConcretePlannedFiles = (investigation: InvestigationResult): Invest
     validation_errors: [
       ...investigation.validation_errors,
       `planned_files 必须是已定位且带扩展名的具体文件，不能是目录、候选范围或说明文字: ${invalid.join(", ")}`,
+    ],
+  };
+};
+
+const plannedFilePath = (
+  value: string,
+  roots: Array<{ alias: string; path: string }>,
+): string | null => {
+  const normalized = value.replace(/\\/g, "/").trim();
+  const separator = normalized.indexOf(":");
+  const alias = (separator >= 0 ? normalized.slice(0, separator) : "project").toLowerCase();
+  const relative = separator >= 0 ? normalized.slice(separator + 1) : normalized;
+  const root = roots.find((item) => item.alias.toLowerCase() === alias);
+  if (!root || !relative || !fs.existsSync(root.path)) return null;
+  return path.resolve(root.path, ...relative.split("/"));
+};
+
+const explicitlyPlannedAsNew = (investigation: InvestigationResult, file: string): boolean => {
+  const normalized = file.replace(/\\/g, "/");
+  const relative = normalized.includes(":") ? normalized.slice(normalized.indexOf(":") + 1) : normalized;
+  return investigation.evidence.some((item) =>
+    /\[(?:新文件|新增)\]|(?:新建|新增)(?:测试)?文件/.test(item) && item.replace(/\\/g, "/").includes(relative));
+};
+
+export const requireExistingPlannedFiles = (
+  investigation: InvestigationResult,
+  roots: Array<{ alias: string; path: string }>,
+): InvestigationResult => {
+  if (!investigation.ok) return investigation;
+  const missing = investigation.planned_files.filter((file) => {
+    const resolved = plannedFilePath(file, roots);
+    return resolved !== null && !fs.existsSync(resolved) && !explicitlyPlannedAsNew(investigation, file);
+  });
+  if (!missing.length) return investigation;
+  return {
+    ...investigation,
+    ok: false,
+    validation_errors: [
+      ...investigation.validation_errors,
+      `planned_files 在对应工作区中不存在，请重新搜索并改为实际文件路径；如确需新建，须在 evidence 中用 [新文件] 明确说明: ${missing.join(", ")}`,
     ],
   };
 };
@@ -864,6 +923,7 @@ export class Worker {
     let activeRepo: RepoConfig | null = null;
     let gitAttempts: GitAttempt[] = [];
     let lastResult: AgentResult | null = null;
+    let orchestratorOpenedTargets: string[] = [];
     try {
       const repo = this.resolveRepo(bug);
       if (!repo) {
@@ -1011,9 +1071,9 @@ export class Worker {
       ])];
       const workspaceRoots = this.workspaceRoots(repo);
       const investigationAdditionalDirs = this.additionalPaths(repo);
-      if (mcpServerNames.length) {
+      if (investigationMcpServers.length) {
         this.store.addEvent(
-          `MCP: 已向 ${backend} Agent 注入配置：${mcpServerNames.join(", ")}；实际连接状态将在 Agent 启动/调用时继续输出`,
+          `MCP: 本次调查选择：${investigationMcpServers.join(", ")}；其中强制可用：${resourceMcpServers.join(", ") || "无"}`,
           "info",
           bug.id,
         );
@@ -1033,7 +1093,8 @@ export class Worker {
         completionGraceSeconds: 30,
         sandboxMode: "read-only" as const,
         outputSchema: INVESTIGATION_OUTPUT_SCHEMA,
-        requiredMcpServers: investigationMcpServers,
+        mcpServers: investigationMcpServers,
+        requiredMcpServers: resourceMcpServers,
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
         cancelEvent: this.cancelEvent,
         media: investigationMedia,
@@ -1085,6 +1146,7 @@ export class Worker {
                 maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
                 repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
                 completionGraceSeconds: 30,
+                mcpServers: [],
                 requiredMcpServers: [],
                 media: [],
               });
@@ -1107,10 +1169,13 @@ export class Worker {
       if (!investigated.ok) {
         throw new Error(`调查 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`);
       }
-      let investigation: InvestigationResult = requireConcretePlannedFiles(parseInvestigation(
-        investigated.raw_output || investigated.log || investigated.summary,
-        admission.context.diagnostic_links,
-      ));
+      let investigation: InvestigationResult = requireExistingPlannedFiles(
+        requireConcretePlannedFiles(parseInvestigation(
+          investigated.raw_output || investigated.log || investigated.summary,
+          admission.context.diagnostic_links,
+        )),
+        workspaceRoots,
+      );
       if (!investigation.ok && !investigation.blocked_reasons.length) {
         this.store.addEvent(
           "调查 Agent 仅返回过程说明或结构化结果不完整，正在原线程强制收敛（不计入 Bug 重试）",
@@ -1130,6 +1195,7 @@ export class Worker {
             maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
             repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
             completionGraceSeconds: 30,
+            mcpServers: [],
             requiredMcpServers: [],
             media: [],
           });
@@ -1143,10 +1209,13 @@ export class Worker {
             `调查 Agent 补充轮异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`,
           );
         }
-        investigation = requireConcretePlannedFiles(parseInvestigation(
-          investigated.raw_output || investigated.log || investigated.summary,
-          admission.context.diagnostic_links,
-        ));
+        investigation = requireExistingPlannedFiles(
+          requireConcretePlannedFiles(parseInvestigation(
+            investigated.raw_output || investigated.log || investigated.summary,
+            admission.context.diagnostic_links,
+          )),
+          workspaceRoots,
+        );
       }
       if (!investigation.ok) {
         const reason = [...investigation.blocked_reasons, ...investigation.validation_errors].join("；");
@@ -1191,6 +1260,20 @@ export class Worker {
           }
           throw error;
         }
+        const existingP4Targets = p4Targets.filter((target) => {
+          const relative = target.replace(/^\.\//, "");
+          return fs.existsSync(path.resolve(repo.path, ...relative.split("/")));
+        });
+        if (existingP4Targets.length) {
+          this.recordWriteIntent(bug.id, p4, investigation.planned_files);
+          await p4.edit(existingP4Targets);
+          orchestratorOpenedTargets = existingP4Targets;
+          this.store.addEvent(
+            `P4: 编排器已在 default changelist 打开 ${existingP4Targets.length} 个已有计划文件`,
+            "info",
+            bug.id,
+          );
+        }
       } else {
         this.store.addEvent(
           "P4: planned_files 不包含 project 路径，本次无需同步 P4 文件",
@@ -1198,7 +1281,7 @@ export class Worker {
           bug.id,
         );
       }
-      const prompt = buildImplementationPrompt({
+      const prompt = withPreopenedP4Files(buildImplementationPrompt({
         bug,
         repoName: repo.name,
         repoPath: repo.path,
@@ -1208,7 +1291,7 @@ export class Worker {
         reviewerFeedback: "",
         unrealMcpEnabled: resourceMcpEnabled,
         workspaceRoots,
-      });
+      }));
       this.store.addEvent(
         retryText
           ? `调用编码 Agent（${backend}）（第 ${attempts} 次尝试，注入上次失败证据）`
@@ -1228,6 +1311,7 @@ export class Worker {
         maxSecondsBeforeWrite: Math.min(this.config.agent_timeout_s, 900),
         sandboxMode: "workspace-write",
         outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
+        mcpServers: resourceMcpServers,
         requiredMcpServers: resourceMcpServers,
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
         onFileWrite: (file?: string) =>
@@ -1300,13 +1384,17 @@ export class Worker {
           throw error;
         }
       }
+      lastResult = result;
       if (!result.ok) {
         throw new Error(`修复 Agent 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
+      }
+      if (orchestratorOpenedTargets.length) {
+        await p4.revertUnchanged(orchestratorOpenedTargets);
+        orchestratorOpenedTargets = [];
       }
       if (result.blocked_reasons.length && !workspaceChangesTakenOver) {
         throw new VerificationError("修复 Agent 报告仍有阻塞项: " + result.blocked_reasons.join("；"));
       }
-      lastResult = result;
       const manualAssets = new Map(result.manual_assets.map((asset) => [asset.path, asset]));
       if (result.manual_assets.length) {
         this.store.addEvent(`识别到需人工处理资源 ${result.manual_assets.length} 项`, "info", bug.id);
@@ -1397,17 +1485,17 @@ export class Worker {
             fixRound += 1;
             const feedback = formatReviewerFeedback(review);
             this.store.addEvent(`Reviewer 拒绝候选，开始第 ${fixRound} 轮定向修正`, "warn", bug.id);
-            const correctionPrompt = buildImplementationPrompt({
-                bug,
-                repoName: repo.name,
-                repoPath: repo.path,
-                verifyCommands: this.verificationCommands(repo, investigation.planned_files),
-                investigation,
-                retryEvidence: retryText,
-            reviewerFeedback: feedback,
-            unrealMcpEnabled: resourceMcpEnabled,
-            workspaceRoots,
-            });
+            const correctionPrompt = withPreopenedP4Files(buildImplementationPrompt({
+              bug,
+              repoName: repo.name,
+              repoPath: repo.path,
+              verifyCommands: this.verificationCommands(repo, investigation.planned_files),
+              investigation,
+              retryEvidence: retryText,
+              reviewerFeedback: feedback,
+              unrealMcpEnabled: resourceMcpEnabled,
+              workspaceRoots,
+            }));
             const correctionOptions = {
               prompt: correctionPrompt,
               repoDir: repo.path,
@@ -1419,6 +1507,7 @@ export class Worker {
               maxSecondsBeforeWrite: Math.min(this.config.agent_timeout_s, 900),
               sandboxMode: "workspace-write",
               outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
+              mcpServers: resourceMcpServers,
               requiredMcpServers: resourceMcpServers,
               onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
               onFileWrite: (file?: string) =>
@@ -1566,6 +1655,13 @@ export class Worker {
         bug.id,
       );
     } catch (exc) {
+      if (p4 && orchestratorOpenedTargets.length) {
+        try {
+          await p4.forkForCleanup().revertUnchanged(orchestratorOpenedTargets);
+        } catch (cleanupError) {
+          this.store.addEvent(`P4: 清理编排器预打开的未修改文件失败: ${String(cleanupError)}`, "warn", bug.id);
+        }
+      }
       // 失败或人工中断可能留下未登记文件；下一次重新做一次完整基线扫描。
       if (activeRepo && activeRepo.preflight_reconcile === "once") {
         this.cleanP4Baselines.delete(activeRepo.path.replace(/\\/g, "/").toLowerCase());

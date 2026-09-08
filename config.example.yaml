@@ -28,7 +28,7 @@ codex:
 # 编码 Agent：pi（https://github.com/earendil-works/pi）
 #   以子进程方式调用 `pi --mode json "<prompt>"`（npm 全局安装 @earendil-works/pi-coding-agent）。
 #
-#   pi 0.74.2 鉴权注意：
+#   pi 0.85.1 鉴权注意：
 #     - 读 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN（或 `pi /login` 做 OAuth 登录，token 存
 #       ~/.pi/agent/auth.json）；**不读** ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN。
 #     - URL 只能通过 ~/.pi/agent/models.json 的自定义 provider 指定，pi 没有 --base-url 参数。
@@ -41,7 +41,7 @@ codex:
 #   【方式二：走中转/代理（url+key 全放 config.yaml，推荐）】
 #     填了 provider 段后，本工具会在 spawn pi 前自动把该段合并写入 ~/.pi/agent/models.json
 #     （只覆盖 providers.<id>，保留你已有其它 provider）。api_key_env 填环境变量**名**，
-#     运行期由 pi 解析，密钥不落盘。model_id 必填，构造 `--model <provider>/<model_id>`。
+#     本工具会按 Pi 0.85+ 要求写成 `$ENV_VAR`，密钥不落盘。model_id 必填，构造 `--model <provider>/<model_id>`。
 pi:
   provider:
     id: "aiyizhan"                                    # provider id（--model 前缀）
