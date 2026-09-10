@@ -388,6 +388,38 @@ export function extractPiProviderError(lines: string[]): string | undefined {
 // ---------------------------------------------------------------------------
 // 结构化输出解析
 // ---------------------------------------------------------------------------
+/** 保留可读证据，避免巨大的增量 JSON 挤掉先前轨迹或回显 prompt 示例。 */
+export function piRecoveryTrace(lines: string[]): string {
+  const entries: string[] = [];
+  const clip = (value: string) => value.length <= 2400 ? value : `${value.slice(0, 1200)}\n…\n${value.slice(-1200)}`;
+  const contentText = (value: unknown): string => typeof value === "string" ? value
+    : Array.isArray(value) ? value.flatMap((block) =>
+      block?.type === "text" && typeof block.text === "string" ? [block.text] : []).join("\n") : "";
+  for (const line of lines) {
+    try {
+      const event = JSON.parse(line);
+      if (event.type === "tool_execution_start") {
+        entries.push(`工具 ${event.toolName}: ${clip(JSON.stringify(event.args ?? {}))}`);
+      } else if (event.type === "tool_execution_end") {
+        entries.push(`结果 ${event.toolName}${event.isError ? "（失败）" : ""}: ${clip(contentText(event.result?.content))}`);
+      } else if (event.type === "message_end" && event.message?.role === "assistant") {
+        const text = contentText(event.message.content);
+        if (text) entries.push(`分析: ${clip(text)}`);
+      }
+    } catch { /* 非事件行不混入恢复证据 */ }
+  }
+  const final = extractFinalText(lines);
+  if (final) entries.push(`最终输出:\n${final.slice(-12000)}`);
+  const kept: string[] = [];
+  let size = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (size + entries[i].length + 1 > 32000) break;
+    kept.unshift(entries[i]);
+    size += entries[i].length + 1;
+  }
+  return kept.join("\n");
+}
+
 function stripCodeFence(seg: string): string {
   let s = seg.trim();
   // 回归：这里曾写成 s.split("\n", 1)[1]——JS 的 split 带 limit 时结果数组只有 1 个
@@ -780,7 +812,8 @@ export class PiAgent {
     const activeTools = opts.tools?.length
       ? [...opts.tools, ...piReadOnlyMcpTools(mcpServers)]
       : undefined;
-    if (activeTools?.length) args.push("--tools", [...new Set(activeTools)].join(","));
+    if (opts.tools?.length === 0) args.push("--no-tools");
+    else if (activeTools?.length) args.push("--tools", [...new Set(activeTools)].join(","));
     // 团队共享 skill 目录：pi 只认 <cwd>/.pi/skills，团队仓库里大家放的是 .agent(s)/skills，
     // 用 --skill <目录>（可重复）挂载进去。只传仓库里实际存在的目录（相对路径按仓库根解析）。
     for (const dir of this.skillDirs(opts.repoDir)) {
@@ -895,7 +928,7 @@ export class PiAgent {
         if (error instanceof AgentInvestigationLimitError) {
           guardFailure = new AgentInvestigationLimitError(
             error.message,
-            [...progressTrace, ...outLines.slice(-80)].join("\n").slice(-32000),
+            piRecoveryTrace(outLines),
             writeProgressGuard.hasWritten,
           );
           killProcessTree(proc);
@@ -948,7 +981,7 @@ export class PiAgent {
           clearInterval(watchdog);
           reject(new AgentTimeoutError(
             `Agent 调用超时(${opts.timeoutS}s): pi`,
-            [...progressTrace, ...outLines.slice(-80)].join("\n").slice(-32000),
+            piRecoveryTrace(outLines),
             writeProgressGuard.hasWritten,
           ));
           return;
@@ -958,7 +991,7 @@ export class PiAgent {
           clearInterval(watchdog);
           reject(new AgentInvestigationLimitError(
             `实施阶段 ${opts.maxSecondsBeforeWrite}s 内仍未产生文件写入，已停止无效停滞`,
-            [...progressTrace, ...outLines.slice(-80)].join("\n").slice(-32000),
+            piRecoveryTrace(outLines),
             false,
           ));
         }

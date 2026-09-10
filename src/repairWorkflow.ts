@@ -175,7 +175,7 @@ ${context}
 
 # 工作目录
 ${roots}
-引用文件时必须使用“根别名:相对路径”，例如 project:Source/A.cpp；不得只写无法区分根目录的相对路径。
+引用文件时必须使用上方实际列出的“根别名:相对路径”，例如 project:Source/A.cpp；不得使用未配置的别名，也不得只写无法区分根目录的相对路径。
 
 # 版本控制与只读命令规则
 - 执行历史、状态或差异命令前，先根据上方列表确认目标文件属于哪个根及其 VCS；不得在 Perforce 根执行 git status/log/blame/diff。
@@ -395,7 +395,7 @@ ${investigation.planned_files.map((file) => `- ${file}`).join("\n")}
 ${retry}${review}${playbookSection}
 # 工作目录与版本控制规则
 ${roots}
-所有 changed_files 必须使用“根别名:相对路径”，例如 project:Source/A.cpp 或 engine:Engine/Source/B.cpp。
+所有 changed_files 必须使用上方实际列出的“根别名:相对路径”，例如 project:Source/A.cpp。输出示例中的 engine 仅为占位符，未配置时必须替换为实际 Git 根别名。
 1. project（Perforce）中修改已有文件前执行 p4 edit；新建文件后执行 p4 add。
 2. 禁止 p4 submit / p4 revert / p4 sync / p4 change，只使用 default changelist。
 3. ${hasGit ? "Git 附加目录的修复分支已由编排器创建；禁止 git switch/checkout/branch/commit/reset/clean/push，只修改文件并运行只读 git diff/status。" : "当前没有 Git 附加目录。"}

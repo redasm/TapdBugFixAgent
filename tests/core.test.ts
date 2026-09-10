@@ -39,6 +39,7 @@ import {
   extractFinalJson,
   extractFinalText,
   extractPiProviderError,
+  piRecoveryTrace,
   formatRetryEvidence,
   progressFromLine,
   resultFromOutput,
@@ -69,7 +70,7 @@ import {
   resolveMcpServers,
 } from "../src/mcpServers.js";
 import { assessFixability } from "../src/quality.js";
-import { buildFixBranchName, GitWorkspace } from "../src/git.js";
+import { buildFixBranchName, GitWorkspace, GitWorkspaceError } from "../src/git.js";
 
 // mock MCP SDK：给 tapdMcp 回归测试用（不发起真实子进程/网络）
 const mcpMockState = vi.hoisted(() => ({
@@ -1525,6 +1526,15 @@ describe("planned_files 工作区校验", () => {
     expect(checked.validation_errors.join("\n")).toContain("实际文件路径");
   });
 
+  it("未知根别名不能绕过 Git 分支准备和变更采集", () => {
+    const checked = requireExistingPlannedFiles(
+      investigation("engine:Engine/Source/Foo.cpp"),
+      [{ alias: "project", path: "C:/project" }, { alias: "engine", path: "E:/engine" }],
+    );
+    expect(checked.ok).toBe(false);
+    expect(checked.validation_errors.join("\n")).toContain("未配置的根别名");
+  });
+
   it("明确标记为新文件时允许 planned_files 尚不存在", () => {
     const repo = tmpdir();
     const file = "project:tests/new-regression.test.ts";
@@ -1814,6 +1824,31 @@ function withFakePiOnPath(dir: string, fn: () => Promise<void>): Promise<void> {
 }
 
 describe("PiAgent 子进程控制", () => {
+  it("调查收尾显式空工具列表禁用全部 Pi 工具", async () => {
+    const d = tmpdir();
+    const script = path.join(d, "args.cjs");
+    fs.writeFileSync(script, "require('fs').writeFileSync('args.txt',JSON.stringify(process.argv.slice(2))); console.log('done');");
+    writeFakePi(d, process.platform === "win32" ? `node "${script}" %*` : `node "${script}" "$@"`);
+    await withFakePiOnPath(d, async () => {
+      await new PiAgent(makeConfig()).run({ prompt: "收尾", repoDir: d, timeoutS: 60, tools: [] });
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(d, "args.txt"), "utf8"))).toContain("--no-tools");
+  });
+
+  it("恢复轨迹保留多条完整证据，不混入用户示例和巨型增量事件", () => {
+    const trace = piRecoveryTrace([
+      { type: "message_end", message: { role: "user", content: [{ type: "text", text: "FINAL_RESULT: 用户示例" }] } },
+      { type: "tool_execution_start", toolName: "read", args: { path: "Map.ts" } },
+      { type: "tool_execution_end", toolName: "read", result: { content: [{ type: "text", text: "代码证据" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "已定位空值分支" }] } },
+      { type: "message_update", message: { content: "x".repeat(64000) } },
+    ].map((event) => JSON.stringify(event)));
+    expect(trace).toContain("Map.ts");
+    expect(trace).toContain("代码证据");
+    expect(trace).toContain("已定位空值分支");
+    expect(trace).not.toContain("用户示例");
+    expect(trace.length).toBeLessThan(1000);
+  });
   it("Pi 进程 exit=0 但 provider stopReason=error 时按基础设施失败处理", async () => {
     const d = tmpdir();
     const script = path.join(d, "provider-error.cjs");
@@ -2890,6 +2925,35 @@ describe("worker 两阶段修复协议", () => {
       .toEqual(["[engine] engine-test"]);
   });
 
+  it("Git 工作区已有改动只进入阻塞，不消耗模型重试", async () => {
+    const w = makeWorker([{
+      name: "game", path: "C:/project", verify_cmds: [],
+      additional_dirs: [{ name: "engine", path: "C:/engine", vcs: "git", base_branch: "main", author: "me", verify_cmds: [] }],
+    }]);
+    const bug = makeBug();
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const run = vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeInvestigation("engine:Engine/Foo.cpp"));
+    vi.spyOn(GitWorkspace.prototype, "prepareBranch").mockRejectedValue(new GitWorkspaceError("Git 工作区存在未提交改动"));
+    await w.processBug(bug);
+    expect(run).toHaveBeenCalledOnce();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("blocked_workspace");
+    expect(w.store.getJob(bug.id)?.attempts).toBe(0);
+  });
+
+  it("验证同时登记预打开文件以外的实际改动，再准确拒绝越界", async () => {
+    const w = makeWorker();
+    const p4 = new P4Client("C:/project");
+    const opened: OpenedFile[] = [{ depot: "//depot/Plan.ts", action: "edit", changelist: "default", type: "text" }];
+    const preview = vi.spyOn(p4, "reconcilePreview").mockResolvedValue("//depot/Actual.ts#1 - reconcile to edit");
+    const reconcile = vi.spyOn(p4, "reconcile").mockResolvedValue("");
+    vi.spyOn(p4, "opened").mockResolvedValue([...opened, { depot: "//depot/Actual.ts", action: "edit", changelist: "default", type: "text" }]);
+    const verify = (w as unknown as { verifyCandidate: (...args: unknown[]) => Promise<unknown> }).verifyCandidate.bind(w);
+    await expect(verify(p4, { path: "C:/project", verify_cmds: [] }, [], opened,
+      ["project:Plan.ts"], ["project:Actual.ts"])).rejects.toThrow("实际修改超出调查阶段计划范围");
+    expect(preview).toHaveBeenCalledWith(["./Plan.ts", "./Actual.ts"]);
+    expect(reconcile).toHaveBeenCalledOnce();
+  });
+
   it("跨目录修复失败时回滚本次 Git 分支", async () => {
     const repo: RepoConfig = {
       name: "game",
@@ -3237,6 +3301,7 @@ describe("worker 两阶段修复协议", () => {
       );
     });
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "revertUnchanged").mockResolvedValue("");
     let openedCalls = 0;
     vi.spyOn(P4Client.prototype, "opened").mockImplementation(async () => {
       openedCalls += 1;
@@ -3257,6 +3322,82 @@ describe("worker 两阶段修复协议", () => {
     );
     expect(w.store.getJob(bug.id)?.agent_state).toBe("manual_review");
     expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("不冒充自动修复成功");
+  });
+
+  it.each(["timeout", "limit"])("%s 时 P4 只有预打开文件必须定向恢复，不能当成真实补丁", async (kind) => {
+    const repo = tmpdir();
+    fs.writeFileSync(path.join(repo, "Login.ts"), "old");
+    const w = makeWorker([{ name: "r", path: repo, verify_cmds: [] }]);
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    let opened = false;
+    let changed = false;
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) return makeInvestigation("Login.ts");
+      if (calls.length === 2) {
+        const ErrorType = kind === "timeout" ? AgentTimeoutError : AgentInvestigationLimitError;
+        throw new ErrorType("预算耗尽", "已确认 Login.ts 的空值分支");
+      }
+      changed = true;
+      return makeResult({ changed_files: ["project:Login.ts"], summary: "完成修复" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "edit").mockImplementation(async () => { opened = true; return ""; });
+    const revert = vi.spyOn(P4Client.prototype, "revertUnchanged").mockImplementation(async () => {
+      if (!changed) opened = false;
+      return "";
+    });
+    vi.spyOn(P4Client.prototype, "opened").mockImplementation(async () => opened
+      ? [{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }] : []);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockImplementation(async () => changed && !opened
+      ? "//depot/Login.ts#1 - reconcile to edit" : "");
+    vi.spyOn(P4Client.prototype, "reconcile").mockImplementation(async () => { opened = true; return ""; });
+    vi.spyOn(P4Client.prototype, "diffUnified").mockImplementation(async () => changed
+      ? "--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed" : "==== //depot/Login.ts#1 - Login.ts ====\n");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(3);
+    expect(String(calls[2].prompt)).toContain("编码阶段已进入强制收尾");
+    expect(revert).toHaveBeenCalled();
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it.each([true, false])("超时补丁验证后必须继续独立评审（approved=%s），不因缺失收尾而重做", async (approved) => {
+    const repo = tmpdir();
+    fs.writeFileSync(path.join(repo, "Login.ts"), "old");
+    const w = makeWorker([{ name: "r", path: repo, verify_cmds: ['node -e "process.exit(0)"'] }]);
+    w.config.review.enabled = true;
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeInvestigation("Login.ts"))
+      .mockRejectedValueOnce(new AgentTimeoutError("超时", "没有 FINAL_RESULT，但文件已修改", true))
+      .mockResolvedValueOnce(makeResult({ raw_output: JSON.stringify({
+        approved, note: "已检查", findings: approved ? [] : [{
+          severity: "high", title: "仍有回归", file: "Login.ts", line: 1,
+          evidence: "空值路径未保护", required_change: "修复空值路径",
+        }],
+      }) }));
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "edit").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/Login.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "revertUnchanged").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Login.ts\n+++ b/Login.ts\n-old\n+fixed");
+    const createPending = vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
+
+    await w.processBug(bug);
+
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(w.store.getJob(bug.id)?.agent_state).toBe(approved ? "review_pending" : "pending");
+    if (approved) expect(createPending).toHaveBeenCalledOnce();
+    else expect(createPending).not.toHaveBeenCalled();
   });
 
   it("诊断链接只选择 Chrome MCP，但不把它作为强制健康门禁", async () => {
@@ -3336,6 +3477,7 @@ describe("worker 两阶段修复协议", () => {
 
     expect(calls).toHaveLength(3);
     expect(String(calls[1].prompt)).toContain("调查阶段已到收敛点");
+    expect(calls[1].tools).toEqual([]);
     expect(String(calls[1].prompt)).toContain("MapMarkChooseView.ts");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });

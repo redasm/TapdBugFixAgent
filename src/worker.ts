@@ -69,6 +69,7 @@ import { createTapdClient, type TapdBackend, TapdError } from "./tapd.js";
 import type { AgentMediaInput } from "./media.js";
 import {
   GitWorkspace,
+  GitWorkspaceError,
   type GitBranchSession,
   type GitFinalizeResult,
 } from "./git.js";
@@ -210,6 +211,17 @@ export const requireExistingPlannedFiles = (
   roots: Array<{ alias: string; path: string }>,
 ): InvestigationResult => {
   if (!investigation.ok) return investigation;
+  const unknownRoots = investigation.planned_files.filter((file) => {
+    const separator = file.indexOf(":");
+    const alias = separator >= 0 ? file.slice(0, separator).toLowerCase() : "project";
+    return !roots.some((root) => root.alias.toLowerCase() === alias);
+  });
+  if (unknownRoots.length) return {
+    ...investigation,
+    ok: false,
+    validation_errors: [...investigation.validation_errors,
+      `planned_files 使用了未配置的根别名，只能使用 ${roots.map((root) => root.alias).join(", ")}: ${unknownRoots.join(", ")}`],
+  };
   const missing = investigation.planned_files.filter((file) => {
     const resolved = plannedFilePath(file, roots);
     return resolved !== null && !fs.existsSync(resolved) && !explicitlyPlannedAsNew(investigation, file);
@@ -692,6 +704,7 @@ export class Worker {
       for (const attempt of attempts.reverse()) {
         try { await attempt.workspace.rollback(attempt.session); } catch { /* 保留原始异常 */ }
       }
+      if (error instanceof GitWorkspaceError) throw new WorkspaceBlockedError(error.message);
       throw error;
     }
   }
@@ -719,7 +732,15 @@ export class Worker {
     gitAttempts: GitAttempt[],
     opened?: OpenedFile[] | null,
     plannedFiles?: string[],
+    reportedFiles: string[] = [],
   ): Promise<{ opened: OpenedFile[]; gitFiles: string[]; diff: string; summary: string; verified: boolean }> {
+    // 计划文件已预打开，仍需登记 Agent 实际写入的其它精确路径，再由范围门拒绝越界。
+    const targets = p4ReconcileTargets([...(plannedFiles ?? []), ...reportedFiles]);
+    const preview = await p4.reconcilePreview(targets);
+    if (preview.trim()) {
+      await p4.reconcile(preview);
+      opened = await p4.opened("default", true);
+    }
     let actualOpened = opened?.length ? opened : [];
     if (!actualOpened.length) {
       const p4Opened = await p4.opened("default");
@@ -810,14 +831,21 @@ export class Worker {
     };
   }
 
-  /** 只判断编码阶段是否已经留下真实工作区改动，不运行测试，也不改变 P4 状态。 */
+  /** 检查真实改动；只关闭内容未变的 edit，不撤销补丁，也不运行测试。 */
   private async hasImplementationChanges(
     p4: P4Client,
     gitAttempts: GitAttempt[],
     plannedFiles: string[],
   ): Promise<boolean> {
-    const opened = await p4.opened("default");
-    if (opened.length && (await p4.diffUnified(opened.map((item) => item.depot))).trim()) return true;
+    // p4 diff -du 对未修改的已打开文件也会输出 ==== ... ==== 标题。
+    // 先关闭这些预打开文件，不能把标题非空当作真实补丁。
+    let opened = await p4.opened("default", true);
+    const edits = opened.filter((item) => item.action === "edit").map((item) => item.depot);
+    if (edits.length) {
+      await p4.revertUnchanged(edits);
+      opened = await p4.opened("default", true);
+    }
+    if (opened.length) return true;
     if ((await p4.reconcilePreview(p4ReconcileTargets(plannedFiles))).trim()) return true;
     for (const attempt of gitAttempts) {
       if ((await attempt.workspace.changedFiles(attempt.session.baseCommit)).length) return true;
@@ -1081,7 +1109,7 @@ export class Worker {
       this.store.addEvent("调用只读调查 Agent：定位根因、证据与最小修改范围", "info", bug.id);
       const investigationPrompt = buildInvestigationPrompt(
         bug, repo.name, repo.path, resourceMcpEnabled, workspaceRoots,
-      );
+      ) + (retryText ? `\n# 上次失败证据（调查时必须核对，避免换方向后丢失已有定位）\n${retryText}` : "");
       const investigationTimeoutS = Math.min(this.config.agent_timeout_s, 600);
       const investigationRunOptions = {
         repoDir: repo.path,
@@ -1142,7 +1170,7 @@ export class Worker {
                   error.partialOutput,
                 ),
                 timeoutS: Math.min(this.config.agent_timeout_s, 180),
-                tools: ["read"],
+                tools: [],
                 maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
                 repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
                 completionGraceSeconds: 30,
@@ -1330,7 +1358,7 @@ export class Worker {
         const hasChanges = await this.hasImplementationChanges(
           p4,
           gitAttempts,
-          investigation.planned_files,
+          [...investigation.planned_files, ...this.lastAttemptFiles(bug.id)],
         );
         if (hasChanges) {
           result = resultFromOutput(error.partialOutput, 0);
@@ -1343,13 +1371,15 @@ export class Worker {
             "warn",
             bug.id,
           );
-        } else if (error instanceof AgentInvestigationLimitError) {
+        } else {
           this.store.addEvent(
-            `编码阶段 ${Math.min(this.config.agent_timeout_s, _AGENT_PHASE_TIMEOUT_S)}s 内没有真实写入，启动一次 ${_IMPLEMENTATION_RECOVERY_TIMEOUT_S}s 定向收尾`,
+            `编码阶段达到预算但没有真实改动，启动一次 ${_IMPLEMENTATION_RECOVERY_TIMEOUT_S}s 定向收尾`,
             "warn",
             bug.id,
           );
           try {
+            // 上面的真实改动检查会关闭未改动的预打开文件；恢复编码前重新使其可写。
+            if (orchestratorOpenedTargets.length) await p4.edit(orchestratorOpenedTargets);
             result = await agent.run({
               ...implementationRunOptions,
               prompt: buildImplementationRecoveryPrompt(prompt, error.partialOutput),
@@ -1366,7 +1396,7 @@ export class Worker {
             const recoveryHasChanges = await this.hasImplementationChanges(
               p4,
               gitAttempts,
-              investigation.planned_files,
+              [...investigation.planned_files, ...this.lastAttemptFiles(bug.id)],
             );
             if (!recoveryHasChanges) throw recoveryError;
             result = resultFromOutput(recoveryError.partialOutput, 0);
@@ -1380,8 +1410,6 @@ export class Worker {
               bug.id,
             );
           }
-        } else {
-          throw error;
         }
       }
       lastResult = result;
@@ -1444,6 +1472,7 @@ export class Worker {
         try {
           verified = await this.verifyCandidate(
             p4, repo, gitAttempts, opened, investigation.planned_files,
+            [...result.changed_files, ...this.lastAttemptFiles(bug.id)],
           );
         } catch (error) {
           if (workspaceChangesTakenOver) {
@@ -1461,7 +1490,7 @@ export class Worker {
         testOut = verified.summary;
         verificationPassed = verified.verified;
         this.store.updateJob(bug.id, { verification: verified });
-        if (workspaceChangesTakenOver) {
+        if (workspaceChangesTakenOver && !(this.config.review.enabled && verificationPassed)) {
           throw new VerificationError(
             "编码 Agent 达到执行预算；已有真实 diff 已完成验证，但流程未正常收尾，转人工评审而不冒充自动修复成功",
           );
@@ -1550,6 +1579,7 @@ export class Worker {
             }
             verified = await this.verifyCandidate(
               p4, repo, gitAttempts, null, investigation.planned_files,
+              [...result.changed_files, ...this.lastAttemptFiles(bug.id)],
             );
             opened = verified.opened;
             result.changed_files = [
