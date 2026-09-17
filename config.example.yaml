@@ -181,7 +181,6 @@ quality:
     min_score: 55
     require_reproduction_signal: true
     manual_keywords: []                 # 通用资源门禁由各 MCP 的 automates_manual_keywords 声明
-    high_risk_keywords: [支付, 账号, 登录, 鉴权, 存档, 协议, 加密, 隐私]
 
 review:
   enabled: true                     # 独立只读 Reviewer；high/medium finding 必须修正

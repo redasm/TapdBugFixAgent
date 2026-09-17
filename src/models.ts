@@ -50,6 +50,12 @@ export interface RetryEvidenceEntry {
   opened_files: string[];
   agent_summary: string;
   manual_assets: string[];
+  phase?: string;
+  partial_output?: string;
+  context_key?: string;
+  investigation?: Record<string, unknown>;
+  investigation_progress?: import("./investigationProgress.js").InvestigationProgress;
+  review_findings?: Record<string, unknown>;
 }
 
 export interface Bug {

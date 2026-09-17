@@ -200,7 +200,7 @@
           <option value="verified">机器验证通过</option>
           <option value="review_pending">待人工确认</option>
           <option value="needs_info">需要补充信息</option>
-          <option value="manual_review">高风险人工评审</option>
+          <option value="manual_review">候选未完成</option>
           <option value="blocked_workspace">工作区待清理</option>
           <option value="accepted">人工原样接受</option>
           <option value="accepted_modified">人工修改后接受</option>
@@ -402,7 +402,7 @@ async function api(path, method='GET', body) {
 // ---------- 渲染 ----------
 const STATE_LABEL = {
   pending:'待处理', in_progress:'处理中', candidate:'候选待验证', candidate_partial:'候选（资源待人工）',
-  verified:'机器验证通过', review_pending:'待人工最终确认', needs_info:'需要补充信息', manual_review:'高风险人工评审',
+  verified:'机器验证通过', review_pending:'待人工最终确认', needs_info:'需要补充信息', manual_review:'候选未完成',
   blocked_workspace:'工作区待清理',
   accepted:'人工原样接受', accepted_modified:'人工修改后接受', rejected:'人工拒绝', reopened:'提交后重开',
   manual_only:'资源待人工', failed:'失败', skipped:'跳过'
@@ -417,7 +417,7 @@ const GROUP_ORDER = [
   ['candidate', '候选待验证'],
   ['candidate_partial', '候选（资源待人工）'],
   ['needs_info', '需要补充信息'],
-  ['manual_review', '高风险人工评审'],
+  ['manual_review', '候选未完成'],
   ['blocked_workspace', '工作区待清理'],
   ['failed', '失败'],
   ['reopened', '提交后重开'],
@@ -664,6 +664,9 @@ function renderDetail(job) {
       <div><b>第 ${escapeHtml(r.attempt)} 次</b> · ${escapeHtml(r.at || '')}
         <span class="r-reason">— ${escapeHtml((r.failure_reason || '').slice(0, 300))}</span></div>
       ${r.agent_summary ? `<div class="muted">Agent 说明: ${escapeHtml(r.agent_summary)}</div>` : ''}
+      ${r.phase ? `<div class="muted">失败阶段: ${escapeHtml(r.phase)}</div>` : ''}
+      ${r.investigation_progress ? `<details><summary>未完成调查断点（待核对）</summary><pre>已读工具记录:\n${escapeHtml((r.investigation_progress.tool_calls || []).join('\n'))}\n已有证据:\n${escapeHtml((r.investigation_progress.findings || []).join('\n'))}\n待核查问题:\n${escapeHtml((r.investigation_progress.open_questions || []).join('\n'))}\n轨迹:\n${escapeHtml(r.investigation_progress.trace || '')}</pre></details>` : ''}
+      ${r.partial_output ? `<details><summary>中断前证据（重试时沿用）</summary><pre>${escapeHtml(r.partial_output)}</pre></details>` : ''}
       ${r.opened_files && r.opened_files.length ? `<div class="r-file">当时打开文件: ${escapeHtml(r.opened_files.join(', '))}</div>` : ''}
       ${r.manual_assets && r.manual_assets.length ? `<div class="r-file">当时需人工资源: ${escapeHtml(r.manual_assets.join(', '))}</div>` : ''}
     </div>`).join('')}
@@ -685,9 +688,9 @@ function renderDetail(job) {
     </div>
     ${progressHTML(job)}
     ${retryHTML}
-    ${investigation.root_cause ? `<div class="section">
-      <h4>只读调查结论</h4>
-      <pre>根因: ${escapeHtml(investigation.root_cause)}\n置信度: ${escapeHtml(investigation.confidence)}\n证据:\n${escapeHtml((investigation.evidence || []).join('\n'))}</pre>
+    ${investigation.root_cause || (investigation.evidence || []).length || (investigation.validation_errors || []).length ? `<div class="section">
+      <h4>${investigation.ok === false ? "只读调查尚未完成（待核对）" : "只读调查结论"}</h4>
+      <pre>根因: ${escapeHtml(investigation.root_cause)}\n置信度: ${escapeHtml(investigation.confidence)}\n证据:\n${escapeHtml((investigation.evidence || []).join('\n'))}\n待核查问题:\n${escapeHtml((investigation.validation_errors || []).join('\n'))}</pre>
     </div>` : ''}
     ${verification.summary ? `<div class="section">
       <h4>机器验证</h4>

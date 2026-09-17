@@ -2,6 +2,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { defaultSearchPaths } from "./search.js";
+import { captureInvestigationProgress, type InvestigationProgress } from "./investigationProgress.js";
 
 import type { AdditionalDirConfig, Config, RepoConfig, WorkspaceConfig } from "./config.js";
 import { priorityRank } from "./config.js";
@@ -33,6 +36,7 @@ import {
   CancelEvent,
   formatRetryEvidence,
   resultFromOutput,
+  withRecoveryEvidence,
 } from "./agent.js";
 import {
   createCodingAgent,
@@ -54,6 +58,7 @@ import {
   INVESTIGATION_OUTPUT_SCHEMA,
   buildImplementationPrompt,
   buildInvestigationPrompt,
+  buildInvestigationContinuationPrompt,
   buildInvestigationRecoveryPrompt,
   buildInvestigationTimeoutRecoveryPrompt,
   parseInvestigation,
@@ -117,8 +122,8 @@ const _MAX_EVIDENCE_ENTRIES = 6; // 重试证据最多保留最近 6 次失败
 // 不按调用次数强杀，避免把正常调查误判成循环；总超时与重复命令守卫负责止损。
 const _INVESTIGATION_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
 const _IMPLEMENTATION_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
-const _REVIEW_COMMAND_BUDGET = 60;
-const _RECOVERY_COMMAND_BUDGET = 20;
+const _REVIEW_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
+const _RECOVERY_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
 const _REPEATED_COMMAND_LIMIT = 3;
 const _IMPLEMENTATION_READ_ONLY_BEFORE_WRITE_LIMIT = Number.POSITIVE_INFINITY;
 const _AGENT_PHASE_TIMEOUT_S = 600;
@@ -357,6 +362,17 @@ export class Worker {
    * 「处理中」却无任何进度输出）。
    */
   private reconcileStaleInProgress(): void {
+    // Retired admission category: requeue only jobs blocked before producing a candidate.
+    for (const job of this.store.listJobs("manual_review")) {
+      if (job.changelist || Number(job.attempts ?? 0) !== 0
+          || !String(job.failure_reason ?? "").startsWith("涉及高风险领域，必须人工确认:")) continue;
+      const id = String(job.bug_id);
+      this.store.updateJob(id, {
+        agent_state: "pending", failure_reason: null, admission_score: null,
+        started_at: null, finished_at: null,
+      });
+      this.store.addEvent("已移除关键词准入分类，任务恢复待处理", "info", id);
+    }
     for (const job of this.store.listJobs("in_progress")) {
       const id = String(job.bug_id);
       this.store.updateJob(id, { agent_state: "pending", started_at: null });
@@ -952,6 +968,11 @@ export class Worker {
     let gitAttempts: GitAttempt[] = [];
     let lastResult: AgentResult | null = null;
     let orchestratorOpenedTargets: string[] = [];
+    let phase = "preflight";
+    let contextKey = "";
+    let investigationCheckpoint: InvestigationResult | undefined;
+    let investigationProgress: InvestigationProgress | undefined;
+    let investigationOutput = "";
     try {
       const repo = this.resolveRepo(bug);
       if (!repo) {
@@ -973,9 +994,7 @@ export class Worker {
       );
       this.store.updateJob(bug.id, { admission_score: admission.score });
       if (!admission.eligible) {
-        const state = admission.disposition === "needs_info"
-          ? "needs_info"
-          : admission.disposition === "manual_only" ? "manual_only" : "manual_review";
+        const state = admission.disposition === "manual_only" ? "manual_only" : "needs_info";
         const reason = admission.reasons.join("；") || "自动修复准入未通过";
         this.store.updateJob(bug.id, {
           agent_state: state,
@@ -1067,7 +1086,8 @@ export class Worker {
       }
 
       // ---- 带证据的重试：把之前的失败记录压缩成提示，喂给全新上下文的 Agent ----
-      const retryText = formatRetryEvidence(this.retryEvidenceEntries(bug.id));
+      const retryEntries = this.retryEvidenceEntries(bug.id);
+      const retryText = formatRetryEvidence(retryEntries);
       const investigationMedia = await this.mediaInputsForBug(bug);
       const attempts = Number(this.store.getJob(bug.id)?.attempts ?? 0) + 1;
       const agent = createCodingAgent(this.config, backend);
@@ -1098,6 +1118,7 @@ export class Worker {
         ...resourceMcpServers,
       ])];
       const workspaceRoots = this.workspaceRoots(repo);
+      contextKey = createHash("sha256").update(JSON.stringify({ context: admission.context, roots: workspaceRoots })).digest("hex");
       const investigationAdditionalDirs = this.additionalPaths(repo);
       if (investigationMcpServers.length) {
         this.store.addEvent(
@@ -1107,7 +1128,7 @@ export class Worker {
         );
       }
       this.store.addEvent("调用只读调查 Agent：定位根因、证据与最小修改范围", "info", bug.id);
-      const investigationPrompt = buildInvestigationPrompt(
+      let investigationPrompt = buildInvestigationPrompt(
         bug, repo.name, repo.path, resourceMcpEnabled, workspaceRoots,
       ) + (retryText ? `\n# 上次失败证据（调查时必须核对，避免换方向后丢失已有定位）\n${retryText}` : "");
       const investigationTimeoutS = Math.min(this.config.agent_timeout_s, 600);
@@ -1128,11 +1149,32 @@ export class Worker {
         media: investigationMedia,
       };
       let investigated: AgentResult;
+      phase = "investigation";
+      const previous = retryEntries.at(-1);
+      if (previous?.context_key === contextKey && previous.phase === "investigation") {
+        investigationProgress = previous.investigation_progress
+          ?? (previous.partial_output ? captureInvestigationProgress(
+            previous.partial_output, parseInvestigation(JSON.stringify(previous.investigation ?? {})),
+          ) : undefined);
+        if (investigationProgress) {
+          investigationPrompt = buildInvestigationContinuationPrompt(investigationPrompt, investigationProgress);
+          this.store.addEvent("恢复未完成调查断点：核对已读文件，仅补查未确认问题", "info", bug.id);
+        }
+      }
+      const saved = previous?.context_key === contextKey && previous.phase === "implementation"
+        && /超时|timeout|停滞/i.test(previous.failure_reason) && previous.investigation
+        ? requireExistingPlannedFiles(requireConcretePlannedFiles(parseInvestigation(JSON.stringify(previous.investigation))), workspaceRoots)
+        : undefined;
       try {
-        investigated = await agent.run({
-          prompt: investigationPrompt,
-          ...investigationRunOptions,
-        });
+        if (saved?.ok) {
+          investigated = resultFromOutput(JSON.stringify(saved), 0);
+          this.store.addEvent("恢复上次调查检查点：由编码阶段核对当前源码后续修，不重新做全仓调查", "info", bug.id);
+        } else {
+          investigated = await agent.run({
+            prompt: investigationPrompt,
+            ...investigationRunOptions,
+          });
+        }
       } catch (error) {
         if (error instanceof AgentInfrastructureError) {
           throw new WorkspaceBlockedError(error.message);
@@ -1150,6 +1192,10 @@ export class Worker {
             error.partialOutput,
             admission.context.diagnostic_links,
           );
+          investigationOutput = error.partialOutput;
+          investigationCheckpoint = partialInvestigation;
+          investigationProgress = captureInvestigationProgress(error.partialOutput, partialInvestigation, investigationProgress);
+          this.store.updateJob(bug.id, { investigation: partialInvestigation });
           if (partialInvestigation.ok) {
             investigated = {
               ok: true,
@@ -1171,6 +1217,7 @@ export class Worker {
                 ),
                 timeoutS: Math.min(this.config.agent_timeout_s, 180),
                 tools: [],
+                thinkingLevel: "off",
                 maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
                 repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
                 completionGraceSeconds: 30,
@@ -1182,7 +1229,7 @@ export class Worker {
               if (recoveryError instanceof AgentInfrastructureError) {
                 throw new WorkspaceBlockedError(recoveryError.message);
               }
-              throw recoveryError;
+              throw withRecoveryEvidence(error, recoveryError);
             }
             if (!investigated.ok) {
               throw new Error(
@@ -1204,9 +1251,13 @@ export class Worker {
         )),
         workspaceRoots,
       );
+      investigationOutput = investigated.raw_output || investigated.log || investigated.summary;
+      investigationCheckpoint = investigation;
+      investigationProgress = captureInvestigationProgress(investigationOutput, investigation, investigationProgress);
+      this.store.updateJob(bug.id, { investigation });
       if (!investigation.ok && !investigation.blocked_reasons.length) {
         this.store.addEvent(
-          "调查 Agent 仅返回过程说明或结构化结果不完整，正在原线程强制收敛（不计入 Bug 重试）",
+          "调查证据或结构化结果不完整，继续定向核查缺失项（不计入 Bug 重试）",
           "warn",
           bug.id,
         );
@@ -1214,12 +1265,13 @@ export class Worker {
           investigated = await agent.run({
             prompt: buildInvestigationRecoveryPrompt(
               investigationPrompt,
-              investigated.raw_output || investigated.log || investigated.summary,
+              investigationOutput,
               investigation.validation_errors,
+              investigationProgress,
             ),
             ...investigationRunOptions,
             timeoutS: Math.min(this.config.agent_timeout_s, 180),
-            tools: ["read"],
+            tools: ["read", "grep", "find", "ls"],
             maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
             repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
             completionGraceSeconds: 30,
@@ -1229,7 +1281,12 @@ export class Worker {
           });
         } catch (error) {
           if (error instanceof AgentInfrastructureError) throw new WorkspaceBlockedError(error.message);
-          if (error instanceof AgentInvestigationLimitError || error instanceof AgentTimeoutError) throw error;
+          if (error instanceof AgentInvestigationLimitError || error instanceof AgentTimeoutError) {
+            throw withRecoveryEvidence(new AgentInvestigationLimitError(
+              "调查补充核查未完成",
+              investigated.raw_output || investigated.log || investigated.summary,
+            ), error);
+          }
           throw error;
         }
         if (!investigated.ok) {
@@ -1245,6 +1302,10 @@ export class Worker {
           workspaceRoots,
         );
       }
+      investigationOutput = investigated.raw_output || investigated.log || investigated.summary;
+      investigationCheckpoint = investigation;
+      investigationProgress = captureInvestigationProgress(investigationOutput, investigation, investigationProgress);
+      this.store.updateJob(bug.id, { investigation });
       if (!investigation.ok) {
         const reason = [...investigation.blocked_reasons, ...investigation.validation_errors].join("；");
         if (investigation.blocked_reasons.length) {
@@ -1260,6 +1321,7 @@ export class Worker {
         bug.id,
       );
       this.store.updateJob(bug.id, { investigation });
+      investigationCheckpoint = investigation;
       // 调查阶段可以只读查看所有附加 Git 仓库；只有调查明确计划修改某个 Git 根时，
       // 才检查该仓库并创建修复分支。普通 P4/TypeScript Bug 不触碰任何 Git 分支。
       gitAttempts = await this.prepareGitAttempts(
@@ -1328,6 +1390,13 @@ export class Worker {
         bug.id,
       );
       const implementationMedia = await this.mediaInputsForBug(bug);
+      phase = "implementation";
+      const searchPaths = defaultSearchPaths(repo.path, investigation.planned_files.flatMap((file) => {
+        const separator = file.indexOf(":");
+        const alias = separator < 0 ? "project" : file.slice(0, separator);
+        const root = workspaceRoots.find((item) => item.alias === alias);
+        return root ? [path.resolve(root.path, separator < 0 ? file : file.slice(separator + 1))] : [];
+      }));
       const implementationRunOptions = {
         prompt,
         repoDir: repo.path,
@@ -1346,6 +1415,7 @@ export class Worker {
           this.recordWriteIntent(bug.id, p4!, investigation.planned_files, file),
         cancelEvent: this.cancelEvent,
         media: implementationMedia,
+        searchPaths,
       } as const;
       let result: AgentResult;
       let workspaceChangesTakenOver = false;
@@ -1398,7 +1468,7 @@ export class Worker {
               gitAttempts,
               [...investigation.planned_files, ...this.lastAttemptFiles(bug.id)],
             );
-            if (!recoveryHasChanges) throw recoveryError;
+            if (!recoveryHasChanges) throw withRecoveryEvidence(error, recoveryError);
             result = resultFromOutput(recoveryError.partialOutput, 0);
             result.log = recoveryError.partialOutput;
             result.summary = result.summary
@@ -1429,6 +1499,7 @@ export class Worker {
       }
 
       // ---- 验证门 ----
+      phase = "verification";
       let opened: OpenedFile[] | null = null;
       let testOut = "";
       let verificationPassed = false;
@@ -1496,6 +1567,7 @@ export class Worker {
           );
         }
         if (this.config.review.enabled && verificationPassed) {
+          phase = "review";
           let review = await this.reviewCandidate(
             reviewer!,
             reviewerModel,
@@ -1740,7 +1812,15 @@ export class Worker {
           this.store.addEvent(`处理被人工中断，保留人工设置的状态（${st}）`, "warn", bug.id);
         }
       } else {
-        await this.handleFailure(bug, failure, p4, lastResult);
+        await this.handleFailure(bug, failure, p4, lastResult, {
+          phase, context_key: contextKey,
+          investigation: investigationCheckpoint as unknown as Record<string, unknown> | undefined,
+          investigation_progress: phase === "investigation" ? captureInvestigationProgress(
+            failure instanceof AgentTimeoutError || failure instanceof AgentInvestigationLimitError
+              ? failure.partialOutput : investigationOutput,
+            investigationCheckpoint ?? parseInvestigation(""), investigationProgress,
+          ) : undefined,
+        });
       }
     }
   }
@@ -1878,6 +1958,7 @@ export class Worker {
 
   private async handleFailure(
     bug: Bug, exc: unknown, p4: P4Client | null, lastResult: AgentResult | null,
+    checkpoint: Pick<RetryEvidenceEntry, "phase" | "context_key" | "investigation" | "investigation_progress"> = {},
   ): Promise<void> {
     const job = this.store.getJob(bug.id) ?? {};
     const attempts = Number(job.attempts ?? 0) + 1;
@@ -1895,6 +1976,11 @@ export class Worker {
       opened_files: openedFiles,
       agent_summary: (lastResult?.summary ?? "").slice(0, 500),
       manual_assets: (lastResult?.manual_assets ?? []).map((a) => a.path),
+      ...checkpoint,
+      review_findings: checkpoint.phase === "review"
+        ? loads<Record<string, unknown> | undefined>(job.review_findings as string, undefined) : undefined,
+      partial_output: exc instanceof AgentTimeoutError || exc instanceof AgentInvestigationLimitError
+        ? exc.partialOutput.slice(-32000) : (lastResult?.raw_output || "").slice(-16000),
     };
     const evidence = [...this.retryEvidenceEntries(bug.id), entry].slice(-_MAX_EVIDENCE_ENTRIES);
     const reviewerInfrastructureFailure = /Reviewer 异常退出/.test(reason);
@@ -2077,9 +2163,8 @@ export class Worker {
       files: null,
       manual_assets: null,
       finished_at: null,
-      retry_evidence: null,
+      // 保留中断轨迹和调查检查点；人工重试只重置本轮尝试次数。
       admission_score: null,
-      investigation: null,
       verification: null,
       review_findings: null,
     });

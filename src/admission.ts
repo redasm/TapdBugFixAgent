@@ -27,7 +27,7 @@ const enrichStructuredDescription = (bug: Bug): Bug => {
 };
 
 /**
- * 保留原有高风险/资源门禁；普通工单只要存在描述就允许进入只读调查。
+ * 仅保留资源工具能力门禁；工单只要存在描述就允许进入只读调查。
  * 描述不要求固定模板、标签或关键词；证据是否足够由只读调查阶段结合代码判断。
  */
 export function assessFixabilityWithNarrative(

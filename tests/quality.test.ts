@@ -58,7 +58,6 @@ const policy: AdmissionPolicy = {
   min_score: 55,
   require_reproduction_signal: true,
   manual_keywords: ["prefab", "场景", "xlsx"],
-  high_risk_keywords: ["支付", "账号", "存档", "协议"],
 };
 
 describe("BugContextBuilder", () => {
@@ -303,7 +302,7 @@ describe("FixabilityAdmission", () => {
     expect(result.reasons.join(" ")).toContain("复现");
   });
 
-  it("资源类和高风险任务进入人工处理", () => {
+  it("资源能力门禁保留，协议等业务关键词不拦截自动处理", () => {
     const resource = assessFixability(
       makeBug({ title: "场景 prefab 显示错误", description: "需要调整 prefab" }),
       policy,
@@ -314,7 +313,8 @@ describe("FixabilityAdmission", () => {
     );
 
     expect(resource.disposition).toBe("manual_only");
-    expect(risky.disposition).toBe("manual_review");
+    expect(risky.disposition).toBe("auto_fix");
+    expect(risky.eligible).toBe(true);
   });
 
   it("已启用对应 MCP 时 prefab 资源 Bug 可进入自动调查", () => {
@@ -345,6 +345,23 @@ describe("FixabilityAdmission", () => {
 });
 
 describe("quality config", () => {
+  it("旧配置中的风险关键词被忽略，不再拦截协议或账号改动", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tapd-retired-admission-"));
+    try {
+      const configPath = path.join(dir, "config.yaml");
+      fs.writeFileSync(configPath, "quality:\n  admission:\n    high_risk_keywords: [协议, 账号, 支付, 存档]\n");
+      const cfg = loadConfig(configPath, "NO_SUCH_ENV.env", "NO_SUCH_OVERRIDES.yaml");
+      expect(cfg.quality.admission).not.toHaveProperty("high_risk_keywords");
+      for (const keyword of ["协议", "账号", "支付", "存档"]) {
+        const result = assessFixability(makeBug({ title: `${keyword}字段错误导致功能异常` }), cfg.quality.admission);
+        expect(result.disposition).toBe("auto_fix");
+        expect(result.eligible).toBe(true);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("默认启用准入门禁、两次修复机会和严格验证状态", () => {
     const cfg = loadConfig("NO_SUCH_CONFIG.yaml", "NO_SUCH_ENV.env", "NO_SUCH_OVERRIDES.yaml");
 
@@ -515,7 +532,7 @@ describe("two-stage repair workflow", () => {
       reviewerFeedback: "",
     });
 
-    expect(prompt).toContain("已确认的调查结论");
+    expect(prompt).toContain("调查结论（实施前核对");
     expect(prompt).toContain("保存请求未 await");
     expect(prompt).toContain("先运行或补充能复现该 Bug 的回归测试");
     expect(prompt).toContain("只修改计划范围");

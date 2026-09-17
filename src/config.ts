@@ -389,7 +389,6 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
         min_score: 55,
         require_reproduction_signal: true,
         manual_keywords: [],
-        high_risk_keywords: ["支付", "账号", "登录", "鉴权", "存档", "协议", "加密", "隐私"],
       },
       require_verification: true,
       max_changed_files: 8,
@@ -462,9 +461,7 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   if (Array.isArray(admissionRaw.manual_keywords)) {
     cfg.quality.admission.manual_keywords = admissionRaw.manual_keywords.map(String).filter(Boolean);
   }
-  if (Array.isArray(admissionRaw.high_risk_keywords)) {
-    cfg.quality.admission.high_risk_keywords = admissionRaw.high_risk_keywords.map(String).filter(Boolean);
-  }
+
 
   const reviewRaw = (raw.review ?? {}) as Record<string, unknown>;
   cfg.review.enabled = Boolean(reviewRaw.enabled ?? cfg.review.enabled);

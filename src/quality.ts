@@ -20,10 +20,9 @@ export interface AdmissionPolicy {
   min_score: number;
   require_reproduction_signal: boolean;
   manual_keywords: string[];
-  high_risk_keywords: string[];
 }
 
-export type AdmissionDisposition = "auto_fix" | "needs_info" | "manual_only" | "manual_review";
+export type AdmissionDisposition = "auto_fix" | "needs_info" | "manual_only";
 
 export interface FixabilityAssessment {
   eligible: boolean;
@@ -178,29 +177,11 @@ export const formatBugContext = (context: BugContext): string => [
   `附件:\n${context.attachments.length ? context.attachments.map((v) => `- ${v}`).join("\n") : "- （缺失）"}`,
 ].join("\n");
 
-const containsKeyword = (haystack: string, keywords: string[]): string | undefined => {
-  const lower = haystack.toLowerCase();
-  return keywords.find((keyword) => keyword.trim() && lower.includes(keyword.toLowerCase()));
-};
-
 const matchingKeywords = (haystack: string, keywords: string[]): string[] => {
   const lower = haystack.toLowerCase();
   return [...new Set(keywords.filter((keyword) =>
     keyword.trim() && lower.includes(keyword.toLowerCase()),
   ))];
-};
-
-/** 高风险判断只看“问题本身”，不扫描复现步骤里的测试账号、登录前置等操作条件。 */
-const highRiskEvidenceText = (context: BugContext): string => {
-  const structuralLabel = /(?:前置条件|测试账号|测试帐号|账号|帐号|测试角色|服务器|区服|复现步骤|重现步骤|操作步骤|环境|版本|日志)[：:]/i;
-  const summary = context.description.split(structuralLabel, 1)[0].trim();
-  return [
-    context.title,
-    context.module,
-    context.expected_result,
-    context.actual_result,
-    summary,
-  ].filter(Boolean).join("\n");
 };
 
 export const assessFixability = (
@@ -227,17 +208,6 @@ export const assessFixability = (
       disposition: "manual_only",
       score: 0,
       reasons: [`涉及需人工处理的资源或工具: ${uncoveredManualKeywords.join(", ")}`],
-      context,
-    };
-  }
-
-  const riskKeyword = containsKeyword(highRiskEvidenceText(context), policy.high_risk_keywords);
-  if (riskKeyword) {
-    return {
-      eligible: false,
-      disposition: "manual_review",
-      score: 0,
-      reasons: [`涉及高风险领域，必须人工确认: ${riskKeyword}`],
       context,
     };
   }

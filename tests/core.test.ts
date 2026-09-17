@@ -165,7 +165,6 @@ function makeConfig(): Config {
         min_score: 0,
         require_reproduction_signal: false,
         manual_keywords: [],
-        high_risk_keywords: [],
       },
       require_verification: false,
       max_changed_files: 8,
@@ -887,7 +886,6 @@ describe("通用 MCP Agent 接入", () => {
       min_score: 0,
       require_reproduction_signal: false,
       manual_keywords: configuredManualKeywords(disabled),
-      high_risk_keywords: [],
     };
     const bug = makeBug({ title: "prefab 显示异常" });
 
@@ -902,7 +900,6 @@ describe("通用 MCP Agent 接入", () => {
       min_score: 0,
       require_reproduction_signal: false,
       manual_keywords: ["prefab", "xlsx"],
-      high_risk_keywords: [],
     }, ["prefab"]);
 
     expect(result.disposition).toBe("manual_only");
@@ -1830,9 +1827,11 @@ describe("PiAgent 子进程控制", () => {
     fs.writeFileSync(script, "require('fs').writeFileSync('args.txt',JSON.stringify(process.argv.slice(2))); console.log('done');");
     writeFakePi(d, process.platform === "win32" ? `node "${script}" %*` : `node "${script}" "$@"`);
     await withFakePiOnPath(d, async () => {
-      await new PiAgent(makeConfig()).run({ prompt: "收尾", repoDir: d, timeoutS: 60, tools: [] });
+      await new PiAgent(makeConfig()).run({ prompt: "收尾", repoDir: d, timeoutS: 60, tools: [], thinkingLevel: "off" });
     });
-    expect(JSON.parse(fs.readFileSync(path.join(d, "args.txt"), "utf8"))).toContain("--no-tools");
+    const args = JSON.parse(fs.readFileSync(path.join(d, "args.txt"), "utf8"));
+    expect(args).toContain("--no-tools");
+    expect(args[args.indexOf("--thinking") + 1]).toBe("off");
   });
 
   it("恢复轨迹保留多条完整证据，不混入用户示例和巨型增量事件", () => {
@@ -1924,7 +1923,8 @@ describe("PiAgent 子进程控制", () => {
     });
 
     const args = fs.readFileSync(path.join(d, "args.txt"), "utf-8");
-    expect(args).not.toContain("--extension");
+    expect(args).not.toContain("mcpProxy");
+    expect(args).toContain("scopedSearch");
     expect(args).not.toContain("chrome_devtools_list_pages");
     expect(args).not.toContain("unreal_mcp_ping");
   });
@@ -2488,13 +2488,16 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
 
     const n = w.retryAllFailed();
     expect(n).toBe(2);
+    expect(JSON.parse(String(w.store.getJob(a.id)?.retry_evidence))[0].failure_reason).toBe("x");
     for (const job of [w.store.getJob(a.id), w.store.getJob(b.id)]) {
       expect(job?.agent_state).toBe("pending");
       expect(job?.attempts).toBe(0);
       expect(job?.failure_reason).toBeNull();
-      expect(job?.retry_evidence).toBeNull();
+      expect(job?.retry_evidence).toBe(job?.bug_id === a.id
+        ? dumps([{ attempt: 1, at: "2026-08-11 09:00:00", failure_reason: "x", opened_files: [], agent_summary: "", manual_assets: [] }])
+        : null);
       expect(job?.admission_score).toBeNull();
-      expect(job?.investigation).toBeNull();
+      expect(job?.investigation).toBe(job?.bug_id === a.id ? '{"root_cause":"旧根因"}' : null);
       expect(job?.verification).toBeNull();
       expect(job?.review_findings).toBeNull();
       expect(job?.finished_at).toBeNull();
@@ -2638,6 +2641,26 @@ describe("worker 控制与取消", () => {
     expect(w.store.getJob(limited.id)?.failure_reason).toBeNull();
   });
 
+  it("启动时恢复旧关键词拦截任务，保留已有候选和实际失败原因", () => {
+    const w = makeWorker();
+    const blocked = makeBug({ id: "1123456780001271798" });
+    const candidate = makeBug({ id: "1123456780001271030" });
+    const unfinished = makeBug({ id: "1123456780001273338" });
+    const reason = "涉及高风险领域，必须人工确认: 协议";
+    w.store.upsertJob(blocked, { agent_state: "manual_review", attempts: 0, failure_reason: reason });
+    w.store.upsertJob(candidate, { agent_state: "manual_review", attempts: 0, changelist: 822967, failure_reason: reason });
+    w.store.upsertJob(unfinished, { agent_state: "manual_review", attempts: 2, failure_reason: "独立代码评审未通过" });
+    const reconcile = () => (w as unknown as { reconcileStaleInProgress(): void }).reconcileStaleInProgress();
+    reconcile();
+    expect(w.store.getJob(blocked.id)?.agent_state).toBe("pending");
+    expect(w.store.getJob(blocked.id)?.failure_reason).toBeNull();
+    expect(w.store.getJob(candidate.id)?.agent_state).toBe("manual_review");
+    expect(w.store.getJob(candidate.id)?.changelist).toBe(822967);
+    expect(w.store.getJob(unfinished.id)?.failure_reason).toBe("独立代码评审未通过");
+    reconcile();
+    expect(w.store.listEvents(blocked.id).filter(e => String(e.msg).includes("已移除关键词")).length).toBe(1);
+  });
+
   it("agent 被取消时 bug 回到 pending，不算失败", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
@@ -2769,8 +2792,8 @@ describe("formatRetryEvidence", () => {
       manual_assets: [],
     }]);
     expect(text).toContain("禁止重新从头做宽泛搜索");
-    expect(text).toContain("立即实施 planned_files 内的最小修改");
-    expect(text).toContain("blocked_reasons");
+    expect(text).toContain("只有调查通过且进入编码阶段才实施");
+    expect(text).toContain("不得把调查中断当成工单缺少信息");
   });
 });
 
@@ -3131,7 +3154,26 @@ describe("worker 两阶段修复协议", () => {
     expect(calls[0].outputSchema).toBeDefined();
     expect(calls[1].outputSchema).toBe(calls[0].outputSchema);
     expect(calls[2].outputSchema).toBeDefined();
+    expect(calls[2].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it("调查补充不再限制 20 次读取，并在中断后保留原结论和缺失证据", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const run = vi.spyOn(PiAgent.prototype, "run")
+      .mockResolvedValueOnce(makeResult({ raw_output: 'FINAL_RESULT: {"root_cause":"尚需核对","evidence":["[观察] Map.ts:12"],"planned_files":[],"blocked_reasons":["未读取标记创建调用者"]}' }))
+      .mockRejectedValueOnce(new AgentTimeoutError("Agent 调用超时(180s): pi", "MapMarkManager.ts:712 已读取"));
+    await w.processBug(bug);
+    expect(run.mock.calls[1][0].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
+    expect(run.mock.calls[1][0].tools).toContain("grep");
+    expect(run.mock.calls[1][0].tools).toContain("find");
+    const evidence = JSON.parse(String(w.store.getJob(bug.id)?.retry_evidence));
+    expect(evidence[0].partial_output).toContain("未读取标记创建调用者");
+    expect(evidence[0].partial_output).toContain("MapMarkManager.ts:712 已读取");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("failed");
   });
 
   it("调查补充轮仍不完整时自动重试，不误标 needs_info", async () => {
@@ -3282,6 +3324,83 @@ describe("worker 两阶段修复协议", () => {
     expect(calls[2].completionGraceSeconds).toBe(30);
     expect(String(calls[2].prompt)).toContain("禁止重新调查整个仓库");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+  });
+
+  it.each([false, true])("编码超时保存两段轨迹；工单变化=%s 时检查是否可以沿用调查", async (changed) => {
+    const repo = tmpdir();
+    fs.writeFileSync(path.join(repo, "Login.ts"), "old");
+    const w = makeWorker([{ name: "r", path: repo, verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "edit").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "revertUnchanged").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    const calls: Array<{ sandboxMode?: string; prompt: string }> = [];
+    const run = vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts);
+      if (calls.length === 1) return makeInvestigation("Login.ts");
+      if (calls.length === 2) throw new AgentTimeoutError("Agent 调用超时(900s): pi", "读取 Login.ts:42，调用者 Click.ts:20");
+      throw new AgentInvestigationLimitError("实施阶段 90s 停滞", "收尾确认空值分支");
+    });
+    await w.processBug(bug);
+    const evidence = JSON.parse(String(w.store.getJob(bug.id)?.retry_evidence));
+    expect(evidence[0].partial_output).toContain("Login.ts:42");
+    expect(evidence[0].partial_output).toContain("收尾确认空值分支");
+    expect(evidence[0].investigation.planned_files).toEqual(["Login.ts"]);
+    expect(evidence[0].phase).toBe("implementation");
+    calls.length = 0;
+    run.mockImplementation(async (opts) => { calls.push(opts); throw new Error("结束测试"); });
+    await w.processBug(changed ? { ...bug, description: bug.description + " 新增复现条件" } : bug);
+    expect(calls[0].sandboxMode).toBe(changed ? "read-only" : "workspace-write");
+    expect(calls[0].prompt).toContain("Login.ts:42");
+    expect(calls[0].prompt).toContain("收尾确认空值分支");
+  });
+
+  it.each([false, true])("未完成调查保存结构化缺口并只读续查；工单变化=%s", async (changed) => {
+    const w = makeWorker([{ name: "r", path: "C:/tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 3;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const incomplete = makeResult({ raw_output: JSON.stringify({
+      root_cause: "", evidence: ["[观察] Map.ts:40 enterPlacement()"], planned_files: [],
+      blocked_reasons: ["未证实边缘点击 OnClick 是否调用 enterPlacement"],
+    }) });
+    const run = vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(incomplete);
+    await w.processBug(bug);
+    const evidence = JSON.parse(String(w.store.getJob(bug.id)?.retry_evidence))[0];
+    expect(evidence.investigation_progress.findings).toContain("[观察] Map.ts:40 enterPlacement()");
+    expect(evidence.investigation_progress.open_questions.join(" ")).toContain("未证实边缘点击");
+    expect(JSON.parse(String(w.store.getJob(bug.id)?.investigation)).ok).toBe(false);
+    run.mockClear().mockRejectedValue(new Error("测试结束"));
+    await w.processBug(changed ? { ...bug, description: bug.description + " 新入口" } : bug);
+    expect(run.mock.calls[0][0].sandboxMode).toBe("read-only");
+    expect(run.mock.calls[0][0].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(run.mock.calls[0][0].prompt.includes("# 继续未完成调查")).toBe(!changed);
+    if (!changed) expect(run.mock.calls[0][0].prompt).toContain("未证实边缘点击");
+  });
+
+  it("调查和收尾均超时后，重试仍包含原始调查证据", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const run = vi.spyOn(PiAgent.prototype, "run")
+      .mockRejectedValueOnce(new AgentTimeoutError("Agent 调用超时(600s): pi", "Map.ts:12 原始证据"))
+      .mockRejectedValueOnce(new AgentTimeoutError("Agent 调用超时(180s): pi", "FINAL_RESULT 未完成"));
+    await w.processBug(bug);
+    const evidence = JSON.parse(String(w.store.getJob(bug.id)?.retry_evidence));
+    expect(evidence[0].failure_reason).toContain("600s");
+    expect(evidence[0].failure_reason).toContain("180s");
+    expect(evidence[0].partial_output).toContain("Map.ts:12");
+    expect(evidence[0].investigation_progress.trace).toContain("Map.ts:12");
+    run.mockRejectedValue(new Error("结束测试"));
+    await w.processBug(bug);
+    expect(run.mock.calls[2][0].prompt).toContain("Map.ts:12 原始证据");
   });
 
   it("编码达到预算但已有真实 diff 时继续验证并隔离到人工评审，不冒充成功", async () => {
@@ -3478,6 +3597,7 @@ describe("worker 两阶段修复协议", () => {
     expect(calls).toHaveLength(3);
     expect(String(calls[1].prompt)).toContain("调查阶段已到收敛点");
     expect(calls[1].tools).toEqual([]);
+    expect(calls[1].thinkingLevel).toBe("off");
     expect(String(calls[1].prompt)).toContain("MapMarkChooseView.ts");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });
@@ -3678,6 +3798,7 @@ describe("worker 两阶段修复协议", () => {
     expect(String(calls[1].prompt)).not.toContain("只使用 default changelist");
     expect(calls[2].tools).toEqual(["read", "grep", "find", "ls"]);
     expect(calls[2].outputSchema).toBeDefined();
+    expect(calls[2].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
     expect(String(calls[3].prompt)).toContain("失败分支必须显示错误并返回");
     expect(calls[3].outputSchema).toBeDefined();
     expect(calls[4].tools).toEqual(["read", "grep", "find", "ls"]);
