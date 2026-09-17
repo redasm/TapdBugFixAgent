@@ -1,7 +1,7 @@
 /**
  * Persistent Chrome DevTools MCP proxy.
  *
- * Codex starts stdio MCP processes per turn. Connecting each of those directly
+ * Pi starts stdio MCP processes per run. Connecting each of those directly
  * with --autoConnect makes Chrome treat every turn as a new debugger client and
  * may show the permission dialog repeatedly. The official chrome-devtools CLI
  * ships a daemon; this small MCP facade keeps that daemon alive and forwards

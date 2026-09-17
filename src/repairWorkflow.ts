@@ -1,4 +1,4 @@
-/** Codex 风格的 Bug 修复协议：只读调查确定根因，再由写入阶段实施最小补丁。 */
+/** Bug 修复协议：只读调查确定根因，再由写入阶段实施最小补丁。 */
 
 import fs from "node:fs";
 import path from "node:path";
@@ -52,69 +52,6 @@ export interface ImplementationPromptInput {
   unrealMcpEnabled?: boolean;
   workspaceRoots?: WorkspaceRootPrompt[];
 }
-
-export const INVESTIGATION_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    root_cause: { type: "string" },
-    evidence: { type: "array", items: { type: "string" } },
-    reproduction: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-        before: { type: "string" },
-      },
-      required: ["command", "before"],
-      additionalProperties: false,
-    },
-    diagnostic_pages: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          url: { type: "string" },
-          status: { type: "string", enum: ["read", "blocked"] },
-          title: { type: "string" },
-          facts: { type: "array", items: { type: "string" } },
-          error: { type: "string" },
-        },
-        required: ["url", "status", "title", "facts", "error"],
-        additionalProperties: false,
-      },
-    },
-    planned_files: { type: "array", items: { type: "string" } },
-    confidence: { type: "number", minimum: 0, maximum: 1 },
-    blocked_reasons: { type: "array", items: { type: "string" } },
-  },
-  required: [
-    "root_cause", "evidence", "reproduction", "diagnostic_pages",
-    "planned_files", "confidence", "blocked_reasons",
-  ],
-  additionalProperties: false,
-} as const;
-
-export const IMPLEMENTATION_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    summary: { type: "string" },
-    changed_files: { type: "array", items: { type: "string" } },
-    manual_assets: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          reason: { type: "string" },
-        },
-        required: ["path", "reason"],
-        additionalProperties: false,
-      },
-    },
-    blocked_reasons: { type: "array", items: { type: "string" } },
-  },
-  required: ["summary", "changed_files", "manual_assets", "blocked_reasons"],
-  additionalProperties: false,
-} as const;
 
 const strings = (value: unknown): string[] => Array.isArray(value)
   ? value.map((v) => String(v ?? "").trim()).filter(Boolean)

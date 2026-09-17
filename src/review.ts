@@ -1,9 +1,19 @@
 /** 独立只读评审协议：基于目标、调查证据、机器验证和完整 diff 输出可执行 findings。 */
 
-import { extractFinalJson } from "./agent.js";
+import { effectivePiModel, effectivePiProviderId, extractFinalJson } from "./agent.js";
+import type { Config } from "./config.js";
 import type { Bug } from "./models.js";
 import type { InvestigationResult } from "./repairWorkflow.js";
 import { buildBugContext, formatBugContext } from "./quality.js";
+
+/** 评审模型允许只写模型 id，自动继承 Pi provider；空值沿用修复模型。 */
+export function effectiveReviewModel(config: Config): string {
+  const configured = config.review.model.trim();
+  if (!configured) return effectivePiModel(config.pi);
+  if (configured.includes("/")) return configured;
+  const providerId = config.pi.provider ? effectivePiProviderId(config.pi) : "";
+  return providerId ? `${providerId}/${configured}` : configured;
+}
 
 export type FindingSeverity = "low" | "medium" | "high";
 

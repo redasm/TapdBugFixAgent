@@ -34,17 +34,12 @@ import {
   AgentInvestigationLimitError,
   AgentTimeoutError,
   CancelEvent,
+  PiAgent,
+  effectivePiModel,
   formatRetryEvidence,
   resultFromOutput,
   withRecoveryEvidence,
 } from "./agent.js";
-import {
-  createCodingAgent,
-  effectiveAgentModel,
-  effectiveReviewModel,
-  selectedAgentBackend,
-  type CodingAgent,
-} from "./agentBackend.js";
 import { nowStr, type StateStore } from "./state.js";
 import { assessFixabilityWithNarrative } from "./admission.js";
 import {
@@ -54,8 +49,6 @@ import {
   mcpServerNamesMatchingText,
 } from "./mcpServers.js";
 import {
-  IMPLEMENTATION_OUTPUT_SCHEMA,
-  INVESTIGATION_OUTPUT_SCHEMA,
   buildImplementationPrompt,
   buildInvestigationPrompt,
   buildInvestigationContinuationPrompt,
@@ -66,6 +59,7 @@ import {
 } from "./repairWorkflow.js";
 import {
   buildReviewPrompt,
+  effectiveReviewModel,
   formatReviewerFeedback,
   parseReviewResult,
   type ReviewResult,
@@ -78,32 +72,6 @@ import {
   type GitBranchSession,
   type GitFinalizeResult,
 } from "./git.js";
-
-const REVIEW_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    approved: { type: "boolean" },
-    note: { type: "string" },
-    findings: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          severity: { type: "string", enum: ["low", "medium", "high"] },
-          title: { type: "string" },
-          file: { type: "string" },
-          line: { type: ["integer", "null"] },
-          evidence: { type: "string" },
-          required_action: { type: "string" },
-        },
-        required: ["severity", "title", "file", "line", "evidence", "required_action"],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["approved", "note", "findings"],
-  additionalProperties: false,
-} as const;
 
 // 终态：已处理（不会自动重新处理）
 const _TERMINAL_STATES = new Set([
@@ -870,7 +838,7 @@ export class Worker {
   }
 
   private async reviewCandidate(
-    reviewer: CodingAgent,
+    reviewer: PiAgent,
     reviewerModel: string,
     p4: P4Client,
     bug: Bug,
@@ -890,7 +858,6 @@ export class Worker {
       maxCommandExecutions: _REVIEW_COMMAND_BUDGET,
       repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
       sandboxMode: "read-only",
-      outputSchema: REVIEW_OUTPUT_SCHEMA,
       model: reviewerModel || undefined,
       requiredMcpServers,
       cancelEvent: this.cancelEvent,
@@ -1007,9 +974,8 @@ export class Worker {
       }
 
       // 处理开始时就把 agent / 模型写进 job，web 列表与详情可实时看到
-      const backend = selectedAgentBackend(this.config);
-      const model = effectiveAgentModel(this.config, backend);
-      this.store.updateJob(bug.id, { agent: backend, model });
+      const model = effectivePiModel(this.config.pi);
+      this.store.updateJob(bug.id, { agent: "pi", model });
 
       const generatedP4Ignore = ensureP4IgnoreFile(repo.path, repo.ignore_paths ?? []);
       if (generatedP4Ignore) this.config.p4.ignore = generatedP4Ignore;
@@ -1090,11 +1056,10 @@ export class Worker {
       const retryText = formatRetryEvidence(retryEntries);
       const investigationMedia = await this.mediaInputsForBug(bug);
       const attempts = Number(this.store.getJob(bug.id)?.attempts ?? 0) + 1;
-      const agent = createCodingAgent(this.config, backend);
-      const reviewerBackend = selectedAgentBackend(this.config, this.config.review.backend);
-      const reviewerModel = effectiveReviewModel(this.config, reviewerBackend);
+      const agent = new PiAgent(this.config);
+      const reviewerModel = effectiveReviewModel(this.config);
       const reviewer = this.config.review.enabled
-        ? createCodingAgent(this.config, reviewerBackend)
+        ? new PiAgent(this.config)
         : null;
       const mcpServerNames = enabledMcpServerNames(this.config.mcp_servers);
       const bugEvidenceText = [
@@ -1141,7 +1106,6 @@ export class Worker {
         repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
         completionGraceSeconds: 30,
         sandboxMode: "read-only" as const,
-        outputSchema: INVESTIGATION_OUTPUT_SCHEMA,
         mcpServers: investigationMcpServers,
         requiredMcpServers: resourceMcpServers,
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
@@ -1384,8 +1348,8 @@ export class Worker {
       }));
       this.store.addEvent(
         retryText
-          ? `调用编码 Agent（${backend}）（第 ${attempts} 次尝试，注入上次失败证据）`
-          : `调用编码 Agent（${backend}）`,
+          ? `调用编码 Agent（pi）（第 ${attempts} 次尝试，注入上次失败证据）`
+          : `调用编码 Agent（pi）`,
         "info",
         bug.id,
       );
@@ -1407,7 +1371,6 @@ export class Worker {
         maxReadOnlyExecutionsBeforeWrite: _IMPLEMENTATION_READ_ONLY_BEFORE_WRITE_LIMIT,
         maxSecondsBeforeWrite: Math.min(this.config.agent_timeout_s, 900),
         sandboxMode: "workspace-write",
-        outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
         mcpServers: resourceMcpServers,
         requiredMcpServers: resourceMcpServers,
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
@@ -1607,7 +1570,6 @@ export class Worker {
               maxReadOnlyExecutionsBeforeWrite: _IMPLEMENTATION_READ_ONLY_BEFORE_WRITE_LIMIT,
               maxSecondsBeforeWrite: Math.min(this.config.agent_timeout_s, 900),
               sandboxMode: "workspace-write",
-              outputSchema: IMPLEMENTATION_OUTPUT_SCHEMA,
               mcpServers: resourceMcpServers,
               requiredMcpServers: resourceMcpServers,
               onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
@@ -1740,7 +1702,7 @@ export class Worker {
             gitResult.files.map((file) => `${name.toLowerCase()}:${file}`)),
         ]),
         manual_assets: dumps(result.manual_assets),
-        agent: backend,
+        agent: "pi",
         failure_reason: null,
         retry_evidence: null, // 成功则清空重试证据
         last_attempt_files: null,

@@ -9,7 +9,7 @@
  */
 
 import { loadConfig, priorityRank, validateConfig, webToken } from "./config.js";
-import { effectiveAgentModel, selectedAgentBackend } from "./agentBackend.js";
+import { effectivePiModel } from "./agent.js";
 import { enabledMcpServerNames } from "./mcpServers.js";
 import { StateStore } from "./state.js";
 import { Worker } from "./worker.js";
@@ -67,10 +67,9 @@ function parseArgs(argv: string[]): CliArgs {
 function make(configPath: string, dbPath: string): { config: ReturnType<typeof loadConfig>; store: StateStore; worker: Worker } {
   const config = loadConfig(configPath);
   for (const problem of validateConfig(config)) console.log(`[配置警告] ${problem}`);
-  const backend = selectedAgentBackend(config);
-  const model = effectiveAgentModel(config, backend) || "(后端默认模型)";
+  const model = effectivePiModel(config.pi) || "(Pi 默认模型)";
   const mcpNames = enabledMcpServerNames(config.mcp_servers);
-  console.log(`[启动] Agent backend=${backend}, model=${model}`);
+  console.log(`[启动] Agent backend=pi, model=${model}`);
   const p4IgnorePaths = config.workspaces.flatMap((workspace) => workspace.repos.flatMap((repo) => repo.ignore_paths ?? []));
   console.log(`[启动] P4 server=${String(config.p4.port ?? "(默认)")}, client=${String(config.p4.client ?? "(默认)")}, user=${String(config.p4.user ?? "(默认)")}, ignore_paths=${p4IgnorePaths.length ? p4IgnorePaths.join(", ") : "(无)"}`);
   for (const repo of config.workspaces.flatMap((workspace) => workspace.repos)) {

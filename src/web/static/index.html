@@ -251,64 +251,20 @@
     </div>
     <div class="modal-body">
       <div class="section">
-        <h4>Agent 后端</h4>
+        <h4>Pi 模型连接</h4>
         <div class="settings-grid">
           <div class="field">
-            <label>主修复后端</label>
-            <select id="sAgentBackend">
-              <option value="pi">Pi</option>
-              <option value="codex">OpenAI Codex SDK</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>Reviewer 后端</label>
-            <select id="sReviewBackend">
-              <option value="">跟随主后端</option>
-              <option value="pi">Pi</option>
-              <option value="codex">OpenAI Codex SDK</option>
-            </select>
-          </div>
-          <div class="settings-note">有效模型: <span id="sAgentEffectiveModel" class="mono">-</span></div>
-        </div>
-      </div>
-      <div class="section">
-        <h4>OpenAI Codex SDK</h4>
-        <div class="settings-grid">
-          <div class="field"><label>模型（留空使用 Codex 默认）</label><input id="sCodexModel" type="text" placeholder="gpt-5.2-codex"></div>
-          <div class="field"><label>推理强度</label><select id="sCodexReasoning"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></div>
-          <div class="field"><label>审批策略</label><select id="sCodexApproval"><option value="never">never</option><option value="on-request">on-request</option><option value="on-failure">on-failure</option><option value="untrusted">untrusted</option></select></div>
-          <div class="field check"><input id="sCodexNetwork" type="checkbox"><label>允许网络访问</label></div>
-          <div class="field full"><label>兼容网关 base_url（可选）</label><input id="sCodexUrl" type="text"></div>
-          <div class="field"><label>API Key 环境变量名</label><input id="sCodexKeyEnv" type="text" placeholder="OPENAI_API_KEY"></div>
-          <div class="field"><label>Codex 可执行文件路径（可选）</label><input id="sCodexPath" type="text"></div>
-          <div class="settings-note">API Key 不会在页面显示或写入 overrides.yaml，只保存环境变量名。</div>
-        </div>
-      </div>
-      <div class="section">
-        <h4>pi 编码 Agent（走中转/代理时填；留空则用 pi 默认鉴权）</h4>
-        <div class="settings-grid">
-          <div class="field">
-            <label>provider id（--model 前缀）</label>
-            <input id="sPiId" type="text" placeholder="custom">
-          </div>
-          <div class="field">
-            <label>模型 id（model_id）</label>
-            <input id="sPiModel" type="text" placeholder="claude-opus-4-8">
+            <label>模型名称</label>
+            <input id="sPiModel" type="text" placeholder="网关支持的模型名称">
           </div>
           <div class="field full">
             <label>网关地址 base_url</label>
             <input id="sPiUrl" type="text" placeholder="https://gateway.example.com">
           </div>
           <div class="field">
-            <label>API Key 环境变量名（推荐）</label>
-            <input id="sPiKeyEnv" type="text" placeholder="ANTHROPIC_AUTH_TOKEN">
-          </div>
-          <div class="field">
-            <label>API Key（明文，不推荐）</label>
+            <label>API Key（留空保持不变）</label>
             <input id="sPiKey" type="password">
           </div>
-          <div class="field check"><input id="sAuthHeader" type="checkbox"><label>Authorization: Bearer（本司网关协议）</label></div>
-          <div class="field check"><input id="sPiReasoning" type="checkbox"><label>reasoning（默认开）</label></div>
           <div class="settings-note">有效模型: <span id="sEffectiveModel" class="mono">-</span></div>
         </div>
       </div>
@@ -942,20 +898,8 @@ async function openSettings() {
   const s = await api('/api/settings');
   if (!s) return;
   const p = s.pi?.provider || {};
-  setVal('sAgentBackend', s.agent?.backend || 'pi');
-  setVal('sReviewBackend', s.review?.backend || '');
-  setVal('sCodexModel', s.codex?.model);
-  setVal('sCodexReasoning', s.codex?.reasoning_effort || 'high');
-  setVal('sCodexApproval', s.codex?.approval_policy || 'never');
-  setVal('sCodexUrl', s.codex?.base_url);
-  setVal('sCodexKeyEnv', s.codex?.api_key_env || 'OPENAI_API_KEY');
-  setVal('sCodexPath', s.codex?.codex_path);
-  $('sCodexNetwork').checked = !!s.codex?.network_access;
-  $('sAgentEffectiveModel').textContent = s.agent?.effective_model || '(后端默认模型)';
-  setVal('sPiId', p.id);
   setVal('sPiModel', p.model_id);
   setVal('sPiUrl', p.base_url);
-  setVal('sPiKeyEnv', p.api_key_env);
   setVal('sPiKey', '');
   setVal('sP4Port', s.p4?.port);
   setVal('sP4Client', s.p4?.client);
@@ -965,8 +909,6 @@ async function openSettings() {
   setVal('sTapdApiUser', s.tapd?.api_user);
   setVal('sTapdToken', '');
   setVal('sTapdApiPw', '');
-  $('sAuthHeader').checked = !!p.auth_header;
-  $('sPiReasoning').checked = p.reasoning !== false;
   $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
   $('sPiKey').placeholder = p.has_api_key ? '已设置，留空保持不变' : '（未设置）';
   $('sP4Password').placeholder = s.p4?.password_set ? '已设置，留空保持不变' : '（未设置）';
@@ -981,25 +923,10 @@ function closeSettings() { $('settingsModal').style.display = 'none'; }
 
 async function saveSettings() {
   const body = {
-    agent: { backend: $('sAgentBackend').value },
-    review: { backend: $('sReviewBackend').value },
-    codex: {
-      model: $('sCodexModel').value,
-      reasoning_effort: $('sCodexReasoning').value,
-      approval_policy: $('sCodexApproval').value,
-      network_access: $('sCodexNetwork').checked,
-      base_url: $('sCodexUrl').value,
-      api_key_env: $('sCodexKeyEnv').value,
-      codex_path: $('sCodexPath').value,
-    },
     pi: { provider: {
-      id: $('sPiId').value,
       base_url: $('sPiUrl').value,
-      api_key_env: $('sPiKeyEnv').value,
       api_key: $('sPiKey').value,
-      auth_header: $('sAuthHeader').checked,
       model_id: $('sPiModel').value,
-      reasoning: $('sPiReasoning').checked,
     } },
     p4: {
       port: $('sP4Port').value, client: $('sP4Client').value,
@@ -1017,7 +944,6 @@ async function saveSettings() {
     $('settingsMsg').textContent = '✓ 已保存，对后续 bug 生效';
     $('settingsMsg').className = '';
     $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
-    $('sAgentEffectiveModel').textContent = s.agent?.effective_model || '(后端默认模型)';
     refresh();
   } else {
     $('settingsMsg').textContent = '✗ 保存失败（见控制台）';

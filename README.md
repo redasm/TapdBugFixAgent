@@ -31,7 +31,7 @@ git clone <本仓库> && cd TapdBugFixAgent
 # 1. 装依赖（Node ≥ 22.19）
 npm install
 
-# 2. 装 Pi 编码 Agent（仅使用 Pi 后端时需要）
+# 2. 装 Pi 编码 Agent
 npm install -g @earendil-works/pi-coding-agent@0.85.1
 
 # 3. 生成配置
@@ -53,19 +53,22 @@ npm start -- serve
 | 依赖 | 说明 |
 |---|---|
 | Node.js ≥ 22.19 | 运行本体、Pi 0.85.1 与 Tapd MCP（官方包已锁定为项目依赖，stdio 模式经 `npx --no-install` 启动） |
-| 编码 Agent | Pi：全局安装 `@earendil-works/pi-coding-agent@0.85.1`；Codex：项目依赖已包含官方 `@openai/codex-sdk` |
+| 编码 Agent | 全局安装 `@earendil-works/pi-coding-agent@0.85.1` |
 | p4 命令行 | 在 PATH 中；为 Agent 建一个**专用 client workspace**（如 `tapd-agent_<你>`），别与日常开发共用 |
 | Tapd 凭据 | **个人访问令牌**（推荐，个人设置 → 个人访问令牌 创建）或 API 账号 |
 | Unreal MCP（可选） | 目标仓库包含 `Plugins/UnrealMCP`；Unreal Editor 已加载插件并启动桥接；本机 Python 可启动两个 MCP server |
 
-pi 鉴权（任选其一）：
-- 环境变量 `ANTHROPIC_API_KEY`（或 `ANTHROPIC_OAUTH_TOKEN`）；
-- 或先手动跑一次 `pi /login` 做 OAuth 登录；
-- 或走公司网关/中转：在 `config.yaml` 配 `pi.provider` 段（base_url + api_key_env），工具会在每次
-  spawn 前自动合并写入 `~/.pi/agent/models.json`（密钥引用环境变量名，不落盘）。
+Pi 直接连接模型网关，在 `config.yaml` 填写地址、API Key 和模型名称即可：
 
-Codex 鉴权：使用本机 Codex 登录状态，或在 `.env` 设置 `OPENAI_API_KEY`。服务不会把 API Key 返回给管理台，
-`codex.api_key_env` 只配置环境变量名。
+```yaml
+pi:
+  provider:
+    base_url: "https://gateway.example.com"
+    api_key: "你的 API Key"
+    model_id: "网关支持的模型名称"
+```
+
+provider 名称默认 `gateway`，认证默认使用 `Authorization: Bearer`，请求使用 Anthropic Messages 协议，网关需支持该协议。模型注册由项目自动完成。若希望把密钥放在环境变量中，可省略 `api_key` 并设置 `PI_API_KEY`。上下文窗口等高级参数可按模型需要覆盖。
 
 ## 配置
 
@@ -99,26 +102,12 @@ p4:
   password: "..."
 ```
 
-其余（Agent 后端、Pi/Codex 参数、Web token、Tapd 数据源）见 `config.example.yaml` 内注释。默认仍使用 Pi；
-切换 Codex 只需设置：
-
-```yaml
-agent:
-  backend: codex
-
-codex:
-  model: ""                 # 空值沿用本机 Codex 默认模型
-  reasoning_effort: high
-
-review:
-  backend: ""               # 跟随主后端；也可设 pi/codex 做交叉评审
-```
+Pi 模型、Web token、Tapd 数据源等配置见 `config.example.yaml` 内注释。调查、修复和独立评审统一使用 Pi；`review.model` 可单独指定评审模型，留空沿用修复模型。旧版的 `agent`、`codex` 和 `review.backend` 配置会被忽略，保存 Web 设置时会从 `overrides.yaml` 清理。
 
 ### 同时修改项目目录和引擎目录
 
 主 `repos[].path` 仍是 Perforce 项目工作区；把一个或多个 Git 仓库放在同一项的
-`additional_dirs` 下即可。Codex SDK 会把它们作为 `additionalDirectories` 传入（CLI 等价于重复
-`--add-dir`），不需要把工作目录写进 skill 配置。
+`additional_dirs` 下即可。Pi 通过提示词中的根别名和绝对路径访问附加目录，不需要把工作目录写进 skill 配置。
 
 每个 Bug 开始前，工具要求附加 Git 仓库处于干净状态，并从 `base_branch` 创建分支：
 `<主分支>_<作者><yyyyMMddHHmmss>`，例如 `branch_0.7.0_developer20260707171730`。
@@ -127,10 +116,9 @@ review:
 目录以 `/` 结尾，也支持 Git glob。不要把源码目录加入此列表。
 修复成功后在该分支本地 commit 并切回主分支，但不会 push；失败或取消时仅清理本次工具创建的分支。
 调查与结果中的文件使用根别名区分，例如 `project:Source/Game.cpp`、
-`engine:Engine/Source/Runtime.cpp`。Pi 后端也能通过绝对路径访问这些目录，但没有 Codex
-`additionalDirectories` 提供的同等沙箱边界，因此多目录自动修改优先推荐 Codex。
+`engine:Engine/Source/Runtime.cpp`。目录访问范围由提示词、工具白名单和修复范围检查约束，Pi 不提供操作系统级目录沙箱。
 
-MCP 与 Codex / Claude Code 一样采用注册表配置：所有 `enabled: true` 的 server 都会在 Agent 启动时自动加载，后续增加 MCP 只需在 YAML 追加一项，不需要修改 TypeScript。示例：
+MCP 采用注册表配置：所有 `enabled: true` 的 server 都会在 Agent 启动时自动加载，后续增加 MCP 只需在 YAML 追加一项，不需要修改 TypeScript。示例：
 
 ```yaml
 mcp_servers:
@@ -156,7 +144,6 @@ mcp_servers:
   chrome_devtools:
     enabled: true
     required: false
-    approval_mode: approve
     command: node
     # 每个 Agent 进程只启动轻量 stdio 代理，实际 Chrome 调试连接由官方常驻 daemon 复用。
     args: ['{agent}\\dist\\chromeDaemonProxy.js']
@@ -169,7 +156,7 @@ mcp_servers:
     tool_timeout_sec: 90
 ```
 
-本地 server 使用 `command/args/cwd/env/env_vars`；远程 Streamable HTTP server 可改用 `url/bearer_token_env_var/http_headers/env_http_headers`。路径和值支持 `{repo}` / `${repo}`（当前 Bug 仓库根）及 `{agent}` / `${agent}`（本工具安装目录）占位符。`enabled`、`required`、`enabled_tools` 和 `disabled_tools` 对齐 Codex；`approval_mode` 会映射成 Codex 的 `default_tools_approval_mode`，默认 `approve`，避免自动任务的 `approval_policy: never` 拒绝已显式开放的 MCP 工具；`read_only_tools` 是本项目为调查与 Reviewer 增加的安全白名单。资源关键词直接配置在对应 MCP 的 `automates_manual_keywords`：server 禁用时保持人工门禁，启用后才允许自动处理，因此不必在全局 `manual_keywords` 重复填写。Codex 直接使用原生 MCP 配置，Pi 通过通用代理动态发现和注册工具；非 `required` 服务启动失败时会跳过，不阻塞纯代码 Bug；但当前 Bug 含诊断链接或命中某个资源关键词时，对应 MCP 会被动态视为必需，预检失败直接阻塞且不消耗修复重试。TAPD MCP 属于编排器数据源，继续单独配置在 `tapd.mcp`，不会加载给编码 Agent。
+本地 server 使用 `command/args/cwd/env/env_vars`；远程 Streamable HTTP server 可改用 `url/bearer_token_env_var/http_headers/env_http_headers`。路径和值支持 `{repo}` / `${repo}`（当前 Bug 仓库根）及 `{agent}` / `${agent}`（本工具安装目录）占位符。`enabled` 和 `required` 控制启用与依赖要求；`enabled_tools` 和 `disabled_tools` 控制工具范围；`read_only_tools` 是本项目为调查与 Reviewer 增加的安全白名单。资源关键词直接配置在对应 MCP 的 `automates_manual_keywords`：server 禁用时保持人工门禁，启用后才允许自动处理，因此不必在全局 `manual_keywords` 重复填写。Pi 通过通用代理动态发现和注册工具；非 `required` 服务启动失败时会跳过，不阻塞纯代码 Bug；但当前 Bug 含诊断链接或命中某个资源关键词时，对应 MCP 会被动态视为必需，预检失败直接阻塞且不消耗修复重试。TAPD MCP 属于编排器数据源，继续单独配置在 `tapd.mcp`，不会加载给编码 Agent。
 
 `chrome_devtools` 使用项目中固定安装的 `chrome-devtools-mcp`，不会临时联网下载。项目代理会自动启动并复用同一个官方 daemon；因此调查、修复、Reviewer 或下一个 Bug 即使重新创建 stdio MCP，也不会重新建立 Chrome 调试连接。首次使用（以及 Chrome、Windows 或 daemon 重启后）需在 Chrome 144+ 的 `chrome://inspect/#remote-debugging` 开启远程调试，并在 Chrome 弹出的连接授权中允许一次；daemon 与 Chrome 持续运行期间后续任务无需重复授权。该安全确认由 Chrome 控制，不能在项目中永久绕过。不要改成 `--isolated`，否则会启动不带现有登录态的临时浏览器。调查阶段会尝试读取外部诊断链接；登录失效、权限不足或页面不可达时如实记录，但只要标题、描述、附件或源码已经能定位相关代码，就继续修复。
 
@@ -178,8 +165,6 @@ Agent 工具调用总次数和同一工具次数均不设置固定上限，`find
 Pi 的 `grep` / `find` 通过本地扩展默认搜索源码目录，编码阶段默认搜索计划文件所在目录；可显式指定相关路径扩大范围。递归搜索排除生成目录、二进制与 Windows `nul` 文件，每次最多 30 秒并保留部分结果；Shell 搜索也设置 30 秒单次超时，编译验证不受此限制。调查和收尾都超时时，会同时保存两段错误和轨迹。编码超时后的重试在工单上下文一致且计划路径仍有效时沿用调查检查点，由编码阶段重新核对源码；人工重试保留证据。独立评审发现的问题仍须修正，不因超时或重试而跳过。
 
 调查未完成时，失败证据保存已调用工具、已有观察、未确认问题和压缩轨迹。工单内容与工作目录一致时，下一次只读调查直接续查缺口；工单变化时重新核对，不把旧断点当成已证实根因。Pi 收尾仅整理已有证据，使用精简提示并关闭该收尾调用的推理；调查、编码和评审的推理设置不变。每 30 秒记录等待响应、推理、输出或工具执行状态及计数，超时报错附上这些元数据，不记录推理内容。未完成调查会在管理台明确显示，不能当成修复成功。
-
-自定义网关仍可用 `codex.context_window` / `codex.auto_compact_token_limit` 设置窗口与压缩阈值；`codex.model_catalog_json` 只应指向与实际模型工具协议匹配的显式目录。不要从 GPT 模型复制目录给 GLM/DeepSeek 等兼容网关模型，否则 Codex 会采用错误的工具调用协议，表现为只输出“我会先调查”而不真正调用工具。`Model metadata ... not found` 的提示对这类兼容网关是可接受的回退信息。
 
 Unreal 资源写入前仍须确认编辑器打开的工程就是该 P4 workspace；Agent 会比较 MCP 返回的项目根，发现不一致时停止写入。
 
@@ -191,7 +176,7 @@ WEB_TOKEN=...              # 管理台鉴权（URL 带 ?token= 或页面弹窗�
 # P4PORT/P4CLIENT/P4USER/P4PASSWD  # 也可放这里，优先级高于 config.yaml
 ```
 
-> 改连接配置不必动文件：管理台顶部 **⚙ 设置** 可在线选择 Pi/Codex、编辑 Agent 与 p4/tapd 连接项，保存写 `overrides.yaml`（优先级最高）。
+> 改连接配置不必动文件：管理台顶部 **⚙ 设置** 可在线编辑 Pi 模型与 p4/tapd 连接项，保存写 `overrides.yaml`（优先级最高）。
 
 ## 运行
 
@@ -226,7 +211,7 @@ P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Rev
 ### 准确率门禁
 
 - **结构化 Bug 上下文**：从 TAPD 原始字段整理复现步骤、预期/实际结果、环境、日志、评论和附件。
-- **图片/视频证据**：通过 TAPD MCP 把描述内图片和附件换成 300 秒临时 URL；Pi 和使用兼容网关的 Codex 都会在请求层发送原生图片/视频内容块，不下载媒体，也不按模型名称硬编码能力。不支持该格式或抓取失败时自动降级为普通 URL 文本。
+- **图片/视频证据**：通过 TAPD MCP 把描述内图片和附件换成 300 秒临时 URL；Pi 会在请求层发送原生图片/视频内容块，不下载媒体，也不按模型名称硬编码能力。不支持该格式或抓取失败时自动降级为普通 URL 文本。
 - **自动修复准入**：描述过短、缺少复现信号时进入 `needs_info`；可由已启用 Unreal MCP 处理的资源类进入自动调查，其余资源类进入 `manual_only`；所有业务代码均按同一流程调查和修复，不按协议、账号等关键词分类拦截。
 - **严格验证**：未配置 `verify_cmds` 时只能生成 `candidate`，不会标记为“已验证”。
 - **范围限制**：默认最多 8 个文件、500 行 diff，超限转失败/人工分析，避免无关大改。
@@ -262,8 +247,8 @@ P4 范围门禁 → `verify_cmds` 机器验证 → 独立只读 Reviewer → Rev
 ## 工作原理
 
 ```
-Tapd ──MCP(个人令牌)──> Orchestrator(worker) ──adapter──> Pi subprocess
-Tapd ──REST(API账号)──>       │        │          └──────> OpenAI Codex SDK
+Tapd ──MCP(个人令牌)──> Orchestrator(worker) ───────────> Pi subprocess
+Tapd ──REST(API账号)──>       │        │
       ^                       │        └── reconcile/edit/add ─> Perforce workspace
       └── 评论回写(不改状态)   │
                               Web 管理台 (Express + SSE)

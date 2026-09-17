@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -21,12 +20,10 @@ import { assessPatchScope, assessPlannedScope, runVerificationPipeline } from ".
 import { buildReviewPrompt, formatReviewerFeedback, parseReviewResult } from "../src/review.js";
 import {
   extractTapdMediaReferences,
-  injectMediaIntoCodexPayload,
   injectMediaIntoProviderPayload,
   isMediaCapabilityError,
   mediaLinksPrompt,
 } from "../src/media.js";
-import { startCodexMediaProxy } from "../src/codexMediaProxy.js";
 import { assessFixabilityWithNarrative } from "../src/admission.js";
 
 const makeBug = (over: Partial<Bug> = {}): Bug => ({
@@ -165,60 +162,21 @@ describe("TAPD 多媒体输入", () => {
     ]);
   });
 
-  it("按 Codex Responses 请求协议注入远程图片和视频，不判断模型名", () => {
+  it("按 Pi Responses provider 协议注入远程图片和视频", () => {
     const payload = {
       model: "any-compatible-model",
       input: [{ role: "user", content: [{ type: "input_text", text: "分析这个 Bug" }] }],
     };
-    const injected = injectMediaIntoCodexPayload(payload, [
+    const injected = injectMediaIntoProviderPayload(payload, [
       { kind: "image", url: "https://tapd.example/a.png" },
       { kind: "video", url: "https://tapd.example/a.mp4" },
-    ]) as { input: Array<{ content: unknown[] }> };
+    ], "openai-responses") as { input: Array<{ content: unknown[] }> };
 
     expect(injected.input[0].content).toEqual([
       { type: "input_text", text: "分析这个 Bug" },
       { type: "input_image", image_url: "https://tapd.example/a.png" },
       { type: "video_url", video_url: { url: "https://tapd.example/a.mp4" } },
     ]);
-  });
-
-  it("Codex 网关拒绝媒体块时使用原请求自动重试", async () => {
-    const received: unknown[] = [];
-    const upstream = http.createServer(async (request, response) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-      received.push(payload);
-      if (received.length === 1) {
-        response.writeHead(400, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "unsupported video content" } }));
-      } else {
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true }));
-      }
-    });
-    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
-    const address = upstream.address();
-    if (!address || typeof address === "string") throw new Error("test upstream failed to listen");
-    const proxy = await startCodexMediaProxy(`http://127.0.0.1:${address.port}/v1`, [
-      { kind: "video", url: "https://tapd.example/a.mp4" },
-    ]);
-    try {
-      const result = await fetch(`${proxy.baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ input: "分析这个 Bug" }),
-      });
-      expect(result.status).toBe(200);
-      expect(proxy.degraded()).toBe(true);
-      expect(received).toHaveLength(2);
-      expect(JSON.stringify(received[0])).toContain("video_url");
-      expect(received[1]).toEqual({ input: "分析这个 Bug" });
-    } finally {
-      await proxy.close();
-      await new Promise<void>((resolve, reject) =>
-        upstream.close((error) => error ? reject(error) : resolve()));
-    }
   });
 
   it("多模态不支持时仍可退回普通 URL 文本", () => {

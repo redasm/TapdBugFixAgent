@@ -171,22 +171,6 @@ const withResponsesContentArray = (message: Record<string, unknown>): Record<str
   return [];
 };
 
-/** Codex 网关代理使用：按实际 payload 协议注入，不按模型名称猜测多模态能力。 */
-export function injectMediaIntoCodexPayload(
-  payload: unknown,
-  media: AgentMediaInput[],
-): unknown {
-  if (!payload || typeof payload !== "object") return payload;
-  const root = payload as Record<string, unknown>;
-  if (Object.hasOwn(root, "input")) {
-    return injectMediaIntoProviderPayload(root, media, "openai-responses");
-  }
-  if (Array.isArray(root.messages)) {
-    return injectMediaIntoProviderPayload(root, media, "openai-chat");
-  }
-  return payload;
-}
-
 export function isMediaCapabilityError(text: string): boolean {
   return /(?:unsupported|invalid).*?(?:image|video|content)|(?:image|video).*?(?:unsupported|not supported|invalid)|image_(?:fetch|download)_failed|could not reach the image host/i.test(text);
 }

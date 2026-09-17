@@ -22,7 +22,6 @@ export interface McpServerConfig {
   disabled_tools: string[];
   read_only_tools?: string[];
   automates_manual_keywords: string[];
-  approval_mode: "auto" | "prompt" | "writes" | "approve";
   startup_timeout_sec: number;
   tool_timeout_sec: number;
 }
@@ -43,7 +42,6 @@ export interface ResolvedMcpServer {
   envHttpHeaders: Record<string, string>;
   enabledTools?: string[];
   disabledTools: string[];
-  approvalMode: McpServerConfig["approval_mode"];
   startupTimeoutSec: number;
   toolTimeoutSec: number;
 }
@@ -59,11 +57,6 @@ export interface McpServerInspection extends McpServerProbe {
   required: boolean;
   availableTools: string[];
   missingEnabledTools: string[];
-}
-
-type CodexConfigValue = string | number | boolean | CodexConfigValue[] | CodexConfigObject;
-interface CodexConfigObject {
-  [key: string]: CodexConfigValue;
 }
 
 const stringArray = (value: unknown): string[] | undefined => Array.isArray(value)
@@ -103,7 +96,6 @@ export function parseMcpServers(value: unknown): McpServersConfig {
       disabled_tools: stringArray(item.disabled_tools) ?? [],
       read_only_tools: stringArray(item.read_only_tools),
       automates_manual_keywords: stringArray(item.automates_manual_keywords) ?? [],
-      approval_mode: String(item.approval_mode ?? "approve") as McpServerConfig["approval_mode"],
       startup_timeout_sec: Number(item.startup_timeout_sec ?? 20),
       tool_timeout_sec: Number(item.tool_timeout_sec ?? 60),
     };
@@ -147,7 +139,6 @@ export function resolveMcpServers(
       envHttpHeaders: { ...config.env_http_headers },
       enabledTools,
       disabledTools: [...config.disabled_tools],
-      approvalMode: config.approval_mode,
       startupTimeoutSec: config.startup_timeout_sec,
       toolTimeoutSec: config.tool_timeout_sec,
     }];
@@ -350,37 +341,7 @@ export function mcpServerConfigProblems(configs: McpServersConfig, repoDirs: str
       if (!Number.isFinite(server.toolTimeoutSec) || server.toolTimeoutSec <= 0) {
         problems.push(`${label}.tool_timeout_sec 必须为正数`);
       }
-      if (!["auto", "prompt", "writes", "approve"].includes(server.approvalMode)) {
-        problems.push(`${label}.approval_mode 必须是 auto、prompt、writes 或 approve`);
-      }
     }
   }
   return [...new Set(problems)];
-}
-
-export function codexMcpConfig(servers: ResolvedMcpServer[]): CodexConfigObject {
-  const mcpServers: CodexConfigObject = {};
-  for (const server of servers) {
-    mcpServers[server.name] = {
-      required: server.required,
-      ...(server.url ? {
-        url: server.url,
-        ...(server.bearerTokenEnvVar ? { bearer_token_env_var: server.bearerTokenEnvVar } : {}),
-        ...(Object.keys(server.httpHeaders).length ? { http_headers: server.httpHeaders } : {}),
-        ...(Object.keys(server.envHttpHeaders).length ? { env_http_headers: server.envHttpHeaders } : {}),
-      } : {
-        command: server.command,
-        args: server.args,
-        cwd: server.cwd,
-        env: server.env,
-        ...(server.envVars.length ? { env_vars: server.envVars } : {}),
-      }),
-      startup_timeout_sec: server.startupTimeoutSec,
-      tool_timeout_sec: server.toolTimeoutSec,
-      default_tools_approval_mode: server.approvalMode,
-      ...(server.enabledTools !== undefined ? { enabled_tools: server.enabledTools } : {}),
-      ...(server.disabledTools.length ? { disabled_tools: server.disabledTools } : {}),
-    };
-  }
-  return servers.length ? { mcp_servers: mcpServers } : {};
 }

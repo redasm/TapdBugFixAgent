@@ -24,33 +24,6 @@ export const DEFAULT_PRIORITY_WEIGHT: Record<string, number> = {
 };
 export const DEFAULT_EXCLUDE_STATUS = ["resolved", "closed", "rejected"];
 
-export type AgentBackend = "pi" | "codex";
-
-export interface AgentSelectionConfig {
-  /** 主修复后端；默认 pi，便于平滑升级和 A/B 对照。 */
-  backend: AgentBackend;
-}
-
-export interface CodexConfig {
-  /** 空值使用本机 Codex 配置的默认模型。 */
-  model: string;
-  reasoning_effort: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
-  approval_policy: "never" | "on-request" | "on-failure" | "untrusted";
-  network_access: boolean;
-  /** 可选兼容网关；空值使用 Codex 默认服务。 */
-  base_url: string;
-  /** API Key 所在环境变量名；空值时沿用 Codex CLI 登录状态。 */
-  api_key_env: string;
-  /** 可选自定义 codex 可执行文件路径。 */
-  codex_path: string;
-  /** 可选 Codex 模型目录；只接受与实际模型匹配的显式目录，禁止套用其他模型模板。 */
-  model_catalog_json: string;
-  /** 自定义/网关模型的上下文窗口，避免 Codex 使用未知模型回退值。 */
-  context_window: number;
-  /** 自动压缩触发 token 数；应小于 context_window。 */
-  auto_compact_token_limit: number;
-}
-
 export interface RepoConfig {
   name: string;
   path: string;
@@ -88,14 +61,14 @@ export interface WorkspaceConfig {
 
 /** 自定义 pi provider 配置（对应 ~/.pi/agent/models.json 的 providers.<id>）。
  *  配置了 provider 段时，agent 会在 spawn pi 前自动合并写入 models.json。
- *  api_key_env / api_key 二选一：推荐 api_key_env（环境变量名，运行期解析，不落盘）。
+ *  常用配置只需 base_url、api_key、model_id；其余字段用于覆盖默认值。
  */
 export interface PiProviderConfig {
-  id: string;                  // provider id（--model 前缀，如 custom）
-  base_url?: string;           // 网关/中转地址，如 https://gateway.example.com
-  api_key_env?: string;        // 从环境变量读 key（推荐，密钥不落盘），如 ANTHROPIC_AUTH_TOKEN
-  api_key?: string;            // 或直接写 key（不推荐，落盘明文）
-  auth_header?: boolean;       // true = Authorization: Bearer（本司网关协议）；false = 默认 x-api-key
+  id?: string;                 // 内部 provider 名称，默认 gateway
+  base_url?: string;           // 网关地址
+  api_key_env?: string;        // 可选：改从指定环境变量读取 key，默认 PI_API_KEY
+  api_key?: string;            // 网关 API Key
+  auth_header?: boolean;       // 默认 true = Authorization: Bearer；false = x-api-key
   model_id?: string;           // 模型 id（构造 `--model <provider>/<model_id>`）；必填（配合 provider 段）
   reasoning?: boolean;         // 默认 true
   context_window?: number;     // 默认 200000
@@ -120,8 +93,6 @@ export interface QualityConfig {
 
 export interface ReviewConfig {
   enabled: boolean;
-  /** 可选 Reviewer 后端；空值沿用主修复后端。 */
-  backend: "" | AgentBackend;
   /** Reviewer 拒绝后允许 Fixer 定向修正的轮数。 */
   max_fix_rounds: number;
   /** 可选独立评审模型；空值沿用修复模型。 */
@@ -132,8 +103,6 @@ export interface ReviewConfig {
  *  loadConfig 启动时按"字段级合并"应用，优先级最高（覆盖 config.yaml 与 .env）。
  *  空字符串/undefined 的字段视为"保持不变"，不会被写入或覆盖。 */
 export interface SettingsOverrides {
-  agent?: Partial<AgentSelectionConfig>;
-  codex?: Partial<CodexConfig>;
   review?: Partial<ReviewConfig>;
   pi?: { provider?: Partial<PiProviderConfig> };
   p4?: Record<string, string>;
@@ -147,12 +116,7 @@ const PI_PROVIDER_FIELDS = [
   "model_id", "reasoning", "context_window", "max_tokens",
 ] as const;
 const TAPD_SCALAR_FIELDS = ["backend", "access_token", "api_user", "api_password"] as const;
-const CODEX_FIELDS = [
-  "model", "reasoning_effort", "approval_policy", "network_access",
-  "base_url", "api_key_env", "codex_path", "model_catalog_json",
-  "context_window", "auto_compact_token_limit",
-] as const;
-const REVIEW_FIELDS = ["enabled", "backend", "max_fix_rounds", "model"] as const;
+const REVIEW_FIELDS = ["enabled", "max_fix_rounds", "model"] as const;
 
 /** 读取 overrides.yaml（不存在或损坏 → null）。 */
 export function readSettingsOverrides(path = SETTINGS_PATH): SettingsOverrides | null {
@@ -168,23 +132,11 @@ export function readSettingsOverrides(path = SETTINGS_PATH): SettingsOverrides |
 
 /** 把 ov 字段级合并进 target（可变对象）。null/undefined/空串字段跳过，保留原值。 */
 function mergeSettingsInto(target: Record<string, unknown>, ov: SettingsOverrides): void {
-  if (ov.agent?.backend) {
-    const cur = (target.agent ??= {}) as Record<string, unknown>;
-    cur.backend = ov.agent.backend;
-  }
-  if (ov.codex) {
-    const cur = (target.codex ??= {}) as Record<string, unknown>;
-    for (const k of CODEX_FIELDS) {
-      const v = (ov.codex as Record<string, unknown>)[k];
-      if (v === undefined || v === null || v === "") continue;
-      cur[k] = v;
-    }
-  }
   if (ov.review) {
     const cur = (target.review ??= {}) as Record<string, unknown>;
     for (const k of REVIEW_FIELDS) {
       const v = (ov.review as Record<string, unknown>)[k];
-      if (v === undefined || v === null || (v === "" && k !== "backend")) continue;
+      if (v === undefined || v === null || v === "") continue;
       cur[k] = v;
     }
   }
@@ -218,8 +170,6 @@ function mergeSettingsInto(target: Record<string, unknown>, ov: SettingsOverride
 export function applySettingsOverrides(cfg: Config, ov: SettingsOverrides | null): void {
   if (!ov) return;
   mergeSettingsInto({
-    agent: cfg.agent,
-    codex: cfg.codex,
     review: cfg.review,
     pi: cfg.pi,
     p4: cfg.p4,
@@ -230,6 +180,12 @@ export function applySettingsOverrides(cfg: Config, ov: SettingsOverrides | null
 /** 把设置合并写回 overrides.yaml（保留已有其它项；下次启动 loadConfig 自动读回）。 */
 export function saveSettingsOverrides(ov: SettingsOverrides, path = SETTINGS_PATH): void {
   const raw = (readSettingsOverrides(path) ?? {}) as unknown as Record<string, unknown>;
+  // 保存时清理旧版本的后端选择；旧配置读取时也不会影响 Pi。
+  delete raw.agent;
+  delete raw.codex;
+  if (raw.review && typeof raw.review === "object") {
+    delete (raw.review as Record<string, unknown>).backend;
+  }
   mergeSettingsInto(raw, ov);
   fs.writeFileSync(path, yaml.dump(raw));
 }
@@ -238,8 +194,6 @@ export interface Config {
   max_bugs_per_run: number;
   max_attempts: number;
   agent_timeout_s: number;
-  agent: AgentSelectionConfig;
-  codex: CodexConfig;
   mcp_servers: McpServersConfig;
   quality: QualityConfig;
   review: ReviewConfig;
@@ -370,19 +324,6 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
     max_bugs_per_run: 10,
     max_attempts: 2,
     agent_timeout_s: 900,
-    agent: { backend: "pi" },
-    codex: {
-      model: "",
-      reasoning_effort: "high",
-      approval_policy: "never",
-      network_access: false,
-      base_url: "",
-      api_key_env: "OPENAI_API_KEY",
-      codex_path: "",
-      model_catalog_json: "",
-      context_window: 0,
-      auto_compact_token_limit: 0,
-    },
     mcp_servers: {},
     quality: {
       admission: {
@@ -394,7 +335,7 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
       max_changed_files: 8,
       max_diff_lines: 500,
     },
-    review: { enabled: true, backend: "", max_fix_rounds: 1, model: "" },
+    review: { enabled: true, max_fix_rounds: 1, model: "" },
     exclude_status: [...DEFAULT_EXCLUDE_STATUS],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -417,29 +358,6 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   cfg.max_bugs_per_run = Number(raw.max_bugs_per_run ?? cfg.max_bugs_per_run);
   cfg.max_attempts = Number(raw.max_attempts ?? cfg.max_attempts);
   cfg.agent_timeout_s = Number(raw.agent_timeout_s ?? cfg.agent_timeout_s);
-
-  const agentRaw = (raw.agent ?? {}) as Record<string, unknown>;
-  cfg.agent.backend = String(agentRaw.backend ?? cfg.agent.backend) as AgentBackend;
-
-  const codexRaw = (raw.codex ?? {}) as Record<string, unknown>;
-  cfg.codex.model = String(codexRaw.model ?? cfg.codex.model);
-  cfg.codex.reasoning_effort = String(
-    codexRaw.reasoning_effort ?? cfg.codex.reasoning_effort,
-  ) as CodexConfig["reasoning_effort"];
-  cfg.codex.approval_policy = String(
-    codexRaw.approval_policy ?? cfg.codex.approval_policy,
-  ) as CodexConfig["approval_policy"];
-  cfg.codex.network_access = Boolean(codexRaw.network_access ?? cfg.codex.network_access);
-  cfg.codex.base_url = String(codexRaw.base_url ?? cfg.codex.base_url);
-  cfg.codex.api_key_env = String(codexRaw.api_key_env ?? cfg.codex.api_key_env);
-  cfg.codex.codex_path = String(codexRaw.codex_path ?? cfg.codex.codex_path);
-  cfg.codex.model_catalog_json = String(
-    codexRaw.model_catalog_json ?? cfg.codex.model_catalog_json,
-  );
-  cfg.codex.context_window = Number(codexRaw.context_window ?? cfg.codex.context_window);
-  cfg.codex.auto_compact_token_limit = Number(
-    codexRaw.auto_compact_token_limit ?? cfg.codex.auto_compact_token_limit,
-  );
 
   cfg.mcp_servers = parseMcpServers(raw.mcp_servers);
 
@@ -465,9 +383,6 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
 
   const reviewRaw = (raw.review ?? {}) as Record<string, unknown>;
   cfg.review.enabled = Boolean(reviewRaw.enabled ?? cfg.review.enabled);
-  cfg.review.backend = String(
-    reviewRaw.backend ?? cfg.review.backend,
-  ) as ReviewConfig["backend"];
   cfg.review.max_fix_rounds = Math.max(0, Number(
     reviewRaw.max_fix_rounds ?? cfg.review.max_fix_rounds,
   ));
@@ -557,29 +472,6 @@ function isPlaceholder(value: unknown): boolean {
 /** 返回配置问题列表（空表示 OK）。 */
 export function validateConfig(cfg: Config): string[] {
   const problems: string[] = [];
-  const agentBackend = cfg.agent?.backend ?? "pi";
-  if (agentBackend !== "pi" && agentBackend !== "codex") {
-    problems.push(`agent.backend 必须是 pi 或 codex（当前: ${agentBackend}）`);
-  }
-  if (cfg.review.backend && cfg.review.backend !== "pi" && cfg.review.backend !== "codex") {
-    problems.push(`review.backend 必须为空、pi 或 codex（当前: ${cfg.review.backend}）`);
-  }
-  if (!["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(cfg.codex.reasoning_effort)) {
-    problems.push(`codex.reasoning_effort 无效（当前: ${cfg.codex.reasoning_effort}）`);
-  }
-  if (!["never", "on-request", "on-failure", "untrusted"].includes(cfg.codex.approval_policy)) {
-    problems.push(`codex.approval_policy 无效（当前: ${cfg.codex.approval_policy}）`);
-  }
-  if (cfg.codex.context_window < 0 || !Number.isFinite(cfg.codex.context_window)) {
-    problems.push("codex.context_window 必须是非负数");
-  }
-  if (cfg.codex.auto_compact_token_limit < 0 || !Number.isFinite(cfg.codex.auto_compact_token_limit)) {
-    problems.push("codex.auto_compact_token_limit 必须是非负数");
-  }
-  if (cfg.codex.context_window > 0
-      && cfg.codex.auto_compact_token_limit >= cfg.codex.context_window) {
-    problems.push("codex.auto_compact_token_limit 必须小于 codex.context_window");
-  }
   const tapd = cfg.tapd as Record<string, unknown>;
   const backend = String(tapd.backend ?? "rest");
   if (backend === "mcp") {

@@ -31,6 +31,7 @@ import {
   AgentRuntimeError,
   AgentTimeoutError,
   CancelEvent,
+  CommandExecutionGuard,
   WriteProgressGuard,
   isFileWriteToolCall,
   PiAgent,
@@ -46,22 +47,8 @@ import {
 } from "../src/agent.js";
 import { Worker, requireExistingPlannedFiles } from "../src/worker.js";
 import { TapdMcpClient } from "../src/tapdMcp.js";
+import { effectiveReviewModel } from "../src/review.js";
 import {
-  createCodingAgent,
-  effectiveAgentModel,
-  effectiveReviewModel,
-  selectedAgentBackend,
-} from "../src/agentBackend.js";
-import {
-  CodexAgent,
-  CommandExecutionGuard,
-  codexOutputSchema,
-  codexThreadOptions,
-  ensureCodexModelCatalog,
-  progressFromCodexEvent,
-} from "../src/codexAgent.js";
-import {
-  codexMcpConfig,
   configuredManualKeywords,
   inspectMcpServer,
   mcpToolGuidance,
@@ -146,19 +133,6 @@ function makeConfig(): Config {
     max_bugs_per_run: 10,
     max_attempts: 1,
     agent_timeout_s: 900,
-    agent: { backend: "pi" },
-    codex: {
-      model: "",
-      reasoning_effort: "high",
-      approval_policy: "never",
-      network_access: false,
-      base_url: "",
-      api_key_env: "OPENAI_API_KEY",
-      codex_path: "",
-      model_catalog_json: "",
-      context_window: 0,
-      auto_compact_token_limit: 0,
-    },
     mcp_servers: {},
     quality: {
       admission: {
@@ -170,7 +144,7 @@ function makeConfig(): Config {
       max_changed_files: 8,
       max_diff_lines: 500,
     },
-    review: { enabled: false, backend: "", max_fix_rounds: 0, model: "" },
+    review: { enabled: false, max_fix_rounds: 0, model: "" },
     exclude_status: ["resolved", "closed", "rejected"],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -316,19 +290,6 @@ priority_weight:
     expect(cfg.workspaces[0].workspace_id).toBe("111");
     expect(cfg.workspaces[0].repos[0].name).toBe("p");
     expect(cfg.priority_weight["低"]).toBe(1);
-    expect(cfg.agent.backend).toBe("pi");
-    expect(cfg.codex.reasoning_effort).toBe("high");
-  });
-
-  it("加载 Codex 后端和独立 Reviewer 后端", () => {
-    const dir = tmpdir();
-    const cfgPath = path.join(dir, "c.yaml");
-    fs.writeFileSync(cfgPath, `agent:\n  backend: codex\ncodex:\n  model: gpt-test\n  reasoning_effort: xhigh\nreview:\n  backend: pi\n`, "utf-8");
-    const cfg = loadConfig(cfgPath);
-    expect(cfg.agent.backend).toBe("codex");
-    expect(cfg.codex.model).toBe("gpt-test");
-    expect(cfg.codex.reasoning_effort).toBe("xhigh");
-    expect(cfg.review.backend).toBe("pi");
   });
 
   it("loadConfig 拒绝旧 pi.model 字段", () => {
@@ -418,18 +379,7 @@ priority_weight:
   });
 });
 
-describe("Agent 后端选择", () => {
-  it("默认保持 Pi，并可切换到 Codex", () => {
-    const cfg = makeConfig();
-    expect(selectedAgentBackend(cfg)).toBe("pi");
-    expect(createCodingAgent(cfg)).toBeInstanceOf(PiAgent);
-    cfg.agent.backend = "codex";
-    cfg.codex.model = "gpt-test";
-    expect(selectedAgentBackend(cfg)).toBe("codex");
-    expect(effectiveAgentModel(cfg)).toBe("gpt-test");
-    expect(createCodingAgent(cfg)).toBeInstanceOf(CodexAgent);
-  });
-
+describe("Pi 模型和执行守卫", () => {
   it("Pi Reviewer 的裸模型名自动继承 provider 前缀", () => {
     const cfg = makeConfig();
     cfg.pi.provider = {
@@ -438,144 +388,12 @@ describe("Agent 后端选择", () => {
       context_window: 1000000, max_tokens: 32000, skill_dirs: [],
     };
     cfg.review.model = "deepseek-v4-pro";
-    expect(effectiveReviewModel(cfg, "pi")).toBe("custom/deepseek-v4-pro");
+    expect(effectiveReviewModel(cfg)).toBe("custom/deepseek-v4-pro");
     cfg.review.model = "other/model";
-    expect(effectiveReviewModel(cfg, "pi")).toBe("other/model");
+    expect(effectiveReviewModel(cfg)).toBe("other/model");
   });
 
-  it("Codex Reviewer 会移除共用配置里的 Pi provider 前缀", () => {
-    const cfg = makeConfig();
-    cfg.pi.provider = {
-      id: "custom",
-      base_url: "https://gateway.example.com",
-      model_id: "glm-test",
-    };
-    cfg.review.model = "custom/gpt-test";
-    expect(effectiveReviewModel(cfg, "codex")).toBe("gpt-test");
-    cfg.review.model = "other/gpt-test";
-    expect(effectiveReviewModel(cfg, "codex")).toBe("other/gpt-test");
-  });
-
-  it("Codex 事件转换为可读进度", () => {
-    const progress = progressFromCodexEvent({
-      type: "item.completed",
-      item: {
-        id: "1",
-        type: "file_change",
-        status: "completed",
-        changes: [{ path: "src/a.ts", kind: "update" }],
-      },
-    } as never);
-    expect(progress).toContain("src/a.ts");
-  });
-
-  it("Codex MCP 工具失败进度包含 SDK 返回的错误正文", () => {
-    const progress = progressFromCodexEvent({
-      type: "item.completed",
-      item: {
-        id: "mcp-1",
-        type: "mcp_tool_call",
-        server: "unreal_mcp",
-        tool: "read_mcp_resource",
-        arguments: { uri: "ping" },
-        status: "failed",
-        error: { message: "Invalid request parameters" },
-      },
-    } as never);
-    expect(progress).toContain("unreal_mcp/read_mcp_resource");
-    expect(progress).toContain("Invalid request parameters");
-  });
-
-  it("Codex 命令失败进度包含 exit code 和输出尾部", () => {
-    const progress = progressFromCodexEvent({
-      type: "item.completed",
-      item: {
-        id: "cmd-1",
-        type: "command_execution",
-        command: "git status --short",
-        aggregated_output: "fatal: not a git repository",
-        exit_code: 128,
-        status: "failed",
-      },
-    } as never);
-    expect(progress).toContain("命令失败（exit 128）");
-    expect(progress).toContain("not a git repository");
-  });
-
-  it("Codex 将 rg exit 1 且无输出显示为未命中而不是失败", () => {
-    const progress = progressFromCodexEvent({
-      type: "item.completed",
-      item: {
-        id: "cmd-2",
-        type: "command_execution",
-        command: "powershell.exe -Command 'rg -n missing Source'",
-        aggregated_output: "",
-        exit_code: 1,
-        status: "failed",
-      },
-    } as never);
-    expect(progress).toContain("搜索未命中");
-    expect(progress).not.toContain("命令失败");
-  });
-
-  it("Codex 将 rg 管道提前结束造成的 exit 1 显示为已有结果", () => {
-    const progress = progressFromCodexEvent({
-      type: "item.completed",
-      item: {
-        id: "cmd-3",
-        type: "command_execution",
-        command: "rg -n WildEvent . | Select-Object -First 20",
-        aggregated_output: "Source/WildEvent.ts:42:class WildEvent",
-        exit_code: 1,
-        status: "failed",
-      },
-    } as never);
-    expect(progress).toContain("搜索已返回结果");
-    expect(progress).not.toContain("命令失败");
-  });
-
-  it("Codex 保留 rg 路径错误为真实命令失败", () => {
-    const progress = progressFromCodexEvent({
-      type: "item.completed",
-      item: {
-        id: "cmd-4",
-        type: "command_execution",
-        command: "rg -n WildEvent MissingDir",
-        aggregated_output: "rg: MissingDir: 系统找不到指定的文件。 (os error 2)",
-        exit_code: 1,
-        status: "failed",
-      },
-    } as never);
-    expect(progress).toContain("命令失败（exit 1）");
-    expect(progress).toContain("系统找不到指定的文件");
-  });
-
-  it("Codex 线程接收去重排序后的 additionalDirectories", () => {
-    const cfg = makeConfig();
-    const options = codexThreadOptions({
-      prompt: "fix",
-      repoDir: "C:\\project",
-      additionalDirs: ["C:\\engine-b", "C:\\engine-a", "C:\\engine-b"],
-      timeoutS: 10,
-    }, cfg.codex, "workspace-write");
-
-    expect(options.workingDirectory).toBe("C:\\project");
-    expect(options.additionalDirectories).toEqual(["C:\\engine-a", "C:\\engine-b"]);
-  });
-
-  it("自定义 Codex 网关禁用原生 outputSchema，避免工具调用被提前终止", () => {
-    const cfg = makeConfig();
-    const schema = { type: "object", properties: { summary: { type: "string" } } };
-    const opts = { prompt: "x", repoDir: "C:\\project", timeoutS: 60, outputSchema: schema };
-
-    cfg.codex.base_url = "https://gateway.example.com";
-    expect(codexOutputSchema(opts, cfg.codex)).toBeUndefined();
-
-    cfg.codex.base_url = "";
-    expect(codexOutputSchema(opts, cfg.codex)).toBe(schema);
-  });
-
-  it("Codex 调查守卫阻止重复命令和超出命令预算", () => {
+  it("Pi 调查守卫阻止重复命令和超出命令预算", () => {
     const repeated = new CommandExecutionGuard(10, 2);
     repeated.observe("rg -n Foo Source");
     repeated.observe("  RG   -n foo source ");
@@ -617,18 +435,6 @@ describe("Agent 后端选择", () => {
     expect(() => guard.observeTool("read", { path: "c.ts" })).toThrow(/仍未修改文件/);
   });
 
-  it("自定义 Codex 网关不自动套用 GPT 模型目录", () => {
-    const cfg = makeConfig();
-    cfg.codex.model = "glm-5.3";
-    cfg.codex.base_url = "https://gateway.example.com";
-    cfg.codex.context_window = 1_000_000;
-    expect(ensureCodexModelCatalog(cfg, cfg.codex.model)).toBeUndefined();
-
-    cfg.codex.model_catalog_json = "{agent}/models/glm.json";
-    expect(ensureCodexModelCatalog(cfg, cfg.codex.model)).toBe(
-      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "models/glm.json"),
-    );
-  });
 });
 
 describe("Git 附加工作区", () => {
@@ -746,7 +552,7 @@ describe("通用 MCP Agent 接入", () => {
     mcpMockState.closed = 0;
   });
 
-  it("按仓库根解析所有启用服务，调查阶段生成只读 Codex MCP 配置", () => {
+  it("按仓库根解析所有启用服务，调查阶段应用只读 MCP 白名单", () => {
     const repo = tmpdir();
     const firstCwd = path.join(repo, "tools", "first");
     const secondCwd = path.join(repo, "tools", "second");
@@ -776,7 +582,6 @@ describe("通用 MCP Agent 接入", () => {
       disabled_mcp: { enabled: false, command: "ignored" },
     });
     const servers = resolveMcpServers(cfg, repo, true);
-    const codex = codexMcpConfig(servers) as Record<string, Record<string, Record<string, unknown>>>;
 
     expect(servers).toHaveLength(3);
     expect(servers[0].args).toEqual([path.join(firstCwd, "server.py")]);
@@ -785,11 +590,7 @@ describe("通用 MCP Agent 接入", () => {
     expect(servers[0].enabledTools).toEqual(["ping", "inspect"]);
     expect(servers[1].enabledTools).toEqual(["read"]);
     expect(servers[2].cwd).toBe(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
-    expect(codex.mcp_servers.demo_mcp.disabled_tools).toContain("execute_python");
-    expect(codex.mcp_servers.demo_mcp.default_tools_approval_mode).toBe("approve");
-    expect(codex.mcp_servers.demo_mcp.enabled_tools).toEqual(["ping", "inspect"]);
-    expect(codex.mcp_servers.second_mcp.enabled_tools).toEqual(["read"]);
-    expect(codex.mcp_servers.disabled_mcp).toBeUndefined();
+    expect(servers[0].disabledTools).toContain("execute_python");
   });
 
   it("实施阶段使用 enabled_tools，未配置 allowlist 时开放除 denylist 外的工具", () => {
@@ -805,7 +606,7 @@ describe("通用 MCP Agent 接入", () => {
     expect(servers[1].disabledTools).toEqual(["dangerous"]);
   });
 
-  it("远程 HTTP MCP 可直接映射到 Codex 配置", () => {
+  it("远程 HTTP MCP 保留连接、鉴权和只读工具配置", () => {
     const cfg = parseMcpServers({
       docs: {
         url: "https://mcp.example.com/mcp",
@@ -815,16 +616,16 @@ describe("通用 MCP Agent 接入", () => {
         read_only_tools: ["search"],
       },
     });
-    const codex = codexMcpConfig(resolveMcpServers(cfg, tmpdir(), true)) as Record<string, Record<string, Record<string, unknown>>>;
+    const [server] = resolveMcpServers(cfg, tmpdir(), true);
 
-    expect(codex.mcp_servers.docs).toMatchObject({
+    expect(server).toMatchObject({
       url: "https://mcp.example.com/mcp",
-      bearer_token_env_var: "MCP_TOKEN",
-      http_headers: { "X-Region": "cn" },
-      env_http_headers: { "X-Tenant": "MCP_TENANT" },
-      enabled_tools: ["search"],
+      bearerTokenEnvVar: "MCP_TOKEN",
+      httpHeaders: { "X-Region": "cn" },
+      envHttpHeaders: { "X-Tenant": "MCP_TENANT" },
+      enabledTools: ["search"],
     });
-    expect(codex.mcp_servers.docs.command).toBeUndefined();
+    expect(server.command).toBe("");
   });
 
   it("MCP 预检枚举实际工具、调用 ping，并生成禁止误用 resources API 的提示", async () => {
@@ -989,18 +790,15 @@ p4:
     expect(cfg.p4.client).toBe("new-client");
   });
 
-  it("Agent/Codex/Reviewer 设置可在线覆盖", () => {
+  it("Pi 与独立评审模型设置可在线覆盖", () => {
     const cfg = makeConfig();
     applySettingsOverrides(cfg, {
-      agent: { backend: "codex" },
-      codex: { model: "gpt-test", reasoning_effort: "xhigh", network_access: true },
-      review: { backend: "pi" },
+      pi: { provider: { id: "test", model_id: "fix-model" } },
+      review: { enabled: true, model: "review-model", max_fix_rounds: 2 },
     });
-    expect(cfg.agent.backend).toBe("codex");
-    expect(cfg.codex.model).toBe("gpt-test");
-    expect(cfg.codex.reasoning_effort).toBe("xhigh");
-    expect(cfg.codex.network_access).toBe(true);
-    expect(cfg.review.backend).toBe("pi");
+    expect(effectivePiModel(cfg.pi)).toBe("test/fix-model");
+    expect(effectiveReviewModel(cfg)).toBe("test/review-model");
+    expect(cfg.review).toEqual({ enabled: true, model: "review-model", max_fix_rounds: 2 });
   });
 
   it("saveSettingsOverrides 保留已有项，多次保存合并", () => {
@@ -3151,9 +2949,6 @@ describe("worker 两阶段修复协议", () => {
     expect(calls).toHaveLength(3);
     expect(String(calls[1].prompt)).toContain("上一轮输出未完成");
     expect(String(calls[1].prompt)).toContain("我会先阅读相关代码");
-    expect(calls[0].outputSchema).toBeDefined();
-    expect(calls[1].outputSchema).toBe(calls[0].outputSchema);
-    expect(calls[2].outputSchema).toBeDefined();
     expect(calls[2].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });
@@ -3238,22 +3033,20 @@ describe("worker 两阶段修复协议", () => {
     expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("P4 服务当前不可用");
   });
 
-  it("Codex 后端沿用同一编排，并按阶段切换沙箱", async () => {
+  it("Pi 完成调查与修复并记录实际模型", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
-    w.config.agent.backend = "codex";
-    w.config.codex.model = "gpt-test";
+    w.config.pi.provider = { id: "test", model_id: "fix-model" };
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
-    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
       calls.push(opts as unknown as Record<string, unknown>);
       return calls.length === 1
         ? makeInvestigation("Login.ts")
-        : makeResult({ changed_files: ["Login.ts"], summary: "Codex 修复" });
+        : makeResult({ changed_files: ["Login.ts"], summary: "Pi 修复" });
     });
-    const piRun = vi.spyOn(PiAgent.prototype, "run");
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "opened")
       .mockResolvedValueOnce([])
@@ -3264,32 +3057,28 @@ describe("worker 两阶段修复协议", () => {
 
     await w.processBug(bug);
 
-    expect(piRun).not.toHaveBeenCalled();
     expect(calls.map((call) => call.sandboxMode)).toEqual(["read-only", "workspace-write"]);
     expect(calls.map((call) => call.timeoutS)).toEqual([600, 1800]);
     expect(calls[0].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
     expect(calls[0].repeatedCommandLimit).toBe(3);
     expect(calls[0].maxReadOnlyExecutionsBeforeWrite).toBeUndefined();
     expect(calls[0].completionGraceSeconds).toBe(30);
-    expect(calls[0].outputSchema).toBeDefined();
     expect(calls[1].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
     expect(calls[1].repeatedCommandLimit).toBe(3);
     expect(calls[1].maxReadOnlyExecutionsBeforeWrite).toBe(Number.POSITIVE_INFINITY);
     expect(calls[1].maxSecondsBeforeWrite).toBe(900);
-    expect(calls[1].outputSchema).toBeDefined();
-    expect(w.store.getJob(bug.id)?.agent).toBe("codex");
-    expect(w.store.getJob(bug.id)?.model).toBe("gpt-test");
+    expect(w.store.getJob(bug.id)?.agent).toBe("pi");
+    expect(w.store.getJob(bug.id)?.model).toBe("test/fix-model");
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
   });
 
   it("编码阶段 900 秒未落笔时保留 1800 秒总上限，并只做一次 180 秒定向收尾", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
-    w.config.agent.backend = "codex";
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
-    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) return makeInvestigation("Login.ts");
       if (calls.length === 2) {
@@ -3405,16 +3194,15 @@ describe("worker 两阶段修复协议", () => {
 
   it("编码达到预算但已有真实 diff 时继续验证并隔离到人工评审，不冒充成功", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
-    w.config.agent.backend = "codex";
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
-    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) return makeInvestigation("Login.ts");
       throw new AgentTimeoutError(
-        "Agent 调用超时(1800s): codex",
+        "Agent 调用超时(1800s): pi",
         'FINAL_RESULT: {"summary":"已修改但未完成收尾","changed_files":["Login.ts"],"manual_assets":[],"blocked_reasons":[]}',
         true,
       );
@@ -3523,14 +3311,13 @@ describe("worker 两阶段修复协议", () => {
     const repoDir = tmpdir();
     fs.writeFileSync(path.join(repoDir, "Login.ts"), "export const login = true;\n");
     const w = makeWorker([{ name: "r", path: repoDir, verify_cmds: [] }]);
-    w.config.agent.backend = "codex";
     w.config.max_attempts = 2;
     const bug = makeBug({
       description: "Crash 详情 https://crashsight.qq.com/crash-reporting/crashes/app/issue/report?pid=10",
     });
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
-    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
       calls.push(opts as unknown as Record<string, unknown>);
       return calls.length === 1
         ? makeInvestigation("project:Login.ts")
@@ -3552,12 +3339,11 @@ describe("worker 两阶段修复协议", () => {
 
   it("Agent 超时后强制收敛，仍失败则自动重试而不是 needs_info", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
-    w.config.agent.backend = "codex";
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
-    vi.spyOn(CodexAgent.prototype, "run").mockRejectedValue(
-      new AgentTimeoutError("Agent 调用超时(600s): codex"),
+    vi.spyOn(PiAgent.prototype, "run").mockRejectedValue(
+      new AgentTimeoutError("Agent 调用超时(600s): pi"),
     );
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
 
@@ -3604,15 +3390,14 @@ describe("worker 两阶段修复协议", () => {
 
   it("调查超时前已有结构化定位结果时直接进入修复阶段", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
-    w.config.agent.backend = "codex";
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
-    vi.spyOn(CodexAgent.prototype, "run").mockImplementation(async (opts) => {
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         throw new AgentTimeoutError(
-          "Agent 调用超时(600s): codex",
+          "Agent 调用超时(600s): pi",
           makeInvestigation("Login.ts").raw_output,
         );
       }
@@ -3637,10 +3422,9 @@ describe("worker 两阶段修复协议", () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
-    vi.spyOn(CodexAgent.prototype, "run").mockResolvedValue(makeResult({
+    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({
       raw_output: 'FINAL_RESULT: {"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":["无法根据标题、描述及现有代码定位问题"]}',
     }));
-    w.config.agent.backend = "codex";
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
 
     await w.processBug(bug);
@@ -3797,12 +3581,9 @@ describe("worker 两阶段修复协议", () => {
     expect(String(calls[1].prompt)).toContain("编排器会在 Agent 完成后统一执行 p4 add");
     expect(String(calls[1].prompt)).not.toContain("只使用 default changelist");
     expect(calls[2].tools).toEqual(["read", "grep", "find", "ls"]);
-    expect(calls[2].outputSchema).toBeDefined();
     expect(calls[2].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
     expect(String(calls[3].prompt)).toContain("失败分支必须显示错误并返回");
-    expect(calls[3].outputSchema).toBeDefined();
     expect(calls[4].tools).toEqual(["read", "grep", "find", "ls"]);
-    expect(calls[4].outputSchema).toBe(calls[2].outputSchema);
     const job = w.store.getJob(bug.id);
     expect(job?.agent_state).toBe("candidate_partial");
     expect(String(job?.manual_assets)).toContain("Assets/Settings.prefab");
@@ -4304,7 +4085,7 @@ describe("ensurePiModels", () => {
     });
   });
 
-  it("未显式配置 key 时引用 ANTHROPIC_API_KEY", () => {
+  it("未显式配置 key 时引用 PI_API_KEY", () => {
     const dir = tmpdir();
     const file = path.join(dir, "models.json");
     ensurePiModels({
@@ -4316,7 +4097,7 @@ describe("ensurePiModels", () => {
     }, file);
 
     const p = JSON.parse(fs.readFileSync(file, "utf-8")).providers.proxy;
-    expect(p.apiKey).toBe("$ANTHROPIC_API_KEY");
+    expect(p.apiKey).toBe("$PI_API_KEY");
   });
 
   it("max_tokens 超过 Pi 网关上限时自动钳制为 131072", () => {
@@ -4389,7 +4170,7 @@ describe("effectivePiModel", () => {
   it("无 provider / 缺 model_id 返回空串", () => {
     expect(effectivePiModel({})).toBe("");
     expect(effectivePiModel({ provider: { id: "custom" } })).toBe("");
-    expect(effectivePiModel({ provider: { model_id: "m" } })).toBe("");
+    expect(effectivePiModel({ provider: { model_id: "m" } })).toBe("gateway/m");
   });
 
   it("拼成 <provider>/<model_id>", () => {

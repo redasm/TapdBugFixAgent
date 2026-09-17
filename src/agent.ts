@@ -625,11 +625,9 @@ export interface AgentRunOptions {
   tools?: string[];
   /** 可选模型覆盖，供独立 Reviewer 使用。 */
   model?: string;
-  /** Codex SDK 使用的阶段化沙箱；Pi 通过 tools 白名单保持兼容。 */
+  /** 阶段访问模式：通过工具和 MCP 白名单限制只读调查与评审。 */
   sandboxMode?: "read-only" | "workspace-write";
-  /** Codex SDK 原生结构化输出 schema；Pi 继续使用 FINAL_RESULT 协议。 */
-  outputSchema?: unknown;
-  /** 与主工作目录同时开放给 Agent 的附加目录（Codex 映射为 additionalDirectories）。 */
+  /** 与主工作目录同时开放给 Agent 的附加目录。 */
   additionalDirs?: string[];
   /** 本次任务必须可用的 MCP；即使 server 的全局 required=false 也会 fail closed。 */
   requiredMcpServers?: string[];
@@ -661,30 +659,34 @@ export interface AgentRunOptions {
 const PI_AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
 const PI_MODELS_PATH = path.join(PI_AGENT_DIR, "models.json");
 
+export function effectivePiProviderId(pi: PiConfig): string {
+  return pi.provider?.id?.trim() || "gateway";
+}
+
 /** 有效 `--model` 值（`<provider>/<model_id>`）。未配置 provider / model_id 返回 ""（pi 用默认模型）。
  *  model_id 若已带 "/"（直接写全限定名）则原样返回，否则拼前缀。 */
 export function effectivePiModel(pi: PiConfig): string {
   const p = pi.provider;
-  if (!p || !p.id || !p.model_id) return "";
-  return p.model_id.includes("/") ? p.model_id : `${p.id}/${p.model_id}`;
+  if (!p?.model_id) return "";
+  return p.model_id.includes("/") ? p.model_id : `${effectivePiProviderId(pi)}/${p.model_id}`;
 }
 
 /** 把 config.yaml 的 pi.provider 段合并写入 ~/.pi/agent/models.json（仅配置了 provider 时）。
  *  - 只覆盖 providers.<id> 这一项，保留用户已配置的其它 provider / 内置 provider。
  *  - apiKey 优先取 p.api_key，否则把 p.api_key_env 写成 `$ENV_VAR`（运行期由 pi 解析，
- *    密钥不落盘）。两者都缺则退化为 `$ANTHROPIC_API_KEY`。
+ *    密钥不落盘）。两者都缺则使用 `$PI_API_KEY`。
  *  - 模型 id 取 p.model_id（带 "/" 时取最后一段，与 effectivePiModel 的 --model 值对应）；
  *    缺 model_id 则不写（交给 pi 报错）。
  *  modelsPath 参数仅测试用。
  */
 export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void {
   const p = pi.provider;
-  if (!p || !p.id || !p.base_url) return;
+  if (!p?.base_url) return;
   const rawModel = p.model_id ?? "";
   const modelId = rawModel.includes("/") ? rawModel.split("/").pop() ?? "" : rawModel;
   if (!modelId) return;
 
-  const apiKey = p.api_key ?? `$${p.api_key_env ?? "ANTHROPIC_API_KEY"}`;
+  const apiKey = p.api_key || `$${p.api_key_env || "PI_API_KEY"}`;
   const entry: Record<string, unknown> = {
     baseUrl: p.base_url,
     api: "anthropic-messages",
@@ -702,7 +704,7 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
       },
     ],
   };
-  if (p.auth_header) entry.authHeader = true;
+  if (p.auth_header ?? true) entry.authHeader = true;
 
   let root: Record<string, unknown> = { providers: {} };
   try {
@@ -716,7 +718,7 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
   const providers = (root.providers && typeof root.providers === "object"
     ? root.providers
     : {}) as Record<string, unknown>;
-  providers[p.id] = entry;
+  providers[effectivePiProviderId(pi)] = entry;
   root.providers = providers;
   fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
   fs.writeFileSync(modelsPath, JSON.stringify(root, null, 2) + "\n");
@@ -782,7 +784,7 @@ export class PiAgent {
 
     if (opts.additionalDirs?.length) {
       opts.onProgress?.(
-        "[警告] Pi 后端会在提示词中获知附加目录，但不提供 Codex additionalDirectories 的沙箱边界",
+        "[警告] Pi 通过提示词获知附加目录，目录访问范围不受操作系统沙箱隔离",
       );
     }
 

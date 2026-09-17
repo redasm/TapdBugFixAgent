@@ -1,4 +1,4 @@
-# 注：web 管理台顶部的「⚙ 设置」可选择 Pi/Codex 并编辑 Agent/p4/tapd 配置，保存写入同目录 overrides.yaml
+# 注：web 管理台顶部的「⚙ 设置」可编辑 Pi 模型及 p4/tapd 配置，保存写入同目录 overrides.yaml
 # （启动时合并、优先级最高），不必改本文件。本文件保留 workspaces / 优先级等复杂结构。
 
 # 修复流程参数
@@ -7,63 +7,21 @@ max_attempts: 2                # 单个 bug 自动重试次数：失败后自动
                                # 重试耗尽才标记 failed 并回写 Tapd 失败评论。设为 1 = 不自动重试
 agent_timeout_s: 1800          # 每个编码 Agent 调用的超时（秒）；超时后停止自动重试并转 needs_info
 
-# Agent 后端：保留 Pi，也可切换到 OpenAI 官方 Codex SDK。
-# 可用同一套历史评测与人工反馈指标做 A/B 对比。
-agent:
-  backend: pi                  # pi | codex
-
-codex:
-  model: ""                    # 空值使用本机 Codex 默认模型
-  reasoning_effort: high       # minimal | low | medium | high | xhigh | max | ultra
-  approval_policy: never       # 自动任务建议 never；外层流程仍有 P4/验证/评审门禁
-  network_access: false        # 默认禁止联网，降低不确定性与提示注入风险
-  base_url: ""                 # 可选兼容网关
-  api_key_env: OPENAI_API_KEY  # 只保存环境变量名，不保存密钥
-  codex_path: ""               # 可选自定义 codex 可执行文件路径
-  model_catalog_json: ""       # 仅填写与实际模型匹配的目录；不要把 GPT 模型元数据套到兼容网关模型
-  context_window: 0            # 自定义模型可填写实际上下文窗口；0 表示沿用模型目录
-  auto_compact_token_limit: 0  # 自动压缩阈值；0 表示沿用模型目录，且非零时须小于 context_window
-
-
-# 编码 Agent：pi（https://github.com/earendil-works/pi）
-#   以子进程方式调用 `pi --mode json "<prompt>"`（npm 全局安装 @earendil-works/pi-coding-agent）。
-#
-#   pi 0.85.1 鉴权注意：
-#     - 读 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN（或 `pi /login` 做 OAuth 登录，token 存
-#       ~/.pi/agent/auth.json）；**不读** ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN。
-#     - URL 只能通过 ~/.pi/agent/models.json 的自定义 provider 指定，pi 没有 --base-url 参数。
-#
-#   两种配法：
-#   【方式一：只用默认鉴权】不配 provider，pi 段留空：
-#     pi: {}
-#     鉴权靠 ANTHROPIC_API_KEY / ANTHROPIC_OAUTH_TOKEN / `pi /login`，模型用 pi 默认。
-#
-#   【方式二：走中转/代理（url+key 全放 config.yaml，推荐）】
-#     填了 provider 段后，本工具会在 spawn pi 前自动把该段合并写入 ~/.pi/agent/models.json
-#     （只覆盖 providers.<id>，保留你已有其它 provider）。api_key_env 填环境变量**名**，
-#     本工具会按 Pi 0.85+ 要求写成 `$ENV_VAR`，密钥不落盘。model_id 必填，构造 `--model <provider>/<model_id>`。
+# Pi 直接连接网关，填写地址、API Key 和模型名称即可。
+# 网关需支持 Anthropic Messages 协议；默认使用 Authorization: Bearer。
 pi:
   provider:
-    id: "aiyizhan"                                    # provider id（--model 前缀）
-    base_url: "https://gateway.example.com/v1"            # 网关/中转地址
-    api_key_env: "ANTHROPIC_AUTH_TOKEN"               # 从环境变量读 key（推荐，不落盘）
-    # api_key: "sk-..."                               # 或直接写 key（不推荐，落盘明文）
-    auth_header: true                                 # true=Authorization: Bearer（本司网关协议）；false=默认 x-api-key
-    model_id: "claude-opus-4-8"                       # 模型 id，构造 `--model custom/claude-opus-4-8`
-    # reasoning: true                                 # 可选，默认 true
-    # context_window: 200000                          # 可选，默认 200000
-    # max_tokens: 32000                               # 可选，默认 32000；最大 131072
-    # 说明：删掉 provider 段不会自动清掉 models.json 里已写入的项，想还原请手动删 ~/.pi/agent/models.json 对应条目。
-  # 团队共享 skill 目录：pi 默认只认 <仓库>/.pi/skills，这里把仓库里的团队目录也挂给 pi。
-  # 不配置时默认尝试仓库下的 .agents/skills （存在才挂载，--skill 可重复传）。
-  # 想追加/覆盖可显式列出（相对仓库根或绝对路径）：
-  # skill_dirs: [".agents/skills"]
-  # 注意：目录里放 <skill-name>/SKILL.md（frontmatter 需 name + description，文件须无 BOM）。
+    base_url: "https://gateway.example.com"
+    api_key: ""                  # 填写网关 API Key；省略时读取 PI_API_KEY 环境变量
+    model_id: "your-model"       # 填写网关支持的模型名称
+    # context_window: 200000     # 可选，按实际模型能力配置
+    # max_tokens: 32000          # 可选，最大 131072
+  # skill_dirs: [".agents/skills"]  # 默认自动加载仓库中的共享 skill 目录
 
 # MCP 注册表：所有 enabled server 会在每个 Agent 启动时自动加载；增加 MCP 只需追加配置。
 # 本地服务使用 command / args / cwd / env，远程 Streamable HTTP 服务使用 url 及可选鉴权字段。
 # 字符串支持 {repo}/${repo}（当前 Bug 仓库根）和 {agent}/${agent}（本工具安装目录）。
-# enabled_tools / disabled_tools 与 Codex MCP 配置一致；read_only_tools 是本项目的调查/评审白名单。
+# enabled_tools / disabled_tools 控制可用工具范围；read_only_tools 是本项目的调查/评审白名单。
 # automates_manual_keywords 同时声明资源门禁关键词；server 禁用时仍转人工，启用时才允许自动处理。
 mcp_servers:
   # 复用已登录 Chrome 读取 CrashSight / Sentry 等诊断页。
@@ -72,7 +30,6 @@ mcp_servers:
   chrome_devtools:
     enabled: false
     required: false
-    approval_mode: approve     # 工具已有 allowlist；自动任务无需与 approval_policy: never 冲突
     command: node
     # 短生命周期 stdio 代理复用官方常驻 daemon，避免每个 Bug/阶段都建立新的 Chrome 调试连接。
     args: ['{agent}\\dist\\chromeDaemonProxy.js']
@@ -97,7 +54,6 @@ mcp_servers:
   unreal_mcp:
     enabled: false
     required: false               # true 时启动失败会中止 Agent；false 时跳过该服务
-    approval_mode: approve
     command: "python"
     args: ['{repo}\Plugins\UnrealMCP\Python\unreal_mcp_server_advanced.py']
     cwd: '{repo}\Plugins\UnrealMCP\Python'
@@ -142,7 +98,6 @@ mcp_servers:
 
   prefab_mcp2:
     enabled: false
-    approval_mode: approve
     command: "python"
     args: [-m, prefab_mcp2.server]
     cwd: '{repo}\Plugins\UnrealMCP\Python\prefab_mcp2'
@@ -184,7 +139,6 @@ quality:
 
 review:
   enabled: true                     # 独立只读 Reviewer；high/medium finding 必须修正
-  backend: ""                       # 空值沿用 agent.backend；可设 pi/codex 做交叉评审
   max_fix_rounds: 1                 # Reviewer 拒绝后最多定向修正一轮
   model: ""                         # 可指定不同评审模型；空值沿用修复模型
 
@@ -217,8 +171,8 @@ workspaces:
         verify_cmds:                  # 按顺序执行；任一失败即停止
           - "npm run typecheck"
           - "npm test -- --runInBand"
-        # 可选：同一个 Bug 允许同时修改多个附加 Git 仓库。Codex 会把这些路径作为
-        # additionalDirectories（CLI 对应可重复的 --add-dir）开放；无需配置 skill 目录。
+        # 可选：同一个 Bug 允许同时修改多个附加 Git 仓库。Pi 通过提示词中的
+        # 根别名和绝对路径访问这些目录；无需配置 skill 目录。
         additional_dirs:
           - name: "engine"            # 稳定根别名；Agent 输出形如 engine:Engine/Source/Foo.cpp
             path: "C:\\repos\\engine" # 必须是 Git 仓库根目录，且开始处理前工作树必须干净
