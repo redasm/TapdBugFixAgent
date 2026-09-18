@@ -33,15 +33,6 @@ export function feedbackMemories(store: StateStore): FeedbackMemory[] {
       outcome: f.outcome, lesson: f.reason, source: `candidate:${f.candidate_id}@${candidate?.diff_hash}`,
       status: "human_feedback_requires_code_check", created_at: f.created_at };
   });
-  const auditedBugs = new Set(result.map(r => r.bug_id));
-  // Legacy feedback has no reliable candidate association. Never relabel it as verified knowledge.
-  for (const f of store.listHistoricalFeedback()) {
-    if (auditedBugs.has(String(f.bug_id))) continue;
-    result.push({ id: `legacy-feedback:${f.id}`, bug_id: String(f.bug_id), group: String(f.bug_id),
-      title: String(store.getJob(String(f.bug_id))?.title || store.audit.legacySnapshot(String(f.bug_id))?.title || ""), outcome: String(f.outcome),
-      lesson: String(f.reason || ""), source: `legacy-feedback:${f.id}（候选版本未绑定）`,
-      status: "human_feedback_requires_code_check", created_at: String(f.created_at) });
-  }
   return result.filter(r => r.lesson && !/^(原样通过|原样提交|原样接受)$/.test(r.lesson));
 }
 

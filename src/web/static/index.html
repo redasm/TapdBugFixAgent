@@ -172,8 +172,6 @@
     <span class="stat">机器验证通过 <b id="stVerified">0</b></span>
     <span class="stat">资源待人工 <b id="stManual">0</b></span>
     <span class="stat">失败 <b id="stFailed">0</b></span>
-    <span class="stat" title="旧统计口径：按 Bug 汇总人工反馈"><span>历史原样接受率</span> <b id="stAcceptance">-</b></span>
-    <span class="stat" title="旧统计口径：原样或修改后接受 / 已评审 Bug"><span>历史接受率</span> <b id="stPrecision">-</b></span>
     <span class="stat" title="按完整候选版本统计"><span>候选精确率</span> <b id="stCandidatePrecision">-</b></span>
     <span class="stat"><span>候选原样接受率</span> <b id="stCandidateUnchanged">-</b></span>
     <span class="stat"><span>候选反馈覆盖率</span> <b id="stFeedbackCoverage">-</b></span>
@@ -426,9 +424,6 @@ function renderStatus() {
   $('stFailed').textContent = counts.failed||0;
   const quality = st.quality || {};
   const asPercent = value => value != null && Number.isFinite(Number(value)) ? (Number(value) * 100).toFixed(1) + '%' : '-';
-  const historical = quality.historical || {};
-  $('stAcceptance').textContent = historical.reviewed ? asPercent(historical.unchanged_acceptance_rate) : '-';
-  $('stPrecision').textContent = historical.reviewed ? asPercent(historical.candidate_precision) : '-';
   const candidateMetrics = quality.candidates || {};
   $('stCandidatePrecision').textContent = asPercent(candidateMetrics.candidate_precision);
   $('stCandidateUnchanged').textContent = asPercent(candidateMetrics.unchanged_acceptance_rate);

@@ -961,7 +961,7 @@ export class Worker {
         agent_timeout_s: this.config.agent_timeout_s, max_attempts: this.config.max_attempts,
         runtime: process.version, agent_code_hashes: runtimeEvidence(),
       },
-    }, this.store.getJob(bug.id));
+    });
     this.store.upsertJob(bug, {
       agent_state: "in_progress", started_at: nowStr(), investigation: null, verification: null,
       review_findings: null, generated_description: null, failure_reason: null,

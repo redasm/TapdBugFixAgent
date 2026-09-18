@@ -99,9 +99,6 @@ export class AttemptAudit {
         );
         CREATE INDEX IF NOT EXISTS idx_candidate_attempt ON repair_candidates(attempt_id);
         CREATE INDEX IF NOT EXISTS idx_candidate_feedback ON candidate_feedback(candidate_id,feedback_id);
-        CREATE TABLE IF NOT EXISTS legacy_job_snapshots(
-          bug_id TEXT PRIMARY KEY, archived_at TEXT NOT NULL, snapshot_json TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS cohort_inputs(
           cohort TEXT NOT NULL, workspace_id TEXT NOT NULL, bug_id TEXT NOT NULL,
           enrolled_at TEXT NOT NULL, input_hash TEXT NOT NULL, input_json TEXT NOT NULL,
@@ -112,7 +109,7 @@ export class AttemptAudit {
     })();
   }
 
-  begin(input: AttemptInput, previousJob?: Record<string, unknown>): string {
+  begin(input: AttemptInput): string {
     const id = randomUUID();
     const at = new Date().toISOString();
     this.db.transaction(() => {
@@ -120,8 +117,6 @@ export class AttemptAudit {
       for (const prior of this.attempts(input.bug_id).filter(a => !a.events.some(e => e.kind === "finished"))) {
         this.event(prior.attempt_id, "finished", { state: "interrupted", failure: "新尝试开始时发现前次缺少结束记录；结果未知" });
       }
-      if (previousJob) this.db.prepare("INSERT OR IGNORE INTO legacy_job_snapshots VALUES (?,?,?)")
-        .run(input.bug_id, at, dumps(previousJob));
       this.db.prepare("INSERT INTO repair_attempts VALUES (?,?,?,?,?,?,?,?)").run(
         id, input.bug_id, input.workspace_id, input.cohort || "production-v1", at,
         evidenceHash(input.input), dumps(input.input), dumps(input.metadata),
@@ -133,11 +128,6 @@ export class AttemptAudit {
   enroll(input: AttemptInput): void {
     this.db.prepare("INSERT OR IGNORE INTO cohort_inputs VALUES (?,?,?,?,?,?)").run(
       input.cohort || "production-v1", input.workspace_id, input.bug_id, new Date().toISOString(), evidenceHash(input.input), dumps(input.input));
-  }
-
-  legacySnapshot(bugId: string): Record<string, unknown> | undefined {
-    const row = this.db.prepare("SELECT snapshot_json FROM legacy_job_snapshots WHERE bug_id=?").get(bugId) as { snapshot_json: string } | undefined;
-    return row ? parse(row.snapshot_json) : undefined;
   }
 
   event(attemptId: string, kind: string, payload: Record<string, unknown>): void {

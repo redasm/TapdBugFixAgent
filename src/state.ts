@@ -3,9 +3,13 @@
  * 注意：bug_id 是 >2^53 的 TAPD 大整数，JS Number 无法精确表示。
  * 全程以 string 传递；打开 DB 时 safeIntegers:true 让超界 INTEGER 以 BigInt
  * 返回，再 String() 化。
+ *
+ * 只维护当前架构：DB 头部 user_version 是「当前 schema」的唯一标记；旧库既不迁移
+ * 也不混写，读出旧标记后直接拒绝并要求使用新库文件（见 SCHEMA_VERSION）。
  */
 
 import Database from "better-sqlite3";
+import fs from "node:fs";
 import path from "node:path";
 import type { Bug } from "./models.js";
 import { dumps } from "./models.js";
@@ -49,19 +53,21 @@ CREATE TABLE IF NOT EXISTS events (
     bug_id INTEGER,
     msg TEXT
 );
-CREATE TABLE IF NOT EXISTS job_feedback (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bug_id INTEGER NOT NULL,
-    outcome TEXT NOT NULL,
-    reason TEXT,
-    human_changed_lines INTEGER DEFAULT 0,
-    submitted_changelist INTEGER,
-    created_at TEXT
-);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(agent_state);
 CREATE INDEX IF NOT EXISTS idx_events_bug ON events(bug_id);
-CREATE INDEX IF NOT EXISTS idx_feedback_bug ON job_feedback(bug_id);
 `;
+
+/** 当前状态库 schema 版本，写入 DB 头部 user_version；非本版本一律拒绝。 */
+export const SCHEMA_VERSION = 3;
+/** 默认状态库文件：新架构从新文件开始采集，旧库保持原样不再读写。 */
+export const DEFAULT_DB_PATH = "tapd_agent_v3.db";
+/** 只存在于旧架构的表：出现即判定为旧库，即使 user_version 被改过也拒绝。 */
+const _LEGACY_TABLES = new Set(["job_feedback", "legacy_job_snapshots"]);
+/** 当前架构必需的任务列：缺失即拒绝，不做自动迁移。 */
+const _REQUIRED_JOB_COLUMNS = [
+  "model", "retry_evidence", "last_attempt_files", "admission_score",
+  "investigation", "verification", "review_findings",
+];
 
 export type FeedbackOutcome =
   | "accepted_unchanged"
@@ -84,20 +90,7 @@ export interface JobFeedbackInput {
   final_patch_ref?: string;
 }
 
-export interface HistoricalQualityMetrics {
-  reviewed: number;
-  accepted_unchanged: number;
-  accepted_modified: number;
-  rejected: number;
-  reopened: number;
-  candidate_precision: number;
-  unchanged_acceptance_rate: number;
-  human_modification_rate: number;
-  reopen_rate: number;
-}
-
 export interface QualityMetrics {
-  historical: HistoricalQualityMetrics;
   candidates: ReturnType<AttemptAudit["metrics"]>;
 }
 
@@ -138,27 +131,63 @@ export class StateStore {
   private db: Database.Database;
   readonly audit: AttemptAudit;
 
-  constructor(dbPath = "tapd_agent_v2.db") {
+  constructor(dbPath = DEFAULT_DB_PATH) {
     const resolved = dbPath === ":memory:" ? dbPath : path.resolve(dbPath);
+    // 拒绝旧库/坏库必须发生在任何写操作（WAL 切换、建表、版本标记）之前，否则会改写旧库文件。
+    this.assertCurrentSchema(resolved);
     this.db = new Database(resolved);
     // 所有整数结果以 BigInt 返回，避免大整数 bug_id / changelist 丢精度（构造选项 safeIntegers 类型缺失，用等价方法）
     this.db.defaultSafeIntegers(true);
-    const cols = this.db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
-    const requiredColumns = [
-      "model", "retry_evidence", "last_attempt_files", "admission_score",
-      "investigation", "verification", "review_findings",
-    ];
-    const missing = cols.length ? requiredColumns.filter((name) => !cols.some((column) => column.name === name)) : [];
-    if (missing.length) {
-      this.db.close();
-      throw new Error(`数据库 schema 不匹配，缺少列: ${missing.join(", ")}；开发阶段不自动迁移，请备份历史数据并使用新数据库`);
-    }
+    // journal_mode 不能放在事务内；上面的检查已完成，此后才是本进程对库文件的写入。
     this.db.pragma("journal_mode = WAL");
-    this.db.exec(_SCHEMA);
-    this.audit = new AttemptAudit(this.db);
+    // 建表与版本标记同一事务：避免初始化中断后留下"有表但没版本标记"的半成品库。
+    this.audit = this.db.transaction(() => {
+      this.db.exec(_SCHEMA);
+      const audit = new AttemptAudit(this.db);
+      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      return audit;
+    })();
     this.db
       .prepare("INSERT OR IGNORE INTO control(id, state, updated_at) VALUES (1, 'stopped', ?)")
       .run(nowStr());
+  }
+
+  /** 只读探测：旧架构表、版本不符或列不齐都在这里拒绝。
+   *  探测连接是 readonly，不切换 journal_mode、不建表、不写版本标记，也不把库升级成 WAL。 */
+  private assertCurrentSchema(resolved: string): void {
+    if (resolved === ":memory:" || !fs.existsSync(resolved)) return;
+    const probe = new Database(resolved, { readonly: true });
+    try {
+      const tables = (probe.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+      ).all() as { name: string }[]).map((row) => row.name);
+      const version = Number(probe.pragma("user_version", { simple: true }));
+      const legacy = tables.filter((name) => _LEGACY_TABLES.has(name));
+      if (legacy.length) {
+        throw new Error(
+          `检测到旧版状态库（${resolved}，含旧架构表 ${legacy.join(", ")}）；旧库保持原样不再使用，`
+          + `开发阶段不自动迁移，请改用新库文件（默认 ${DEFAULT_DB_PATH}）`,
+        );
+      }
+      if (tables.length && version !== SCHEMA_VERSION) {
+        throw new Error(
+          `状态库 schema 版本不匹配（${resolved}，期望 ${SCHEMA_VERSION}，实际 ${version}）；旧库保持原样不再使用，`
+          + `开发阶段不自动迁移，请改用新库文件（默认 ${DEFAULT_DB_PATH}）`,
+        );
+      }
+      if (tables.includes("jobs")) {
+        const cols = (probe.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]).map((column) => column.name);
+        const missing = _REQUIRED_JOB_COLUMNS.filter((name) => !cols.includes(name));
+        if (missing.length) {
+          throw new Error(
+            `状态库 schema 不匹配（${resolved}），缺少列: ${missing.join(", ")}；开发阶段不自动迁移，`
+            + `旧库保持原样，请改用新库文件（默认 ${DEFAULT_DB_PATH}）`,
+          );
+        }
+      }
+    } finally {
+      probe.close();
+    }
   }
 
   close(): void {
@@ -309,58 +338,14 @@ export class StateStore {
     this.addEvent(`人工反馈: ${input.outcome}${input.reason ? `（${input.reason}）` : ""}`, "info", bugId);
   }
 
-  /** Read-only historical labels; all new feedback belongs to a concrete candidate. */
-  listHistoricalFeedback(bugId?: string): Record<string, unknown>[] {
-    const rows = bugId
-      ? this.db.prepare("SELECT * FROM job_feedback WHERE bug_id=? ORDER BY id").all(bugId)
-      : this.db.prepare("SELECT * FROM job_feedback ORDER BY id").all();
-    return (rows as Record<string, unknown>[]).map((row) => ({
-      ...row,
-      id: Number(row.id),
-      bug_id: idToString(row.bug_id),
-      human_changed_lines: row.human_changed_lines == null ? null : Number(row.human_changed_lines),
-      submitted_changelist: numOrNull(row.submitted_changelist),
-    }));
-  }
-
+  /** 现役口径：全部指标按具体候选版本统计（见 AttemptAudit.metrics）。 */
   qualityMetrics(): QualityMetrics {
-    const latestDecision = new Map<string, FeedbackOutcome>();
-    const reopened = new Set<string>();
-    for (const row of this.listHistoricalFeedback()) {
-      const id = String(row.bug_id);
-      const outcome = String(row.outcome) as FeedbackOutcome;
-      if (outcome === "reopened") reopened.add(id);
-      else latestDecision.set(id, outcome);
-    }
-    let acceptedUnchanged = 0;
-    let acceptedModified = 0;
-    let rejected = 0;
-    for (const outcome of latestDecision.values()) {
-      if (outcome === "accepted_unchanged") acceptedUnchanged += 1;
-      else if (outcome === "accepted_modified") acceptedModified += 1;
-      else rejected += 1;
-    }
-    const reviewed = acceptedUnchanged + acceptedModified + rejected;
-    const accepted = acceptedUnchanged + acceptedModified;
-    return {
-      historical: {
-        reviewed,
-        accepted_unchanged: acceptedUnchanged,
-        accepted_modified: acceptedModified,
-        rejected,
-        reopened: reopened.size,
-        candidate_precision: reviewed ? accepted / reviewed : 0,
-        unchanged_acceptance_rate: reviewed ? acceptedUnchanged / reviewed : 0,
-        human_modification_rate: accepted ? acceptedModified / accepted : 0,
-        reopen_rate: accepted ? reopened.size / accepted : 0,
-      },
-      candidates: this.audit.metrics(),
-    };
+    return { candidates: this.audit.metrics() };
   }
 
   /** 清空全部 job 记录与事件（web「清除并重新同步」用）。
    *  控制态（control 表）保留；changelist 等历史一并删除——p4 上已生成的
-   *  pending changelist 不受影响（那是 p4 服务器侧的对象）。人工反馈是长期质量标签，保留。 */
+   *  pending changelist 不受影响（那是 p4 服务器侧的对象）。候选与人工反馈是长期质量标签，保留。 */
   deleteAllJobs(): number {
     const n = this.jobCount();
     const tx = this.db.transaction(() => {

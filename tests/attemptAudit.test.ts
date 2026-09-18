@@ -54,7 +54,6 @@ describe("candidate provenance", () => {
     expect(() => store.recordFeedback(bug.id, { candidate_id: "", outcome: "accepted_unchanged", reason: "", human_changed_lines: null, submitted_changelist: null })).toThrow("具体候选");
     expect(() => feedback("wrong-candidate")).toThrow("不属于");
     expect(() => feedback(cid, "reopened")).toThrow("已经接受");
-    expect(store.listHistoricalFeedback()).toHaveLength(0);
     expect(store.audit.feedback()).toHaveLength(0);
     store.close();
   });

@@ -21,7 +21,7 @@ import {
   validateConfig,
 } from "../src/config.js";
 import type { Config, RepoConfig } from "../src/config.js";
-import { StateStore } from "../src/state.js";
+import { SCHEMA_VERSION, StateStore } from "../src/state.js";
 import { ensureP4IgnoreFile, GENERATED_P4IGNORE, isP4ConnectionFailure, P4CancelledError, P4Client, P4ConnectionError, P4Error, P4SyncTimeoutError, p4EnvFromConfig, p4PathIgnored, setSpecField } from "../src/p4.js";
 import type { OpenedFile } from "../src/p4.js";
 import { VerificationError, checkAndPrepareP4, p4ReconcileTargets } from "../src/verify.js";
@@ -901,9 +901,10 @@ describe("state", () => {
     }
   });
 
-  it("旧数据库 schema 拒绝启动且不修改原表", () => {
+  it("旧数据库（无版本标记）拒绝启动，且不改动原表、版本标记与业务数据", () => {
     const d = tmpdir();
     const p = path.join(d, "old.db");
+    const bugId = "1152729922001247900";
     const conn = new Database(p);
     conn.exec(`CREATE TABLE control (
                  id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT NOT NULL, updated_at TEXT);
@@ -914,14 +915,113 @@ describe("state", () => {
                  agent TEXT, attempts INTEGER DEFAULT 0, started_at TEXT, finished_at TEXT);
                CREATE TABLE events (
                  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, bug_id INTEGER, msg TEXT);
+               CREATE TABLE job_feedback (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, bug_id INTEGER NOT NULL, outcome TEXT NOT NULL,
+                 reason TEXT, human_changed_lines INTEGER DEFAULT 0, submitted_changelist INTEGER, created_at TEXT);
                CREATE INDEX idx_jobs_state ON jobs(agent_state);
-               CREATE INDEX idx_events_bug ON events(bug_id);`);
+               CREATE INDEX idx_events_bug ON events(bug_id);
+               CREATE INDEX idx_feedback_bug ON job_feedback(bug_id);`);
+    conn.prepare("INSERT INTO control(id, state, updated_at) VALUES (1,'running','2026-09-18 12:00:00')").run();
+    conn.prepare(`INSERT INTO jobs(bug_id, workspace_id, title, agent_state, changelist)
+                  VALUES (?,?,?,?,?)`).run(bugId, "111", "跨地图传送", "accepted", 4242);
+    conn.prepare(`INSERT INTO job_feedback(bug_id,outcome,reason,human_changed_lines,submitted_changelist,created_at)
+                  VALUES (?,?,?,?,?,?)`).run(bugId, "accepted_unchanged", "原样通过", 0, 4242, "2026-09-17 10:00:00");
+    // 拒绝前后的比较基准：表/索引定义、版本标记、journal_mode 与业务样本
+    const snapshot = (db: Database.Database) => ({
+      schema: db.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all(),
+      userVersion: Number(db.pragma("user_version", { simple: true })),
+      // readonly 连接下 journal_mode 读出来仍是旧库原本的模式
+      journalMode: String(db.pragma("journal_mode", { simple: true })),
+      control: db.prepare("SELECT state, updated_at FROM control").all(),
+      jobs: db.prepare("SELECT bug_id, title, agent_state, changelist FROM jobs").all(),
+      feedback: db.prepare("SELECT bug_id, outcome, reason FROM job_feedback").all(),
+    });
+    const before = snapshot(conn);
+    expect(before.userVersion).toBe(0);
+    expect(before.journalMode).not.toBe("wal");
     conn.close();
-    expect(() => new StateStore(p)).toThrow("开发阶段不自动迁移");
+
+    expect(() => new StateStore(p)).toThrow(/旧版状态库|版本不匹配/);
+
     const unchanged = new Database(p, { readonly: true });
-    expect((unchanged.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).some(c => c.name === "model")).toBe(false);
+    expect(snapshot(unchanged)).toEqual(before); // 原数据、表结构、版本标记与 journal_mode 全部保持原样
     expect(unchanged.prepare("SELECT name FROM sqlite_master WHERE name='repair_attempts'").get()).toBeUndefined();
     unchanged.close();
+  });
+
+  it.each([0, 2, 4])("版本标记为 %i 的非空库被拒绝，且不写库、不改动样本数据", (version) => {
+    const d = tmpdir();
+    const p = path.join(d, `v${version}.db`);
+    const conn = new Database(p);
+    conn.exec("CREATE TABLE sentinel(value TEXT);");
+    conn.prepare("INSERT INTO sentinel(value) VALUES ('keep-me')").run();
+    conn.pragma(`user_version = ${version}`);
+    const snapshot = (db: Database.Database) => ({
+      schema: db.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all(),
+      userVersion: Number(db.pragma("user_version", { simple: true })),
+      sentinel: db.prepare("SELECT value FROM sentinel").all(),
+    });
+    const before = snapshot(conn);
+    conn.close();
+
+    expect(() => new StateStore(p)).toThrow(`期望 ${SCHEMA_VERSION}，实际 ${version}`);
+
+    const after = new Database(p, { readonly: true });
+    expect(snapshot(after)).toEqual(before);
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE name='repair_attempts'").get()).toBeUndefined();
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE name='jobs'").get()).toBeUndefined();
+    after.close();
+  });
+
+  it("版本标记正确但缺少必需列时按缺少列拒绝，且不写入审计表", () => {
+    const d = tmpdir();
+    const p = path.join(d, "partial.db");
+    const conn = new Database(p);
+    conn.exec("CREATE TABLE jobs(bug_id INTEGER PRIMARY KEY, title TEXT);");
+    conn.prepare("INSERT INTO jobs(bug_id, title) VALUES (7, '旧列样本')").run();
+    conn.pragma(`user_version = ${SCHEMA_VERSION}`);
+    const before = {
+      schema: conn.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all(),
+      rows: conn.prepare("SELECT bug_id, title FROM jobs").all(),
+    };
+    conn.close();
+
+    expect(() => new StateStore(p)).toThrow(/缺少列: .*model/);
+
+    const after = new Database(p, { readonly: true });
+    expect(Number(after.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
+    expect(after.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all()).toEqual(before.schema);
+    expect(after.prepare("SELECT bug_id, title FROM jobs").all()).toEqual(before.rows);
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE name='repair_attempts'").get()).toBeUndefined();
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE name='control'").get()).toBeUndefined();
+    after.close();
+  });
+
+  it("新库使用当前 schema 版本、不含旧架构表，并可安全重开", () => {
+    const d = tmpdir();
+    const p = path.join(d, "state.db");
+    const first = new StateStore(p);
+    const bug = makeBug();
+    first.upsertJob(bug, { agent_state: "pending" });
+    const tables = (): string[] => ((first as unknown as { db: Database.Database }).db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(t => t.name);
+    expect(tables()).not.toContain("job_feedback");
+    expect(tables()).not.toContain("legacy_job_snapshots");
+    expect(tables()).toContain("repair_attempts");
+    const version = (db: Database.Database) => Number(db.pragma("user_version", { simple: true }));
+    expect(version((first as unknown as { db: Database.Database }).db)).toBe(SCHEMA_VERSION);
+    first.close();
+
+    // 重开当前库：版本检查不能误拒自己写的库，业务行仍在
+    const second = new StateStore(p);
+    try {
+      expect(version((second as unknown as { db: Database.Database }).db)).toBe(SCHEMA_VERSION);
+      expect(second.jobCount()).toBe(1);
+      expect(second.getJob(bug.id)?.agent_state).toBe("pending");
+      expect(second.qualityMetrics().candidates).toMatchObject({ inputs: 0, attempts: 0, reviewed: 0 });
+    } finally {
+      second.close();
+    }
   });
 
   it("记录人工接受、修改、拒绝和 reopen，并计算真实准确率指标", () => {
@@ -972,8 +1072,6 @@ describe("state", () => {
     expect(store.getJob(modified.id)?.agent_state).toBe("accepted_modified");
     expect(store.getJob(rejected.id)?.agent_state).toBe("rejected");
     const metrics = store.qualityMetrics().candidates;
-    expect(store.listHistoricalFeedback()).toEqual([]);
-    expect(store.qualityMetrics().historical.reviewed).toBe(0);
     expect(metrics.reviewed).toBe(3);
     expect(metrics.accepted_unchanged).toBe(1);
     expect(metrics.accepted_modified).toBe(1);
@@ -4311,7 +4409,12 @@ describe("web 前端 bug_id 内插引号", () => {
     expect(html).toContain("review_pending");
     expect(html).toContain("candidate_partial");
     expect(html).toContain("blocked_workspace");
-    expect(html).toContain("stAcceptance");
+    expect(html).toContain("stCandidatePrecision");
+    // 旧人工接受口径（历史原样接受率/历史接受率）已随旧架构移除
+    expect(html).not.toContain("stAcceptance");
+    expect(html).not.toContain("stPrecision");
+    expect(html).not.toContain("历史原样接受率");
+    expect(html).not.toContain("历史接受率");
     expect(html).toContain("/api/bugs/${id}/feedback");
     expect(html).toContain("accepted_unchanged");
     expect(html).toContain("rejected_wrong_root_cause");

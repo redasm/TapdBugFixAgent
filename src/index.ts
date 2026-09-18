@@ -11,7 +11,7 @@
 import { loadConfig, priorityRank, validateConfig, webToken } from "./config.js";
 import { effectivePiModel } from "./agent.js";
 import { enabledMcpServerNames } from "./mcpServers.js";
-import { StateStore } from "./state.js";
+import { DEFAULT_DB_PATH, StateStore } from "./state.js";
 import { Worker } from "./worker.js";
 import { createTapdClient } from "./tapd.js";
 import { TapdMcpClient } from "./tapdMcp.js";
@@ -33,7 +33,7 @@ function parseArgs(argv: string[]): CliArgs {
   const args: CliArgs = {
     cmd: "",
     config: "config.yaml",
-    db: "tapd_agent_v2.db",
+    db: DEFAULT_DB_PATH,
     once: false,
     results: [],
   };
@@ -237,7 +237,7 @@ function printHelp(): void {
   eval             校验冻结数据集或比较独立配对试验（JSON数据集+JSONL结果）
 选项:
   --config <path>  配置文件路径（默认 config.yaml）
-  --db <path>      状态库路径（默认 tapd_agent_v2.db）
+  --db <path>      状态库路径（默认 tapd_agent_v3.db；旧版库文件不再兼容，保持原样）
   --host <ip>      监听地址（serve，默认取配置）
   --port <n>       端口（serve，默认取配置）
   --dataset <path> eval 的冻结 JSON 数据集
