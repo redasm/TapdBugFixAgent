@@ -1,6 +1,8 @@
 // Project regression expectations from case-08. Uses current source, not copied implementation.
+export const files = ['TypeScript/Src/Game/Module/LevelMap/Controller/LevelMapController.ts'];
+
 export default async ({ test, assert, loadMembers }) => {
-  const file = 'TypeScript/Src/Game/Module/LevelMap/Controller/LevelMapController.ts';
+  const [file] = files;
   const subject = tiles => loadMembers(file, 'LevelMapController', ['CheckLevelCanOpen'], {
     ConfigManager: { MapConfig: { GetAllTileConfig: () => tiles } },
   });

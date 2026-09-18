@@ -330,6 +330,8 @@ worker 轮询时自动转跳过并写明原因。
 
 行为测试配置、14例开发基线和严格配对评测用法见 [实施说明](docs/accuracy-implementation.md)，调研依据见 [设计方案](docs/accuracy-improvement-2026-09-18.md)。构建并重启服务后新流程生效；按仓库配置 `behavior_checks` 才会执行对应专项。
 
+行为测试按目录自动发现，适用源码由脚本的 `export const files` 声明。新增/删除 `.mjs` 从下一次修复生效；无需在配置中逐项维护文件。停用、改名和脚本模板见 [行为测试维护指南](behavior-suites/README.md)。
+
 ## 风险提示
 
 自动修真实 Bug 有风险（语义误判、误改）。保持 `review` 模式：代码停在 pending changelist，

@@ -171,20 +171,14 @@ workspaces:
         verify_cmds:                  # 按顺序执行；任一失败即停止
           - "npm run typecheck"
           - "npm test -- --runInBand"
-        # 可选：suite 相对本 config 文件；files 相对上述 repo.path，精确匹配 planned_files。
-        # 测试执行实际 TS 成员；依赖替身不等于 UE 集成。修改前冻结断言，修复后重跑。
-        # 下例适用于 my-project 客户端目录布局；其它项目需编写对应 suite。
-        # behavior_checks:
-        #   - name: map-tiles
-        #     suite: behavior-suites/map-tiles.mjs
-        #     files: [you-faile-path]
-        #     timeout_sec: 30
-        #   - name: recruit-timing
-        #     suite: behavior-suites/recruit-timing.mjs
-        #     files: [you-faile-path]
-        #   - name: mark-lifecycle
-        #     suite: behavior-suites/mark-lifecycle.mjs
-        #     files: [you-faile-path]
+        # 每次修复前递归发现目录内 .mjs；脚本 export const files 声明适用源码。
+        # directory 相对本 config 文件；测试名为目录内相对路径（不含 .mjs）。
+        # 内置脚本针对 project；其它项目请换为自己的测试目录后启用。
+        behavior_checks:
+          enabled: false
+          directory: behavior-suites
+          disabled: []                 # 临时停用示例：[map-tiles]；子目录示例：[map/tiles]
+          timeout_sec: 30
         # 可选：同一个 Bug 允许同时修改多个附加 Git 仓库。Pi 通过提示词中的
         # 根别名和绝对路径访问这些目录；无需配置 skill 目录。
         additional_dirs:

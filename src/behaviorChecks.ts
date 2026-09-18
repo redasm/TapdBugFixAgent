@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import { spawn, execFile } from "node:child_process";
 import { evidenceHash } from "./attemptAudit.js";
 import { sourceEvidence } from "./sourceEvidence.js";
+import { discoverBehaviorSuites, type BehaviorChecksConfig } from "./behaviorDiscovery.js";
 
-export interface BehaviorCheckConfig { name: string; suite: string; files: string[]; timeout_sec?: number }
 export interface BehaviorCaseResult { id: string; kind: "reproduction" | "regression"; status: "pass" | "fail" | "error"; detail: string }
 export interface FrozenBehaviorCheck {
   name: string; source: string; suite_hash: string; timeout_sec: number; before: BehaviorCaseResult[];
@@ -66,13 +66,18 @@ export async function runBehaviorSource(source: string, root: string, timeoutSec
   }
 }
 
-export async function prepareBehaviorChecks(configs: BehaviorCheckConfig[], root: string, plannedFiles: string[], cancel?: { readonly cancelled: boolean }): Promise<FrozenBehaviorCheck[]> {
-  const selected = configs.filter(c => plannedFiles.some(f => c.files.some(s => f.replace(/\\/g, "/").replace(/^project:/, "") === s.replace(/\\/g, "/").replace(/^project:/, ""))));
+export async function prepareBehaviorChecks(config: BehaviorChecksConfig | undefined, root: string, plannedFiles: string[], cancel?: { readonly cancelled: boolean }): Promise<FrozenBehaviorCheck[]> {
+  if (cancel?.cancelled) throw new AgentCancelledError("行为测试已取消");
+  const normalize = (file: string) => {
+    const normalized = file.replace(/\\/g, "/").replace(/^project:/i, "").replace(/^\.\//, "");
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  const planned = new Set(plannedFiles.map(normalize));
+  const selected = discoverBehaviorSuites(config).filter(c => c.files.some(file => planned.has(normalize(file))));
   const frozen: FrozenBehaviorCheck[] = [];
   for (const c of selected) {
-    const source = fs.readFileSync(c.suite, "utf8");
-    if (Buffer.byteLength(source)>100000) throw new Error("行为测试脚本超过100KB，须拆分为定向测试");
-    frozen.push({ name: c.name, source, suite_hash: evidenceHash(source), timeout_sec: c.timeout_sec ?? 30,
+    const source = c.source;
+    frozen.push({ name: c.name, source, suite_hash: evidenceHash(source), timeout_sec: c.timeout_sec,
       files: c.files, before_sources: sourceEvidence(c.files, [{ alias: "project", path: root }]),
       before: await runBehaviorSource(source, root, c.timeout_sec, cancel) });
   }

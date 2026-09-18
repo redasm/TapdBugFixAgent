@@ -11,12 +11,13 @@ describe("frozen behavior verification", () => {
     const source = path.join(root, "Map.ts");
     try {
       fs.writeFileSync(source, "export class Map { canTravel(playerId: number, targetId: number) { return true; } }");
-      fs.writeFileSync(suite, `export default async ({ test, assert, loadMembers }) => {
-        const actual = loadMembers('Map.ts','Map',['canTravel'],{});
+      fs.writeFileSync(suite, `export const files = ['Map.ts'];
+      export default async ({ test, assert, loadMembers }) => {
+        const actual = loadMembers(files[0],'Map',['canTravel'],{});
         await test('cross-map', 'reproduction', () => assert.equal(actual.canTravel(1,2),false));
         await test('same-map', 'regression', () => assert.equal(actual.canTravel(1,1),true));
       };`);
-      const frozen = await prepareBehaviorChecks([{ name: "map", suite, files: ["Map.ts"] }], root, ["project:Map.ts"]);
+      const frozen = await prepareBehaviorChecks({ enabled: true, directory: root, disabled: [], timeout_sec: 30 }, root, ["project:Map.ts"]);
       expect(frozen[0].before.map(r => r.status)).toEqual(["fail", "pass"]);
       fs.writeFileSync(source, "export class Map { canTravel(playerId: number, targetId: number) { return playerId === targetId; } }");
       fs.writeFileSync(suite, "throw Error('candidate modified test file');");

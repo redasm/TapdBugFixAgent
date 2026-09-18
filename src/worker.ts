@@ -1397,7 +1397,7 @@ export class Worker {
           bug.id,
         );
       }
-      behaviorChecks = await prepareBehaviorChecks(repo.behavior_checks || [], repo.path, investigation.planned_files, this.cancelEvent);
+      behaviorChecks = await prepareBehaviorChecks(repo.behavior_checks, repo.path, investigation.planned_files, this.cancelEvent);
       if (this.cancelEvent.cancelled) throw new AgentCancelledError("行为测试已取消");
       this.store.audit.event(auditAttemptId, "behavior_baseline", {
         checks: behaviorChecks,

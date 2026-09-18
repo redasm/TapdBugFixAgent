@@ -1,5 +1,7 @@
+export const files = ['TypeScript/Src/Game/Module/LevelMap/SubViews/CustomMarkHandleView.ts'];
+
 export default async ({ test, assert, loadMembers }) => {
-  const file = 'TypeScript/Src/Game/Module/LevelMap/SubViews/CustomMarkHandleView.ts';
+  const [file] = files;
   for (const markExists of [false, true]) {
     await test(`restore-secondary-state-${markExists}`, markExists ? 'regression' : 'reproduction', () => {
       const emitted = [];

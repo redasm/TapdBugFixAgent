@@ -1,6 +1,8 @@
 // View/controller boundary only; does not assert network-ordering guarantees.
+export const files = ['TypeScript/Src/Game/Module/RecruitBoard/View/RecruitMinePanel.ts'];
+
 export default async ({ test, assert, loadMembers }) => {
-  const file = 'TypeScript/Src/Game/Module/RecruitBoard/View/RecruitMinePanel.ts';
+  const [file] = files;
   for (const accept of [false, true]) for (const team of [false, true]) {
     await test(`reply-${accept}-${team}`, 'reproduction', () => {
       const events = [];
