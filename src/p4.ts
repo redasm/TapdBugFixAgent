@@ -419,6 +419,31 @@ export class P4Client {
     }
   }
 
+  /** p4 diff omits opened adds/deletes; retain their real content in candidate evidence. */
+  async candidateDiff(opened: OpenedFile[]): Promise<string> {
+    const parts = [await this.diffUnified(opened.map(f => f.depot))];
+    for (const item of opened.filter(f => /^(?:add|delete|move\/add|move\/delete|branch)$/.test(f.action))) {
+      const deleting = item.action.endsWith("delete");
+      if (/binary|ubinary/.test(item.type)) {
+        parts.push(`Binary files ${deleting ? item.depot : "/dev/null"} and ${deleting ? "/dev/null" : item.depot} differ`);
+        continue;
+      }
+      let content: string;
+      if (deleting) content = await this.run(["print", "-q", `${item.depot}#have`]);
+      else {
+        const where = await this.run(["-ztag", "where", item.depot]);
+        const local = /^\.\.\. path (.+)$/m.exec(where)?.[1]?.trim();
+        if (!local) throw new P4Error(`无法取得新增文件实际路径: ${item.depot}`);
+        const base = fs.realpathSync(this.path), real = fs.realpathSync(local);
+        const rel = path.relative(base, real);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) throw new P4Error("新增文件越过工作区");
+        content = fs.readFileSync(real, "utf8");
+      }
+      parts.push(`diff --git ${item.depot} ${item.depot}\n${deleting ? "deleted" : "new"} file mode 100644\n--- ${deleting ? item.depot : "/dev/null"}\n+++ ${deleting ? "/dev/null" : item.depot}\n${content.split(/\r?\n/).map(line => (deleting ? "-" : "+") + line).join("\n")}`);
+    }
+    return parts.filter(Boolean).join("\n");
+  }
+
   /** 检测"改了文件但没 p4 edit/p4 add"的磁盘差异（-n 预览）。 */
   async reconcilePreview(files: string[] = ["./..."]): Promise<string> {
     try {

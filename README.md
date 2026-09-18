@@ -272,8 +272,9 @@ pending → in_progress
 ```
 
 失败未耗尽重试回 `pending`；Tapd 上已删除的单自动转 `skipped` 留痕。
-开发阶段不维护旧数据库迁移。新版默认使用 `tapd_agent_v2.db`；旧 `tapd_agent.db` 原样保留，
-不读取也不自动转换。若显式传入旧 schema 数据库，启动会提示改用新库。
+开发阶段只维护当前协议，不保留旧接口、旧字段兼容分支或旧数据库自动迁移。
+默认使用 `tapd_agent_v2.db`；schema 不匹配时拒绝启动，请先备份历史数据再使用新库。
+当前库已有的人工反馈作为只读历史基线保留，新反馈必须关联具体候选，且仅写入候选反馈表。
 
 **P4 安全**：Agent 只允许 `p4 edit / add / delete`（submit / revert / sync / change 写入 prompt 禁止）；
 工具侧只收集 **default changelist** 的文件生成 pending，绝不动其它编号 changelist；
@@ -294,28 +295,16 @@ name + description，文件必须无 BOM）。可用 `pi.skill_dirs` 覆盖。
 
 ## 历史 Bug 离线评测
 
-用固定 JSONL 历史集比较不同模型或 Prompt，不接触真实 P4 workspace：
+使用冻结的 JSON 数据集与 JSONL 配对试验比较模型或 Prompt；命令仅读取评测记录，不连接 P4、模型或 TAPD：
 
-```bash
-npm run dev -- eval \
-  --dataset eval/cases.jsonl \
-  --result deepseek-v4=eval/results-deepseek-v4.jsonl \
-  --result reviewer-v2=eval/results-reviewer-v2.jsonl
+```powershell
+npm run dev -- eval --dataset docs/accuracy-development-cases.json
+npm run dev -- eval --dataset evaluation/frozen.json --result A=evaluation/a.jsonl --result B=evaluation/b.jsonl
 ```
 
-数据集每行：
+不传结果文件时只校验数据集。传入结果时，校验初始版本、预算、配对次数、独立工作区身份和答案泄漏，输出 top-1 接受率、候选/反馈覆盖率、原样接受率、耗时和成本。未产出候选仍计入分母，未知成本保持 null。
 
-```json
-{"bug_id":"b1","category":"async_state","expected_files":["src/Settings.ts"],"forbidden_files":["src/Auth.ts"],"requires_verification":true}
-```
-
-结果每行：
-
-```json
-{"bug_id":"b1","changed_files":["src/Settings.ts"],"verification_ok":true,"review_approved":true,"human_outcome":"accepted_unchanged","reopened":false}
-```
-
-输出覆盖率、有效修复率、验证通过率、范围精确率、评审通过率、原样接受率和加权综合分。
+唯一数据格式为 `EvaluationDataset` / `PairedTrial`，字段与使用边界见 [实施说明](docs/accuracy-implementation.md)。历史标签缺少源码/资源版本时只能做标签分析，不能声称完成历史重放。
 
 **changelist 描述**：首行 `【b<短号>】<标题>`（= Tapd「复制Bug单信息」按钮的文本，可过 swarm 校验；
 短号由完整 id 推导），后附单号链接 / 修复说明 / 修改文件 / 需人工资源 / 验证结果。
@@ -334,6 +323,12 @@ worker 轮询时自动转跳过并写明原因。
 这些单会重新处理。已人工关闭（resolved 等）的单不会。
 
 **开发**：`npm test`（vitest）；源码在 `src/`，构建产物 `dist/`（含 `prompts/`）。
+
+## 准确率改进
+
+新流程按尝试保存补丁与人工反馈，调查必须给出业务验收条件，并检索相关历史经验。管理台分开显示历史接受率、完整候选精确率、原样接受率和覆盖率。编译通过与行为验证分别记录。
+
+行为测试配置、14例开发基线和严格配对评测用法见 [实施说明](docs/accuracy-implementation.md)，调研依据见 [设计方案](docs/accuracy-improvement-2026-09-18.md)。构建并重启服务后新流程生效；按仓库配置 `behavior_checks` 才会执行对应专项。
 
 ## 风险提示
 

@@ -16,6 +16,8 @@ import os from "node:os";
 import path from "node:path";
 import { defaultSearchPaths } from "./search.js";
 import { PiActivity } from "./piActivity.js";
+import { PiAudit } from "./piAudit.js";
+import { evidenceHash } from "./attemptAudit.js";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { Config, PiConfig } from "./config.js";
@@ -620,6 +622,7 @@ export interface AgentRunOptions {
   repoDir: string;
   timeoutS: number;
   onProgress?: (msg: string) => void;
+  onAudit?: (event: Record<string, unknown>) => void;
   cancelEvent?: CancelEvent;
   /** pi 内置工具白名单；用于调查/评审阶段强制只读。 */
   tools?: string[];
@@ -774,6 +777,8 @@ export class PiAgent {
   }
 
   async run(opts: AgentRunOptions): Promise<AgentResult> {
+    const audit = new PiAudit(), auditStarted=Date.now();
+    opts.onAudit?.({ kind: "agent_input", prompt_hash: evidenceHash(opts.prompt), model: opts.model || effectivePiModel(this.config.pi), timeout_s: opts.timeoutS, tools: opts.tools ?? null });
     // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）
     try {
       ensurePiModels(this.config.pi);
@@ -843,7 +848,7 @@ export class PiAgent {
     if (model) args.push("--model", model);
     if (opts.thinkingLevel) args.push("--thinking", opts.thinkingLevel);
     const activeTools = opts.tools?.length
-      ? [...opts.tools, ...piReadOnlyMcpTools(mcpServers)]
+      ? [...opts.tools, ...(opts.tools.includes("grep") ? ["lookup_symbol", "find_references", "find_related_implementations"] : []), ...piReadOnlyMcpTools(mcpServers)]
       : undefined;
     if (opts.tools?.length === 0) args.push("--no-tools");
     else if (activeTools?.length) args.push("--tools", [...new Set(activeTools)].join(","));
@@ -961,6 +966,7 @@ export class PiAgent {
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
         activity.observe(event);
+        audit.observe(event);
         const delta = event.assistantMessageEvent as { type?: string } | undefined;
         if (event.type === "message_update" && delta?.type === "text_delta") lastProgressAt = Date.now();
         if (event.type === "tool_execution_start") {
@@ -1089,6 +1095,7 @@ export class PiAgent {
     try {
       completed = await result;
     } finally {
+      opts.onAudit?.({ kind: "agent_usage", ...audit.result(), elapsed_seconds: (Date.now()-auditStarted)/1000 });
       // 清理 Windows 临时 prompt 文件
       if (promptTmpDir) {
         try {

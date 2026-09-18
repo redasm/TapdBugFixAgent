@@ -146,6 +146,20 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
     res.json(store.qualityMetrics());
   });
 
+  app.get("/api/quality/candidates", auth, (req, res) => {
+    const days = req.query.followup_days === undefined ? 14 : Number(req.query.followup_days);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      res.status(400).json({ detail: "随访窗口必须为 1–365 天" });
+      return;
+    }
+    res.json(store.audit.metrics({ cohort: String(req.query.cohort || "") || undefined, followup_days: days }));
+  });
+
+  app.get("/api/bugs/:id/attempts", auth, (req, res) => {
+    const id = String(req.params.id);
+    res.json({ attempts: store.audit.attempts(id), candidates: store.audit.candidates(id), feedback: store.audit.feedback(id) });
+  });
+
   app.post("/api/control", auth, (req, res) => {
     const a = String((req.body as Record<string, unknown> | undefined)?.action ?? "");
     if (!_VALID_ACTIONS.has(a)) {
@@ -225,7 +239,11 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
       store.recordFeedback(String(req.params.id), {
         outcome: String(body.outcome ?? "") as never,
         reason: String(body.reason ?? ""),
-        human_changed_lines: Number(body.human_changed_lines ?? 0),
+        human_changed_lines: body.human_changed_lines == null || body.human_changed_lines === "" ? null : Number(body.human_changed_lines),
+        candidate_id: typeof body.candidate_id === "string" ? body.candidate_id : "",
+        human_minutes: body.human_minutes == null || body.human_minutes === "" ? null : Number(body.human_minutes),
+        modification_category: String(body.modification_category || ""),
+        final_patch_ref: String(body.final_patch_ref || ""),
         submitted_changelist: body.submitted_changelist === null
           || body.submitted_changelist === undefined
           || body.submitted_changelist === ""

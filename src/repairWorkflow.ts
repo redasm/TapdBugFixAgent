@@ -8,6 +8,7 @@ import { extractFinalJson } from "./agent.js";
 import type { Bug } from "./models.js";
 import { buildBugContext, formatBugContext } from "./quality.js";
 import { compactInvestigationTrace, type InvestigationProgress } from "./investigationProgress.js";
+import { CONTRACT_EXAMPLE, parseRepairContract, formatRepairContract, type RepairContract } from "./repairContract.js";
 
 export interface ReproductionEvidence {
   command: string;
@@ -32,6 +33,7 @@ export interface InvestigationResult {
   confidence: number;
   blocked_reasons: string[];
   validation_errors: string[];
+  repair_contract: RepairContract;
 }
 
 export interface WorkspaceRootPrompt {
@@ -153,10 +155,13 @@ ${crossRepoStop}
 ${resourceGuidance}
 
 # 输出
+若提取共用接口确需补充文件，返回 scope_amendment: {files:[具体根别名:相对路径],reason:必要性与复用证据}；编排器先进行一次只读复核再改变白名单。没有补充则为 null。修改阶段不得自行扩大范围。
+必须输出 repair_contract（业务验收条件）：用户要求、关键 ID/配置/状态含义、正常对照、现有复用点；不要用不报错代替业务结果。source_refs 只允许 bug:title、bug:description、bug:expected_result、bug:reproduction_steps 或 evidence:N（从0起的 [观察]）。工单字段不得为空。open_questions 仅记录影响方向的未确认问题；无法运行游戏的限制放 reproduction.before。
+repair_contract 示例（必须替换内容）：${JSON.stringify(CONTRACT_EXAMPLE)}
 最后严格输出：
 FINAL_RESULT:
 \`\`\`json
-{"root_cause":"根因","evidence":["[观察] URL 或根别名:相对路径:符号或命令 — 可复查事实","[推断] 基于上述事实得到的结论","[排除] 候选原因 — 排除证据"],"reproduction":{"command":"复现或相关测试命令；没有则为空","before":"修复前观察到的失败或等价静态证据"},"diagnostic_pages":[{"url":"工单中的原始链接","status":"read","title":"页面标题","facts":["从页面读取的事实"],"error":""}],"planned_files":["project:相对路径","engine:相对路径"],"confidence":0.0,"blocked_reasons":[]}
+{"repair_contract":${JSON.stringify(CONTRACT_EXAMPLE)},"scope_amendment":null,"root_cause":"根因","evidence":["[观察] URL 或根别名:相对路径:符号或命令 — 可复查事实","[推断] 基于上述事实得到的结论","[排除] 候选原因 — 排除证据"],"reproduction":{"command":"复现或相关测试命令；没有则为空","before":"修复前观察到的失败或等价静态证据"},"diagnostic_pages":[{"url":"工单中的原始链接","status":"read","title":"页面标题","facts":["从页面读取的事实"],"error":""}],"planned_files":["project:相对路径","engine:相对路径"],"confidence":0.0,"blocked_reasons":[]}
 \`\`\``;
 };
 
@@ -212,8 +217,9 @@ ${compactInvestigationTrace(partialOutput.trim()) || "（没有保留下可用�
 现在不要继续广泛搜索，也不要调用工具。根据已读取的代码证据立即输出完整 FINAL_RESULT，优先保留已证实的触发条件、调用关系和排除项。
 相关文件名或某个相似函数不足以证实根因；不得强行给出计划修改。调用链未证实时用 blocked_reasons 说明具体缺失证据，根因与 planned_files 可为空。只有确实无法定位任何相关代码入口时，才写“无法根据标题、描述及现有代码定位问题”。
 保留 [观察]、[推断]、[排除] 的区分，禁止把工具文本中的 JSON 示例当成结论。
+保留已形成的 repair_contract；没有业务验收证据则留空并记录缺口，不得编造。
 只输出 FINAL_RESULT: 后接一个 JSON 对象，字段为：
-{"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":[]}
+{"repair_contract":null,"scope_amendment":null,"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":[]}
 只填写轨迹支持的内容；无法补全的字段留空并记录具体缺口。`;
 
 const normalizedDiagnosticUrl = (value: string): string => {
@@ -237,6 +243,7 @@ const isUnlocatableReason = (reason: string): boolean => {
 export const parseInvestigation = (
   output: string,
   requiredDiagnosticLinks: string[] = [],
+  bugFields?: Record<string, unknown>,
 ): InvestigationResult => {
   const data = extractFinalJson(output) ?? {};
   const rootCause = String(data.root_cause ?? "").trim();
@@ -271,6 +278,7 @@ export const parseInvestigation = (
   const reportedBlocks = strings(data.blocked_reasons);
   const blockedReasons = reportedBlocks.filter(isUnlocatableReason);
   const validationErrors: string[] = [];
+  const parsedContract = parseRepairContract(data.repair_contract, evidence, bugFields);
   if (!blockedReasons.length && !plannedFiles.length && reportedBlocks.length) {
     validationErrors.push(`调查证据尚未收敛: ${reportedBlocks.join("；")}`);
   }
@@ -281,6 +289,7 @@ export const parseInvestigation = (
     if (!page || page.status !== "read" || !page.facts.length) continue;
   }
   if (!blockedReasons.length) {
+    validationErrors.push(...parsedContract.errors);
     if (!rootCause) validationErrors.push("调查结果缺少 root_cause");
     if (!evidence.length) validationErrors.push("调查结果缺少可核查 evidence");
     if (!evidence.some((item) => item.startsWith("[观察]"))) {
@@ -305,6 +314,7 @@ export const parseInvestigation = (
     confidence,
     blocked_reasons: blockedReasons,
     validation_errors: validationErrors,
+    repair_contract: parsedContract.contract,
   };
 };
 
@@ -351,6 +361,8 @@ ${context}
 </bug_context>
 
 # 调查结论（实施前核对，推断不等于已确认）
+业务验收条件：
+${formatRepairContract(investigation.repair_contract)}
 根因: ${investigation.root_cause}
 置信度: ${investigation.confidence}
 证据:

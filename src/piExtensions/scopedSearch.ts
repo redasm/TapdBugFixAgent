@@ -1,3 +1,4 @@
+import { codeRelations } from "../codeRelations.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,16 @@ export default function scopedSearchExtension(pi: PiExtensionApi): void {
   const localRg = path.join(os.homedir(), ".pi", "agent", "bin", process.platform === "win32" ? "rg.exe" : "rg");
   const rg = process.env.TAPD_BUGFIX_RG_PATH || (fs.existsSync(localRg) ? localRg : "rg");
   const configured = JSON.parse(process.env.TAPD_BUGFIX_SEARCH_PATHS || "[]") as string[];
+  for (const [name, mode] of [["lookup_symbol", "symbol"], ["find_references", "references"], ["find_related_implementations", "related"]] as const) {
+    pi.registerTool({ name, label: name, description: "只读 TypeScript AST 检索。指定具体模块目录、符号名；返回行号、源码哈希与片段。引用为标识符候选，须核实类型身份；最多300文件/2秒。",
+      parameters: { type: "object", properties: { path: { type: "string" }, symbol: { type: "string" }, limit: { type: "number" } }, required: ["path", "symbol"] },
+      async execute(_id: string, input: {path:string;symbol:string;limit?:number}, signal?:AbortSignal, _update?:unknown, ctx?:{cwd:string}) {
+        if(signal?.aborted) throw new Error("检索已取消");
+        const result=codeRelations(ctx?.cwd||process.cwd(),input.path,input.symbol,mode,input.limit);
+        return { content: [{type:"text",text:JSON.stringify(result)}],details:result };
+      },
+    });
+  }
   // Shell searches also need a per-command deadline; builds keep their original timeout.
   pi.on("tool_call", (event) => {
     if (event.toolName !== "bash") return;

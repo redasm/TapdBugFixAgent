@@ -9,6 +9,7 @@ import Database from "better-sqlite3";
 import path from "node:path";
 import type { Bug } from "./models.js";
 import { dumps } from "./models.js";
+import { AttemptAudit } from "./attemptAudit.js";
 
 const _SCHEMA = `
 CREATE TABLE IF NOT EXISTS control (
@@ -75,11 +76,15 @@ export type FeedbackOutcome =
 export interface JobFeedbackInput {
   outcome: FeedbackOutcome;
   reason: string;
-  human_changed_lines: number;
+  human_changed_lines: number | null;
   submitted_changelist: number | null;
+  candidate_id: string;
+  human_minutes?: number | null;
+  modification_category?: string;
+  final_patch_ref?: string;
 }
 
-export interface QualityMetrics {
+export interface HistoricalQualityMetrics {
   reviewed: number;
   accepted_unchanged: number;
   accepted_modified: number;
@@ -89,6 +94,11 @@ export interface QualityMetrics {
   unchanged_acceptance_rate: number;
   human_modification_rate: number;
   reopen_rate: number;
+}
+
+export interface QualityMetrics {
+  historical: HistoricalQualityMetrics;
+  candidates: ReturnType<AttemptAudit["metrics"]>;
 }
 
 const _FEEDBACK_OUTCOMES = new Set<FeedbackOutcome>([
@@ -126,26 +136,26 @@ const _UPDATE_ALLOWED = new Set([
 
 export class StateStore {
   private db: Database.Database;
+  readonly audit: AttemptAudit;
 
   constructor(dbPath = "tapd_agent_v2.db") {
     const resolved = dbPath === ":memory:" ? dbPath : path.resolve(dbPath);
     this.db = new Database(resolved);
     // 所有整数结果以 BigInt 返回，避免大整数 bug_id / changelist 丢精度（构造选项 safeIntegers 类型缺失，用等价方法）
     this.db.defaultSafeIntegers(true);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(_SCHEMA);
     const cols = this.db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
     const requiredColumns = [
       "model", "retry_evidence", "last_attempt_files", "admission_score",
       "investigation", "verification", "review_findings",
     ];
-    const missing = requiredColumns.filter((name) => !cols.some((column) => column.name === name));
+    const missing = cols.length ? requiredColumns.filter((name) => !cols.some((column) => column.name === name)) : [];
     if (missing.length) {
       this.db.close();
-      throw new Error(
-        `数据库 schema 不匹配，缺少列: ${missing.join(", ")}；开发阶段不执行迁移，请删除数据库后重建`,
-      );
+      throw new Error(`数据库 schema 不匹配，缺少列: ${missing.join(", ")}；开发阶段不自动迁移，请备份历史数据并使用新数据库`);
     }
+    this.db.pragma("journal_mode = WAL");
+    this.db.exec(_SCHEMA);
+    this.audit = new AttemptAudit(this.db);
     this.db
       .prepare("INSERT OR IGNORE INTO control(id, state, updated_at) VALUES (1, 'stopped', ?)")
       .run(nowStr());
@@ -275,29 +285,32 @@ export class StateStore {
       throw new Error(`未知反馈结果: ${String(input.outcome)}`);
     }
     if (!this.getJob(bugId)) throw new Error(`未找到 bug: ${bugId}`);
-    const changedLines = Math.max(0, Math.floor(Number(input.human_changed_lines) || 0));
-    this.db.prepare(
-      `INSERT INTO job_feedback(
-         bug_id, outcome, reason, human_changed_lines, submitted_changelist, created_at
-       ) VALUES (?,?,?,?,?,?)`,
-    ).run(
-      bugId,
-      input.outcome,
-      input.reason.slice(0, 2000),
-      changedLines,
-      input.submitted_changelist,
-      nowStr(),
-    );
-    const agentState = input.outcome === "accepted_unchanged"
-      ? "accepted"
-      : input.outcome === "accepted_modified"
-        ? "accepted_modified"
-        : input.outcome === "reopened" ? "reopened" : "rejected";
-    this.updateJob(bugId, { agent_state: agentState, finished_at: nowStr() });
+    const attempts = this.audit.attempts(bugId);
+    if (!input.candidate_id?.trim()) {
+      throw new Error("必须选择具体候选版本后记录反馈；未产出补丁的尝试不能记为候选接受");
+    }
+    const candidates = this.audit.candidates(bugId);
+    const target = candidates.find(c => c.candidate_id === input.candidate_id);
+    if (!target) throw new Error("候选不存在或不属于该 Bug，请重新选择候选版本");
+    this.db.transaction(() => {
+      this.audit.recordFeedback(bugId, input);
+      // A decision on an older candidate must not overwrite a newer attempt's live state.
+      const latest = attempts.at(-1);
+      const isCurrent = target.attempt_id === latest?.attempt_id
+        && latest.events.some(e => e.kind === "finished")
+        && candidates.at(-1)?.candidate_id === target.candidate_id;
+      const agentState = input.outcome === "accepted_unchanged"
+        ? "accepted"
+        : input.outcome === "accepted_modified"
+          ? "accepted_modified"
+          : input.outcome === "reopened" ? "reopened" : "rejected";
+      if (isCurrent) this.updateJob(bugId, { agent_state: agentState, finished_at: nowStr() });
+    })();
     this.addEvent(`人工反馈: ${input.outcome}${input.reason ? `（${input.reason}）` : ""}`, "info", bugId);
   }
 
-  listFeedback(bugId?: string): Record<string, unknown>[] {
+  /** Read-only historical labels; all new feedback belongs to a concrete candidate. */
+  listHistoricalFeedback(bugId?: string): Record<string, unknown>[] {
     const rows = bugId
       ? this.db.prepare("SELECT * FROM job_feedback WHERE bug_id=? ORDER BY id").all(bugId)
       : this.db.prepare("SELECT * FROM job_feedback ORDER BY id").all();
@@ -305,7 +318,7 @@ export class StateStore {
       ...row,
       id: Number(row.id),
       bug_id: idToString(row.bug_id),
-      human_changed_lines: Number(row.human_changed_lines ?? 0),
+      human_changed_lines: row.human_changed_lines == null ? null : Number(row.human_changed_lines),
       submitted_changelist: numOrNull(row.submitted_changelist),
     }));
   }
@@ -313,7 +326,7 @@ export class StateStore {
   qualityMetrics(): QualityMetrics {
     const latestDecision = new Map<string, FeedbackOutcome>();
     const reopened = new Set<string>();
-    for (const row of this.listFeedback()) {
+    for (const row of this.listHistoricalFeedback()) {
       const id = String(row.bug_id);
       const outcome = String(row.outcome) as FeedbackOutcome;
       if (outcome === "reopened") reopened.add(id);
@@ -330,15 +343,18 @@ export class StateStore {
     const reviewed = acceptedUnchanged + acceptedModified + rejected;
     const accepted = acceptedUnchanged + acceptedModified;
     return {
-      reviewed,
-      accepted_unchanged: acceptedUnchanged,
-      accepted_modified: acceptedModified,
-      rejected,
-      reopened: reopened.size,
-      candidate_precision: reviewed ? accepted / reviewed : 0,
-      unchanged_acceptance_rate: reviewed ? acceptedUnchanged / reviewed : 0,
-      human_modification_rate: accepted ? acceptedModified / accepted : 0,
-      reopen_rate: accepted ? reopened.size / accepted : 0,
+      historical: {
+        reviewed,
+        accepted_unchanged: acceptedUnchanged,
+        accepted_modified: acceptedModified,
+        rejected,
+        reopened: reopened.size,
+        candidate_precision: reviewed ? accepted / reviewed : 0,
+        unchanged_acceptance_rate: reviewed ? acceptedUnchanged / reviewed : 0,
+        human_modification_rate: accepted ? acceptedModified / accepted : 0,
+        reopen_rate: accepted ? reopened.size / accepted : 0,
+      },
+      candidates: this.audit.metrics(),
     };
   }
 

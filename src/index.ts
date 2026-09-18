@@ -192,26 +192,12 @@ async function cmdMcpTools(args: CliArgs): Promise<number> {
   return 0;
 }
 
-function percent(value: number): string {
-  return `${(value * 100).toFixed(1)}%`;
-}
-
 async function cmdEval(args: CliArgs): Promise<number> {
-  if (!args.dataset || !args.results.length) {
-    console.error("eval 需要 --dataset <cases.jsonl> 和至少一个 --result <name=path>");
+  if (!args.dataset) {
+    console.error("eval 需要 --dataset <dataset.json>");
     return 1;
   }
-  const reports = evaluateFiles(args.dataset, args.results);
-  console.log("模型/Prompt             综合分  覆盖率  有效修复  验证通过  范围精确  评审通过  原样接受");
-  console.log("-".repeat(100));
-  for (const report of reports) {
-    console.log(
-      `${report.name.padEnd(22)} ${report.score.toFixed(3).padStart(6)}  `
-      + `${percent(report.coverage).padStart(6)}  ${percent(report.effective_fix_rate).padStart(8)}  `
-      + `${percent(report.verified_rate).padStart(8)}  ${percent(report.scope_precision).padStart(8)}  `
-      + `${percent(report.review_pass_rate).padStart(8)}  ${percent(report.unchanged_acceptance_rate).padStart(8)}`,
-    );
-  }
+  console.log(JSON.stringify(evaluateFiles(args.dataset, args.results), null, 2));
   return 0;
 }
 
@@ -248,13 +234,13 @@ function printHelp(): void {
   run              无界面：处理一批
   serve            启动 Web 管理台 + 工作线程
   mcp-tools        调试：连上 Tapd MCP 并打印发现的工具清单
-  eval             离线比较历史 Bug 的不同模型/Prompt 结果
+  eval             校验冻结数据集或比较独立配对试验（JSON数据集+JSONL结果）
 选项:
   --config <path>  配置文件路径（默认 config.yaml）
   --db <path>      状态库路径（默认 tapd_agent_v2.db）
   --host <ip>      监听地址（serve，默认取配置）
   --port <n>       端口（serve，默认取配置）
-  --dataset <path> eval 的历史 Bug JSONL 数据集
+  --dataset <path> eval 的冻结 JSON 数据集
   --result <n=p>   eval 的结果 JSONL，可重复，例如 --result model-a=a.jsonl`);
 }
 

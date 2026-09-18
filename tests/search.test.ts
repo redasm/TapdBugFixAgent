@@ -67,7 +67,7 @@ describe("bounded source search", () => {
     let hook: (event: { toolName: string; input: Record<string, unknown> }) => void = () => {};
     const names: string[] = [];
     scopedSearch({ registerTool: (tool) => { names.push(String(tool.name)); }, on: (_event, handler) => { hook = handler; } });
-    expect(names).toEqual(["grep", "find"]);
+    expect(names).toEqual(["lookup_symbol", "find_references", "find_related_implementations", "grep", "find"]);
     const search = { toolName: "bash", input: { command: 'cd "repo" && rg -n Mark .', timeout: 600 } };
     hook(search);
     expect(search.input.timeout).toBe(30);

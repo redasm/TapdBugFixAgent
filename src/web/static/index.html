@@ -172,8 +172,13 @@
     <span class="stat">机器验证通过 <b id="stVerified">0</b></span>
     <span class="stat">资源待人工 <b id="stManual">0</b></span>
     <span class="stat">失败 <b id="stFailed">0</b></span>
-    <span class="stat" title="人工原样接受 / 已评审候选"><span>原样接受率</span> <b id="stAcceptance">-</b></span>
-    <span class="stat" title="人工确认方向正确 / 已评审候选"><span>候选精确率</span> <b id="stPrecision">-</b></span>
+    <span class="stat" title="旧统计口径：按 Bug 汇总人工反馈"><span>历史原样接受率</span> <b id="stAcceptance">-</b></span>
+    <span class="stat" title="旧统计口径：原样或修改后接受 / 已评审 Bug"><span>历史接受率</span> <b id="stPrecision">-</b></span>
+    <span class="stat" title="按完整候选版本统计"><span>候选精确率</span> <b id="stCandidatePrecision">-</b></span>
+    <span class="stat"><span>候选原样接受率</span> <b id="stCandidateUnchanged">-</b></span>
+    <span class="stat"><span>候选反馈覆盖率</span> <b id="stFeedbackCoverage">-</b></span>
+    <span class="stat"><span>候选覆盖率</span> <b id="stCandidateCoverage">-</b></span>
+    <span class="stat"><span>端到端有效率</span> <b id="stEndToEnd">-</b></span>
   </div>
   <div class="actions">
     <button id="btnSettings" class="ghost">⚙ 设置</button>
@@ -420,9 +425,16 @@ function renderStatus() {
   $('stManual').textContent = counts.manual_only||0;
   $('stFailed').textContent = counts.failed||0;
   const quality = st.quality || {};
-  const asPercent = value => Number.isFinite(Number(value)) ? (Number(value) * 100).toFixed(1) + '%' : '-';
-  $('stAcceptance').textContent = quality.reviewed ? asPercent(quality.unchanged_acceptance_rate) : '-';
-  $('stPrecision').textContent = quality.reviewed ? asPercent(quality.candidate_precision) : '-';
+  const asPercent = value => value != null && Number.isFinite(Number(value)) ? (Number(value) * 100).toFixed(1) + '%' : '-';
+  const historical = quality.historical || {};
+  $('stAcceptance').textContent = historical.reviewed ? asPercent(historical.unchanged_acceptance_rate) : '-';
+  $('stPrecision').textContent = historical.reviewed ? asPercent(historical.candidate_precision) : '-';
+  const candidateMetrics = quality.candidates || {};
+  $('stCandidatePrecision').textContent = asPercent(candidateMetrics.candidate_precision);
+  $('stCandidateUnchanged').textContent = asPercent(candidateMetrics.unchanged_acceptance_rate);
+  $('stFeedbackCoverage').textContent = asPercent(candidateMetrics.feedback_coverage);
+  $('stCandidateCoverage').textContent = asPercent(candidateMetrics.candidate_coverage);
+  $('stEndToEnd').textContent = asPercent(candidateMetrics.end_to_end_effective_rate);
   const failedN = counts.failed || 0;
   const bf = $('btnRetryFailed');
   bf.disabled = !failedN;
@@ -561,7 +573,11 @@ function feedbackDraft() {
   if (!outcome) return null;
   return {
     outcome: outcome.value,
-    lines: $('feedbackLines')?.value ?? '0',
+    lines: $('feedbackLines')?.value ?? '',
+    candidate: $('feedbackCandidate')?.value ?? '',
+    minutes: $('feedbackMinutes')?.value ?? '',
+    category: $('feedbackCategory')?.value ?? '',
+    patchRef: $('feedbackPatchRef')?.value ?? '',
     changelist: $('feedbackCl')?.value ?? '',
     reason: $('feedbackReason')?.value ?? '',
   };
@@ -573,6 +589,10 @@ function restoreFeedbackDraft(draft) {
   $('feedbackLines').value = draft.lines;
   $('feedbackCl').value = draft.changelist;
   $('feedbackReason').value = draft.reason;
+  if ($('feedbackCandidate')) $('feedbackCandidate').value = draft.candidate;
+  if ($('feedbackMinutes')) $('feedbackMinutes').value = draft.minutes;
+  if ($('feedbackCategory')) $('feedbackCategory').value = draft.category;
+  if ($('feedbackPatchRef')) $('feedbackPatchRef').value = draft.patchRef;
 }
 
 function renderDetail(job) {
@@ -592,6 +612,8 @@ function renderDetail(job) {
   const verification = parseObj(job.verification);
   const review = parseObj(job.review_findings);
   const findings = Array.isArray(review.findings) ? review.findings : [];
+  const candidates = job.repair_candidates || [];
+  const attempts = job.repair_attempts || [];
   const actionHTML = job.agent_state === 'skipped'
     ? `<div class="section">
       <h4>操作</h4>
@@ -644,6 +666,10 @@ function renderDetail(job) {
     </div>
     ${progressHTML(job)}
     ${retryHTML}
+    ${attempts.length ? `<div class="section"><h4>尝试与候选版本</h4>
+      ${attempts.slice().reverse().map(a => `<details><summary>${escapeHtml(a.started_at)} · ${escapeHtml(a.attempt_id.slice(0,8))} · ${escapeHtml(a.events.find(e => e.kind === 'finished')?.payload.state || '未结束')}</summary><pre>${escapeHtml(JSON.stringify(a, null, 2))}</pre></details>`).join('')}
+      ${candidates.slice().reverse().map(c => `<details><summary>${c.delivery === 'complete' ? '完整候选' : '未完成候选'} · ${escapeHtml(c.candidate_id.slice(0,8))} · ${escapeHtml(c.diff_hash.slice(0,12))}</summary><pre>${escapeHtml(c.diff)}</pre></details>`).join('')}
+    </div>` : ''}
     ${investigation.root_cause || (investigation.evidence || []).length || (investigation.validation_errors || []).length ? `<div class="section">
       <h4>${investigation.ok === false ? "只读调查尚未完成（待核对）" : "只读调查结论"}</h4>
       <pre>根因: ${escapeHtml(investigation.root_cause)}\n置信度: ${escapeHtml(investigation.confidence)}\n证据:\n${escapeHtml((investigation.evidence || []).join('\n'))}\n待核查问题:\n${escapeHtml((investigation.validation_errors || []).join('\n'))}</pre>
@@ -652,8 +678,10 @@ function renderDetail(job) {
       <h4>机器验证</h4>
       <pre>${escapeHtml(verification.summary)}</pre>
     </div>` : ''}
+    ${investigation.repair_contract ? `<div class="section"><h4>业务验收条件与复用方案</h4><pre>${escapeHtml(JSON.stringify(investigation.repair_contract, null, 2))}</pre></div>` : ''}
     ${review.note || findings.length ? `<div class="section">
       <h4>独立 Reviewer</h4>
+      ${review.requirement_match ? `<pre>业务要求: ${escapeHtml(review.requirement_match)} · 行为证据: ${escapeHtml(review.behavioral_evidence)} · 复用/生命周期: ${escapeHtml(review.reuse_and_lifecycle)}\n待验收:\n${escapeHtml((review.unverified_items || []).join('\n'))}</pre>` : ''}
       <pre>${escapeHtml(review.note || '')}${findings.length ? '\n' + escapeHtml(findings.map(f => `[${f.severity}] ${f.file || ''}${f.line ? ':' + f.line : ''} ${f.title}\n${f.required_action}`).join('\n\n')) : ''}</pre>
     </div>` : ''}
     ${job.description ? `<div class="section">
@@ -673,9 +701,10 @@ function renderDetail(job) {
       <ul>${assets.length ? assets.map(a => `<li class="mono">${escapeHtml(a.path)} <span class="reason">— ${escapeHtml(a.reason || '')}</span></li>`).join('') : '<li class="muted">(无)</li>'}</ul>
     </div>
     ${actionHTML}
-    ${job.has_local && job.changelist ? `<div class="section" data-qa="qa:feedback.form">
+    ${job.has_local && candidates.length ? `<div class="section" data-qa="qa:feedback.form">
       <h4>人工修复结论</h4>
       <div class="feedback-grid">
+        <label class="full">候选版本<select id="feedbackCandidate"><option value="">请选择要验收的补丁</option>${candidates.slice().reverse().map(c => `<option value="${escapeHtml(c.candidate_id)}">${escapeHtml(c.created_at)} · ${c.delivery === 'complete' ? '完整候选' : '未完成候选（不计完整候选指标）'} · ${escapeHtml(c.diff_hash.slice(0,12))}</option>`).join('')}</select></label>
         <label class="full">结论
           <select id="feedbackOutcome">
             <option value="accepted_unchanged">原样接受并提交</option>
@@ -688,8 +717,11 @@ function renderDetail(job) {
             <option value="reopened">提交后 Bug 重开</option>
           </select>
         </label>
-        <label>人工改动行数<input id="feedbackLines" type="number" min="0" value="0"></label>
-        <label>最终 Changelist<input id="feedbackCl" type="number" min="1" value="${job.changelist}"></label>
+        <label>人工改动行数<input id="feedbackLines" type="number" min="0" placeholder="未知可留空"></label>
+        <label>最终 Changelist<input id="feedbackCl" type="number" min="1" value="${job.changelist ?? ''}"></label>
+        <label>人工耗时（分钟）<input id="feedbackMinutes" type="number" min="0" step="0.1" placeholder="未知可留空"></label>
+        <label>修改类别<input id="feedbackCategory" placeholder="业务条件 / 定位 / 复用 / 生命周期"></label>
+        <label class="full">最终补丁引用<input id="feedbackPatchRef" placeholder="提交哈希、changelist 或本地补丁位置"></label>
         <label class="full">原因或补充说明<textarea id="feedbackReason" placeholder="例如：原样通过；或说明人工补了哪些边界条件"></textarea></label>
         <button class="full" data-qa="qa:feedback.submit" onclick="submitFeedback('${job.bug_id}')">记录人工结论</button>
       </div>
@@ -799,10 +831,15 @@ function updateLocalJobState(id, state) {
 async function submitFeedback(id) {
   const outcome = $('feedbackOutcome').value;
   const reason = $('feedbackReason').value.trim();
-  const human_changed_lines = Number($('feedbackLines').value || 0);
+  const human_changed_lines = $('feedbackLines').value === '' ? null : Number($('feedbackLines').value);
+  const candidate_id = $('feedbackCandidate').value;
+  if (!candidate_id) { toast('请选择具体候选版本', true); return; }
   const submitted_changelist = Number($('feedbackCl').value || 0) || null;
   const r = await api(`/api/bugs/${id}/feedback`, 'POST', {
-    outcome, reason, human_changed_lines, submitted_changelist,
+    outcome, reason, human_changed_lines, submitted_changelist, candidate_id,
+    human_minutes: $('feedbackMinutes').value === '' ? null : Number($('feedbackMinutes').value),
+    modification_category: $('feedbackCategory').value,
+    final_patch_ref: $('feedbackPatchRef').value,
   });
   if (!r) return;
   toast('已记录人工修复结论，质量指标已更新');

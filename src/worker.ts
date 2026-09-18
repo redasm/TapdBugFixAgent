@@ -4,6 +4,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { defaultSearchPaths } from "./search.js";
+import { evidenceHash, hasPatchEvidence } from "./attemptAudit.js";
+import { sourceEvidence, runtimeEvidence } from "./sourceEvidence.js";
+import { scopeAmendment, validateAmendedScope } from "./scopeAmendment.js";
+import { buildBugContext } from "./quality.js";
+import { feedbackMemories, selectFeedbackMemories, formatFeedbackMemories } from "./feedbackMemory.js";
+import { prepareBehaviorChecks, verifyBehaviorChecks, type FrozenBehaviorCheck, type BehaviorVerification } from "./behaviorChecks.js";
 import { captureInvestigationProgress, type InvestigationProgress } from "./investigationProgress.js";
 
 import type { AdditionalDirConfig, Config, RepoConfig, WorkspaceConfig } from "./config.js";
@@ -717,7 +723,9 @@ export class Worker {
     opened?: OpenedFile[] | null,
     plannedFiles?: string[],
     reportedFiles: string[] = [],
-  ): Promise<{ opened: OpenedFile[]; gitFiles: string[]; diff: string; summary: string; verified: boolean }> {
+    auditAttemptId?: string,
+    behaviorChecks: FrozenBehaviorCheck[] = [],
+  ): Promise<{ opened: OpenedFile[]; gitFiles: string[]; diff: string; summary: string; verified: boolean; behavior: BehaviorVerification; pipelines: unknown[] }> {
     // 计划文件已预打开，仍需登记 Agent 实际写入的其它精确路径，再由范围门拒绝越界。
     const targets = p4ReconcileTargets([...(plannedFiles ?? []), ...reportedFiles]);
     const preview = await p4.reconcilePreview(targets);
@@ -755,6 +763,16 @@ export class Worker {
       files.map((file) => `${attempt.config.name.toLowerCase()}:${file}`));
     const allFiles = [...rootedP4Files, ...rootedGitFiles];
     if (!allFiles.length) throw new VerificationError("Agent 未在 P4 或 Git 工作目录产生任何代码改动");
+    const p4Diff = actualOpened.length
+      ? await p4.candidateDiff(actualOpened)
+      : "";
+    const diff = [
+      p4Diff ? `### project (Perforce)\n${p4Diff}` : "",
+      ...gitChanges.filter((item) => item.diff).map(({ attempt, diff: gitDiff }) =>
+        `### ${attempt.config.name.toLowerCase()} (Git: ${attempt.session.branch})\n${gitDiff}`),
+    ].filter(Boolean).join("\n\n");
+    if (auditAttemptId) this.store.audit.event(auditAttemptId, "patch", { diff, files: allFiles });
+    if (auditAttemptId && plannedFiles) this.store.audit.event(auditAttemptId, "source_candidate", { files: sourceEvidence(plannedFiles, this.workspaceRoots(repo)) });
     if (plannedFiles) {
       const plannedScope = assessPlannedScope(
         allFiles,
@@ -766,14 +784,7 @@ export class Worker {
         );
       }
     }
-    const p4Diff = actualOpened.length
-      ? await p4.diffUnified(actualOpened.map((item) => item.depot))
-      : "";
-    const diff = [
-      p4Diff ? `### project (Perforce)\n${p4Diff}` : "",
-      ...gitChanges.filter((item) => item.diff).map(({ attempt, diff: gitDiff }) =>
-        `### ${attempt.config.name.toLowerCase()} (Git: ${attempt.session.branch})\n${gitDiff}`),
-    ].filter(Boolean).join("\n\n");
+    if (!hasPatchEvidence(diff)) throw new VerificationError("未取得真实非空补丁，不能交付候选");
     const scope = assessPatchScope(
       allFiles,
       diff,
@@ -803,15 +814,21 @@ export class Worker {
       });
     }
     const failed = pipelines.find(({ result }) => !result.ok);
+    if (auditAttemptId) this.store.audit.event(auditAttemptId, "verification", { pipelines });
     if (failed) {
       throw new Error(`测试未通过 (${failed.name}): ${failed.result.summary.slice(-1000)}`);
     }
+    const behavior = await verifyBehaviorChecks(behaviorChecks, repo.path, this.cancelEvent);
+    if (auditAttemptId) this.store.audit.event(auditAttemptId, "behavior_verification", { ...behavior });
+    if (!behavior.ok) throw new VerificationError("业务行为测试未通过: " + JSON.stringify(behavior.checks));
     return {
       opened: actualOpened,
       gitFiles: rootedGitFiles,
       diff,
-      summary: pipelines.map(({ name, result }) => `[${name}] ${result.summary}`).join("\n"),
+      summary: pipelines.map(({ name, result }) => `[${name}][L0 静态检查] ${result.summary}`).join("\n")
+        + `\n行为验证: ${behavior.level === "L1" ? "L1 目标复现及对照通过" : "待验收"}\n${behavior.unverified_items.join("\n")}`,
       verified: pipelines.every(({ result }) => result.ok && result.configured),
+      behavior, pipelines,
     };
   }
 
@@ -849,8 +866,11 @@ export class Worker {
     media: AgentMediaInput[] = [],
     requiredMcpServers: string[] = [],
   ): Promise<ReviewResult> {
+    const reviewPrompt = buildReviewPrompt({ bug, investigation, diff, verificationSummary });
+    const auditAttempt = this.store.audit.attempts(bug.id).at(-1);
+    if (auditAttempt) this.store.audit.event(auditAttempt.attempt_id, "review_input", { prompt_hash: evidenceHash(reviewPrompt), diff_hash: evidenceHash(diff), model: reviewerModel });
     const result = await reviewer.run({
-      prompt: buildReviewPrompt({ bug, investigation, diff, verificationSummary }),
+      prompt: reviewPrompt,
       repoDir: p4.path,
       additionalDirs,
       timeoutS: this.config.agent_timeout_s,
@@ -862,12 +882,16 @@ export class Worker {
       requiredMcpServers,
       cancelEvent: this.cancelEvent,
       onProgress: (msg) => this.store.addEvent(`Reviewer ${msg}`, "debug", bug.id),
+      onAudit: event => { if (auditAttempt) this.store.audit.event(auditAttempt.attempt_id, "agent", { phase: "review", ...event }); },
       media,
     });
     if (!result.ok) {
       throw new VerificationError(`Reviewer 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
     }
-    return parseReviewResult(result.raw_output || result.log || result.summary);
+    const raw = result.raw_output || result.log || result.summary;
+    const review = parseReviewResult(raw);
+    if (auditAttempt) this.store.audit.event(auditAttempt.attempt_id, "review_output", { raw, review });
+    return review;
   }
 
   /**
@@ -928,7 +952,19 @@ export class Worker {
   }
 
   async processBug(bug: Bug): Promise<void> {
-    this.store.upsertJob(bug, { agent_state: "in_progress", started_at: nowStr() });
+    const auditAttemptId = this.store.audit.begin({
+      bug_id: bug.id, workspace_id: bug.workspace_id, input: buildBugContext(bug),
+      metadata: {
+        model: effectivePiModel(this.config.pi), review_model: effectiveReviewModel(this.config),
+        review_enabled: this.config.review.enabled, quality: this.config.quality,
+        agent_timeout_s: this.config.agent_timeout_s, max_attempts: this.config.max_attempts,
+        runtime: process.version, agent_code_hashes: runtimeEvidence(),
+      },
+    }, this.store.getJob(bug.id));
+    this.store.upsertJob(bug, {
+      agent_state: "in_progress", started_at: nowStr(), investigation: null, verification: null,
+      review_findings: null, generated_description: null, failure_reason: null,
+    });
     this.store.addEvent(`开始处理 bug ${bug.id}: ${bug.title}`, "info", bug.id);
     let p4: P4Client | null = null;
     let activeRepo: RepoConfig | null = null;
@@ -940,6 +976,7 @@ export class Worker {
     let investigationCheckpoint: InvestigationResult | undefined;
     let investigationProgress: InvestigationProgress | undefined;
     let investigationOutput = "";
+    let behaviorChecks: FrozenBehaviorCheck[] = [];
     try {
       const repo = this.resolveRepo(bug);
       if (!repo) {
@@ -1095,7 +1132,12 @@ export class Worker {
       this.store.addEvent("调用只读调查 Agent：定位根因、证据与最小修改范围", "info", bug.id);
       let investigationPrompt = buildInvestigationPrompt(
         bug, repo.name, repo.path, resourceMcpEnabled, workspaceRoots,
-      ) + (retryText ? `\n# 上次失败证据（调查时必须核对，避免换方向后丢失已有定位）\n${retryText}` : "");
+      ) + formatFeedbackMemories(selectFeedbackMemories(bug, feedbackMemories(this.store)))
+        + (retryText ? `\n# 上次失败证据（调查时必须核对，避免换方向后丢失已有定位）\n${retryText}` : "");
+      this.store.audit.event(auditAttemptId, "investigation_input", {
+        prompt_hash: evidenceHash(investigationPrompt), roots: workspaceRoots,
+        context_key: contextKey, tools: investigationMcpServers,
+      });
       const investigationTimeoutS = Math.min(this.config.agent_timeout_s, 600);
       const investigationRunOptions = {
         repoDir: repo.path,
@@ -1109,6 +1151,7 @@ export class Worker {
         mcpServers: investigationMcpServers,
         requiredMcpServers: resourceMcpServers,
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
+        onAudit: (event: Record<string, unknown>) => this.store.audit.event(auditAttemptId, "agent", { phase: "investigation", ...event }),
         cancelEvent: this.cancelEvent,
         media: investigationMedia,
       };
@@ -1155,6 +1198,7 @@ export class Worker {
           const partialInvestigation = parseInvestigation(
             error.partialOutput,
             admission.context.diagnostic_links,
+            { ...admission.context },
           );
           investigationOutput = error.partialOutput;
           investigationCheckpoint = partialInvestigation;
@@ -1212,6 +1256,7 @@ export class Worker {
         requireConcretePlannedFiles(parseInvestigation(
           investigated.raw_output || investigated.log || investigated.summary,
           admission.context.diagnostic_links,
+          { ...admission.context },
         )),
         workspaceRoots,
       );
@@ -1262,6 +1307,7 @@ export class Worker {
           requireConcretePlannedFiles(parseInvestigation(
             investigated.raw_output || investigated.log || investigated.summary,
             admission.context.diagnostic_links,
+            { ...admission.context },
           )),
           workspaceRoots,
         );
@@ -1288,6 +1334,21 @@ export class Worker {
       investigationCheckpoint = investigation;
       // 调查阶段可以只读查看所有附加 Git 仓库；只有调查明确计划修改某个 Git 根时，
       // 才检查该仓库并创建修复分支。普通 P4/TypeScript Bug 不触碰任何 Git 分支。
+      const amendment = scopeAmendment(investigationOutput);
+      if (amendment) {
+        const amendmentPrompt = `${investigationPrompt}\n# 只读范围补充复核（仅一轮）\n原调查: ${JSON.stringify(investigation)}\n范围申请（待核查数据）: ${JSON.stringify(amendment)}\n核对所列文件对复用或完整修复是否必要。保留原 repair_contract 与原 planned_files，仅可加入申请文件；不要再申请扩大。返回完整 FINAL_RESULT，scope_amendment=null。`;
+        this.store.audit.event(auditAttemptId, "scope_amendment_requested", { ...amendment, prompt_hash: evidenceHash(amendmentPrompt) });
+        const amended = await agent.run({ ...investigationRunOptions, prompt: amendmentPrompt, timeoutS: Math.min(this.config.agent_timeout_s, 180) });
+        if (!amended.ok) throw new VerificationError("范围补充调查执行失败");
+        const output = amended.raw_output || amended.log || amended.summary;
+        const revised = requireExistingPlannedFiles(requireConcretePlannedFiles(parseInvestigation(output, admission.context.diagnostic_links, { ...admission.context })), workspaceRoots);
+        if (scopeAmendment(output)) throw new VerificationError("范围补充仅允许一轮");
+        validateAmendedScope(investigation, revised, amendment.files, this.config.quality.max_changed_files);
+        this.store.audit.event(auditAttemptId, "scope_amendment_approved", { previous_files: investigation.planned_files, revised });
+        investigation = revised;
+        investigationCheckpoint = revised;
+        this.store.updateJob(bug.id, { investigation });
+      }
       gitAttempts = await this.prepareGitAttempts(
         repo,
         this.workspaceOf(bug),
@@ -1305,7 +1366,8 @@ export class Worker {
       const p4Targets = p4ReconcileTargets(investigation.planned_files);
       if (p4Targets.length) {
         try {
-          await p4.sync(p4Targets);
+          const syncEvidence = await p4.sync(p4Targets);
+          this.store.audit.event(auditAttemptId, "p4_sync", { targets: p4Targets, output: syncEvidence, client: this.config.p4.client || null });
         } catch (error) {
           if (error instanceof P4SyncTimeoutError) {
             throw new WorkspaceBlockedError(
@@ -1335,6 +1397,12 @@ export class Worker {
           bug.id,
         );
       }
+      behaviorChecks = await prepareBehaviorChecks(repo.behavior_checks || [], repo.path, investigation.planned_files, this.cancelEvent);
+      if (this.cancelEvent.cancelled) throw new AgentCancelledError("行为测试已取消");
+      this.store.audit.event(auditAttemptId, "behavior_baseline", {
+        checks: behaviorChecks,
+      });
+      this.store.audit.event(auditAttemptId, "source_baseline", { files: sourceEvidence(investigation.planned_files, workspaceRoots) });
       const prompt = withPreopenedP4Files(buildImplementationPrompt({
         bug,
         repoName: repo.name,
@@ -1346,6 +1414,11 @@ export class Worker {
         unrealMcpEnabled: resourceMcpEnabled,
         workspaceRoots,
       }));
+      this.store.audit.event(auditAttemptId, "implementation_input", {
+        prompt_hash: evidenceHash(prompt), investigation,
+        git_bases: gitAttempts.map(a => ({ root: a.config.name, commit: a.session.baseCommit })),
+        verification_commands: this.verificationCommands(repo, investigation.planned_files),
+      });
       this.store.addEvent(
         retryText
           ? `调用编码 Agent（pi）（第 ${attempts} 次尝试，注入上次失败证据）`
@@ -1376,6 +1449,7 @@ export class Worker {
         onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
         onFileWrite: (file?: string) =>
           this.recordWriteIntent(bug.id, p4!, investigation.planned_files, file),
+        onAudit: (event: Record<string, unknown>) => this.store.audit.event(auditAttemptId, "agent", { phase: "implementation", ...event }),
         cancelEvent: this.cancelEvent,
         media: implementationMedia,
         searchPaths,
@@ -1507,6 +1581,8 @@ export class Worker {
           verified = await this.verifyCandidate(
             p4, repo, gitAttempts, opened, investigation.planned_files,
             [...result.changed_files, ...this.lastAttemptFiles(bug.id)],
+            auditAttemptId,
+            behaviorChecks,
           );
         } catch (error) {
           if (workspaceChangesTakenOver) {
@@ -1573,6 +1649,7 @@ export class Worker {
               mcpServers: resourceMcpServers,
               requiredMcpServers: resourceMcpServers,
               onProgress: (msg: string) => this.store.addEvent(msg, "debug", bug.id),
+              onAudit: (event: Record<string, unknown>) => this.store.audit.event(auditAttemptId, "agent", { phase: "correction", ...event }),
               onFileWrite: (file?: string) =>
                 this.recordWriteIntent(bug.id, p4!, investigation.planned_files, file),
               cancelEvent: this.cancelEvent,
@@ -1614,6 +1691,8 @@ export class Worker {
             verified = await this.verifyCandidate(
               p4, repo, gitAttempts, null, investigation.planned_files,
               [...result.changed_files, ...this.lastAttemptFiles(bug.id)],
+              auditAttemptId,
+              behaviorChecks,
             );
             opened = verified.opened;
             result.changed_files = [
@@ -1708,6 +1787,14 @@ export class Worker {
         last_attempt_files: null,
         finished_at: nowStr(),
       });
+      const delivered = this.store.getJob(bug.id)!;
+      const verification = loads<Record<string, unknown>>(delivered.verification as string, {});
+      if (hasCodeChanges(result)) this.store.audit.candidate(auditAttemptId, {
+        diff: String(verification.diff || ""), files: result.changed_files,
+        delivery: state === "candidate_partial" ? "partial" : "complete",
+        evidence: { verification, review: loads(delivered.review_findings as string, {}),
+          investigation, changelist: cl, git_results: gitResults, manual_assets: result.manual_assets },
+      });
 
       // ---- Tapd 回写 ----
       await this.notifyTapd(bug, state, cl, result, gitResults);
@@ -1719,6 +1806,20 @@ export class Worker {
         bug.id,
       );
     } catch (exc) {
+      if (p4 && activeRepo && ["implementation", "verification", "review"].includes(phase)
+        && !this.store.audit.attempts(bug.id).find(a=>a.attempt_id===auditAttemptId)?.events.some(e=>e.kind==="patch")) {
+        try {
+          const capture = p4.forkForCleanup();
+          const files = await capture.opened("default", true);
+          const diffs = files.length ? [await capture.candidateDiff(files)] : [];
+          const names = files.map(f=>`project:${f.depot}`);
+          for (const git of gitAttempts) {
+            diffs.push(await git.workspace.diff(git.session.baseCommit));
+            names.push(...(await git.workspace.changedFiles(git.session.baseCommit)).map(f=>`${git.config.name}:${f}`));
+          }
+          if (hasPatchEvidence(diffs.join("\n"))) this.store.audit.event(auditAttemptId,"patch",{diff:diffs.join("\n"),files:names});
+        } catch (captureError) { this.store.audit.event(auditAttemptId,"patch_capture_failed",{reason:String(captureError)}); }
+      }
       if (p4 && orchestratorOpenedTargets.length) {
         try {
           await p4.forkForCleanup().revertUnchanged(orchestratorOpenedTargets);
@@ -1784,6 +1885,28 @@ export class Worker {
           ) : undefined,
         });
       }
+    } finally {
+      const job = this.store.getJob(bug.id) || {};
+      const snapshot = this.store.audit.attempts(bug.id).find(a => a.attempt_id === auditAttemptId)!;
+      const verification = loads<Record<string, unknown>>(job.verification as string, {});
+      const patch = snapshot.events.filter(e => e.kind === "patch").at(-1)?.payload;
+      // Preserve failed candidates without passing them off as completed deliveries.
+      if (!this.store.audit.candidates(bug.id).some(c => c.attempt_id === auditAttemptId) && patch) {
+        try {
+          this.store.audit.candidate(auditAttemptId, {
+            diff: String(patch.diff || ""), files: patch.files as string[], delivery: "partial",
+            evidence: { verification, review: loads(job.review_findings as string, {}),
+              investigation: investigationCheckpoint, failure: job.failure_reason, phase },
+          });
+        } catch (error) {
+          this.store.audit.event(auditAttemptId, "candidate_unavailable", { reason: String(error) });
+        }
+      }
+      this.store.audit.event(auditAttemptId, "finished", {
+        state: job.agent_state, phase, failure: job.failure_reason,
+        investigation: investigationCheckpoint, verification,
+        review: loads(job.review_findings as string, {}),
+      });
     }
   }
 
@@ -2089,6 +2212,9 @@ export class Worker {
     const job = this.store.getJob(bugId);
     if (!bug && !job) return null;
     const detail: Record<string, unknown> = bug ? this.jobRow(bug, true) : {};
+    detail.repair_attempts = this.store.audit.attempts(bugId);
+    detail.repair_candidates = this.store.audit.candidates(bugId);
+    detail.candidate_feedback = this.store.audit.feedback(bugId);
     if (job) {
       Object.assign(detail, job); // 本地处理字段优先（files 等保持 JSON 字符串，前端自行 parse）
       detail.bug_id = String(detail.bug_id);
@@ -2201,6 +2327,7 @@ export class Worker {
         continue;
       }
       this.store.upsertJob(bug, { agent_state: "pending" });
+      this.store.audit.enroll({ bug_id: bug.id, workspace_id: bug.workspace_id, input: buildBugContext(bug), metadata: {} });
       synced += 1;
     }
     this.store.addEvent(

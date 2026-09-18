@@ -1,3 +1,4 @@
+import { contractFixture } from "./contractFixture.js";
 /** 核心逻辑测试（纯本地，无网络/p4 依赖）——由 tests/test_core.py 移植。 */
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import fs from "node:fs";
@@ -124,7 +125,7 @@ function makeResult(over: Partial<AgentResult> = {}): AgentResult {
 
 function makeInvestigation(file: string): AgentResult {
   return makeResult({
-    raw_output: `FINAL_RESULT: {"root_cause":"测试根因","evidence":["[观察] ${file}:1","[推断] 根因由该观察事实支持"],"reproduction":{"command":"","before":"复现失败"},"planned_files":["${file}"],"confidence":0.9,"blocked_reasons":[]}`,
+    raw_output: `FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"测试根因","evidence":["[观察] ${file}:1","[推断] 根因由该观察事实支持"],"reproduction":{"command":"","before":"复现失败"},"planned_files":["${file}"],"confidence":0.9,"blocked_reasons":[]}`,
   });
 }
 
@@ -900,7 +901,7 @@ describe("state", () => {
     }
   });
 
-  it("旧数据库 schema 直接报错，开发阶段不做自动迁移", () => {
+  it("旧数据库 schema 拒绝启动且不修改原表", () => {
     const d = tmpdir();
     const p = path.join(d, "old.db");
     const conn = new Database(p);
@@ -916,7 +917,11 @@ describe("state", () => {
                CREATE INDEX idx_jobs_state ON jobs(agent_state);
                CREATE INDEX idx_events_bug ON events(bug_id);`);
     conn.close();
-    expect(() => new StateStore(p)).toThrow(/数据库 schema 不匹配.*删除.*重建/);
+    expect(() => new StateStore(p)).toThrow("开发阶段不自动迁移");
+    const unchanged = new Database(p, { readonly: true });
+    expect((unchanged.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).some(c => c.name === "model")).toBe(false);
+    expect(unchanged.prepare("SELECT name FROM sqlite_master WHERE name='repair_attempts'").get()).toBeUndefined();
+    unchanged.close();
   });
 
   it("记录人工接受、修改、拒绝和 reopen，并计算真实准确率指标", () => {
@@ -928,25 +933,35 @@ describe("state", () => {
     store.upsertJob(modified, { agent_state: "review_pending", changelist: 102 });
     store.upsertJob(rejected, { agent_state: "review_pending", changelist: 103 });
 
+    const candidateIds = new Map([accepted, modified, rejected].map(bug => {
+      const attempt = store.audit.begin({ bug_id: bug.id, workspace_id: bug.workspace_id, input: bug, metadata: {} });
+      const candidate = store.audit.candidate(attempt, { diff: "-bad\n+fixed\n", files: ["a.ts"], delivery: "complete", evidence: {} });
+      store.audit.event(attempt, "finished", { state: "review_pending" });
+      return [bug.id, candidate];
+    }));
     store.recordFeedback(accepted.id, {
+      candidate_id: candidateIds.get(accepted.id)!,
       outcome: "accepted_unchanged",
       reason: "原样提交",
       human_changed_lines: 0,
       submitted_changelist: 101,
     });
     store.recordFeedback(modified.id, {
+      candidate_id: candidateIds.get(modified.id)!,
       outcome: "accepted_modified",
       reason: "补了一个边界判断",
       human_changed_lines: 4,
       submitted_changelist: 202,
     });
     store.recordFeedback(rejected.id, {
+      candidate_id: candidateIds.get(rejected.id)!,
       outcome: "rejected_wrong_root_cause",
       reason: "根因判断错误",
       human_changed_lines: 0,
       submitted_changelist: null,
     });
     store.recordFeedback(accepted.id, {
+      candidate_id: candidateIds.get(accepted.id)!,
       outcome: "reopened",
       reason: "线上再次复现",
       human_changed_lines: 0,
@@ -956,12 +971,14 @@ describe("state", () => {
     expect(store.getJob(accepted.id)?.agent_state).toBe("reopened");
     expect(store.getJob(modified.id)?.agent_state).toBe("accepted_modified");
     expect(store.getJob(rejected.id)?.agent_state).toBe("rejected");
-    const metrics = store.qualityMetrics();
+    const metrics = store.qualityMetrics().candidates;
+    expect(store.listHistoricalFeedback()).toEqual([]);
+    expect(store.qualityMetrics().historical.reviewed).toBe(0);
     expect(metrics.reviewed).toBe(3);
     expect(metrics.accepted_unchanged).toBe(1);
     expect(metrics.accepted_modified).toBe(1);
     expect(metrics.rejected).toBe(1);
-    expect(metrics.reopened).toBe(1);
+    expect(metrics.reopened_candidates).toBe(1);
     expect(metrics.candidate_precision).toBeCloseTo(2 / 3);
     expect(metrics.unchanged_acceptance_rate).toBeCloseTo(1 / 3);
   });
@@ -972,6 +989,7 @@ describe("state", () => {
     store.upsertJob(bug, { agent_state: "review_pending" });
 
     expect(() => store.recordFeedback(bug.id, {
+      candidate_id: "",
       outcome: "looks_good" as never,
       reason: "",
       human_changed_lines: 0,
@@ -1301,6 +1319,7 @@ describe("p4", () => {
 describe("planned_files 工作区校验", () => {
   const investigation = (file: string, evidence: string[] = ["[观察] 文件定位", "[推断] 根因"]): any => ({
     ok: true,
+    repair_contract: contractFixture,
     root_cause: "测试根因",
     evidence,
     reproduction: { command: "", before: "失败" },
@@ -1462,6 +1481,7 @@ describe("agent parsing", () => {
 
   it("结构化输出为纯调查 JSON 时也可提取", () => {
     const text = JSON.stringify({
+      repair_contract: contractFixture,
       root_cause: "缓存失效后仍解引用旧对象",
       evidence: ["[观察] project:Login.ts:42", "[推断] 旧对象为空导致崩溃"],
       reproduction: { command: "npm test -- login", before: "FAIL" },
@@ -1530,7 +1550,7 @@ describe("agent parsing", () => {
   });
 
   it("Pi provider 报错时不从 user prompt 回显解析 FINAL_RESULT 示例", () => {
-    const prompt = 'FINAL_RESULT: {"root_cause":"根因","planned_files":["project:相对路径"]}';
+    const prompt = 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"根因","planned_files":["project:相对路径"]}';
     const lines = [
       JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: prompt }] } }),
       JSON.stringify({
@@ -1652,7 +1672,7 @@ describe("PiAgent 子进程控制", () => {
     fs.writeFileSync(script, `console.log(JSON.stringify({
       type: "agent_end",
       messages: [
-        { role: "user", content: [{ type: "text", text: 'FINAL_RESULT: {"root_cause":"根因"}' }] },
+        { role: "user", content: [{ type: "text", text: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"根因"}' }] },
         { role: "assistant", content: [], stopReason: "error", errorMessage: "max_tokens 参数非法" },
       ],
     }));`);
@@ -2295,7 +2315,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
         ? dumps([{ attempt: 1, at: "2026-08-11 09:00:00", failure_reason: "x", opened_files: [], agent_summary: "", manual_assets: [] }])
         : null);
       expect(job?.admission_score).toBeNull();
-      expect(job?.investigation).toBe(job?.bug_id === a.id ? '{"root_cause":"旧根因"}' : null);
+      expect(job?.investigation).toBe(job?.bug_id === a.id ? JSON.stringify({root_cause: "旧根因"}) : null);
       expect(job?.verification).toBeNull();
       expect(job?.review_findings).toBeNull();
       expect(job?.finished_at).toBeNull();
@@ -2315,7 +2335,11 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     stubMyBugs(w, [live1, live2]);
     w.store.upsertJob(live1, { agent_state: "accepted", changelist: 777 }); // 人工结论保留
     w.store.upsertJob(gone, { agent_state: "failed" });
+    const attempt = w.store.audit.begin({ bug_id: live1.id, workspace_id: live1.workspace_id, input: live1, metadata: {} });
+    const candidate = w.store.audit.candidate(attempt, { diff: "-bad\n+fixed\n", files: ["a.ts"], delivery: "complete", evidence: {} });
+    w.store.audit.event(attempt, "finished", { state: "review_pending" });
     w.store.recordFeedback(live1.id, {
+      candidate_id: candidate,
       outcome: "accepted_unchanged",
       reason: "人工确认正确",
       human_changed_lines: 0,
@@ -2340,8 +2364,8 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
     const evs = w.store.listEvents(undefined, 10);
     expect(evs.some((e) => String(e.msg).includes("重新同步"))).toBe(true);
     expect(evs.some((e) => String(e.msg) === "旧事件")).toBe(true);
-    expect(w.store.listFeedback(live1.id)).toHaveLength(1); // 质量标签不是队列缓存，必须长期保留
-    expect(w.store.qualityMetrics().accepted_unchanged).toBe(1);
+    expect(w.store.audit.feedback(live1.id)).toHaveLength(1); // 质量标签不是队列缓存，必须长期保留
+    expect(w.store.qualityMetrics().candidates.accepted_unchanged).toBe(1);
   });
 
   it("resyncFromTapd 运行态拒绝（非运行才可用，后端同 UI 一道闸）", async () => {
@@ -2834,7 +2858,7 @@ describe("worker 两阶段修复协议", () => {
       .mockResolvedValueOnce([])
       .mockResolvedValue([{ depot: "//depot/Content/UI/Test.prefab", action: "edit", changelist: "default", type: "binary" }]);
     vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
-    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("Binary files old and new differ");
     vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
 
     await w.processBug(bug);
@@ -2895,7 +2919,7 @@ describe("worker 两阶段修复协议", () => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"root_cause":"空引用来自缓存失效","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+          raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"空引用来自缓存失效","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
         });
       }
       return makeResult({ changed_files: ["Login.ts"], summary: "修复缓存失效" });
@@ -2959,7 +2983,7 @@ describe("worker 两阶段修复协议", () => {
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
     const run = vi.spyOn(PiAgent.prototype, "run")
-      .mockResolvedValueOnce(makeResult({ raw_output: 'FINAL_RESULT: {"root_cause":"尚需核对","evidence":["[观察] Map.ts:12"],"planned_files":[],"blocked_reasons":["未读取标记创建调用者"]}' }))
+      .mockResolvedValueOnce(makeResult({ raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"尚需核对","evidence":["[观察] Map.ts:12"],"planned_files":[],"blocked_reasons":["未读取标记创建调用者"]}' }))
       .mockRejectedValueOnce(new AgentTimeoutError("Agent 调用超时(180s): pi", "MapMarkManager.ts:712 已读取"));
     await w.processBug(bug);
     expect(run.mock.calls[1][0].maxCommandExecutions).toBe(Number.POSITIVE_INFINITY);
@@ -3155,6 +3179,7 @@ describe("worker 两阶段修复协议", () => {
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
     const incomplete = makeResult({ raw_output: JSON.stringify({
+      repair_contract: contractFixture,
       root_cause: "", evidence: ["[观察] Map.ts:40 enterPlacement()"], planned_files: [],
       blocked_reasons: ["未证实边缘点击 OnClick 是否调用 enterPlacement"],
     }) });
@@ -3285,7 +3310,7 @@ describe("worker 两阶段修复协议", () => {
       .mockResolvedValueOnce(makeInvestigation("Login.ts"))
       .mockRejectedValueOnce(new AgentTimeoutError("超时", "没有 FINAL_RESULT，但文件已修改", true))
       .mockResolvedValueOnce(makeResult({ raw_output: JSON.stringify({
-        approved, note: "已检查", findings: approved ? [] : [{
+        approved, requirement_match: approved ? "pass" : "fail", behavioral_evidence: "static_only", reuse_and_lifecycle: "pass", unverified_items: [], note: "已检查", findings: approved ? [] : [{
           severity: "high", title: "仍有回归", file: "Login.ts", line: 1,
           evidence: "空值路径未保护", required_change: "修复空值路径",
         }],
@@ -3423,7 +3448,7 @@ describe("worker 两阶段修复协议", () => {
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({
-      raw_output: 'FINAL_RESULT: {"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":["无法根据标题、描述及现有代码定位问题"]}',
+      raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":["无法根据标题、描述及现有代码定位问题"]}',
     }));
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
 
@@ -3445,7 +3470,7 @@ describe("worker 两阶段修复协议", () => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+          raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"空引用","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
         });
       }
       return makeResult({ changed_files: ["Login.ts"], summary: "修复空引用" });
@@ -3475,7 +3500,7 @@ describe("worker 两阶段修复协议", () => {
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     vi.spyOn(PiAgent.prototype, "run")
       .mockResolvedValueOnce(makeResult({
-        raw_output: 'FINAL_RESULT: {"root_cause":"空引用","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
+        raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"空引用","evidence":["[观察] Login.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- login","before":"FAIL"},"planned_files":["Login.ts"],"confidence":0.9,"blocked_reasons":[]}',
       }))
       .mockResolvedValueOnce(makeResult({ changed_files: ["Login.ts"], summary: "修复空引用" }));
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
@@ -3541,7 +3566,7 @@ describe("worker 两阶段修复协议", () => {
       calls.push(opts as unknown as Record<string, unknown>);
       if (calls.length === 1) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
+          raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
         });
       }
       if (calls.length === 2) {
@@ -3553,11 +3578,11 @@ describe("worker 两阶段修复协议", () => {
       }
       if (calls.length === 3) {
         return makeResult({
-          raw_output: 'FINAL_RESULT: {"approved":false,"note":"错误路径遗漏","findings":[{"severity":"high","title":"失败时仍显示成功","file":"Settings.ts","line":50,"evidence":"catch 分支仍调用 showSuccess","required_action":"失败分支必须显示错误并返回"}]}',
+          raw_output: 'FINAL_RESULT: {"approved":false,"requirement_match":"fail","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"note":"错误路径遗漏","findings":[{"severity":"high","title":"失败时仍显示成功","file":"Settings.ts","line":50,"evidence":"catch 分支仍调用 showSuccess","required_action":"失败分支必须显示错误并返回"}]}',
         });
       }
       if (calls.length === 4) return makeResult({ changed_files: ["Settings.ts"], summary: "补齐失败路径" });
-      return makeResult({ raw_output: 'FINAL_RESULT: {"approved":true,"note":"问题已修复","findings":[]}' });
+      return makeResult({ raw_output: 'FINAL_RESULT: {"approved":true,"requirement_match":"pass","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"note":"问题已修复","findings":[]}' });
     });
     vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "edit").mockResolvedValue("");
@@ -3891,6 +3916,7 @@ describe("worker 自动重试", () => {
     vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
     vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4321);
 
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- old\n+++ new\n-old\n+fixed");
     await w.processBug(bug);
     expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
     expect(comments).toHaveLength(1);
@@ -3937,6 +3963,7 @@ describe("worker 自动重试", () => {
       },
     );
 
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- old\n+++ new\n-old\n+fixed");
     await w.processBug(bug);
     const job = w.store.getJob(bug.id);
     expect(job?.agent_state).toBe("candidate");
@@ -3983,6 +4010,7 @@ describe("worker 自动重试", () => {
       },
     );
 
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- old\n+++ new\n-old\n+fixed");
     await w.processBug(bug);
     const job = w.store.getJob(bug.id);
     expect(job?.agent_state).toBe("candidate");

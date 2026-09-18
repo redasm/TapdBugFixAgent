@@ -7,6 +7,7 @@ export interface InvestigationProgress {
   findings: string[];
   open_questions: string[];
   trace: string;
+  repair_contract?: InvestigationResult["repair_contract"];
 }
 
 /** Preserve the entry point and the most recent work without duplicating retry prompts. */
@@ -24,7 +25,7 @@ export function captureInvestigationProgress(
   const unique = (items: string[], count: number) => [...new Set(items.filter(Boolean))].slice(-count);
   const calls = trace.split(/\r?\n/).filter((line) => /^工具 .+?:/.test(line)).map((line) => line.slice(0, 1000));
   const newQuestions = [...result.blocked_reasons, ...result.validation_errors];
-  const hasSpecificGap = newQuestions.some((question) => !question.startsWith("调查结果缺少") && !question.startsWith("调查证据缺少"));
+  const hasSpecificGap = newQuestions.some((question) => /^(调查证据尚未收敛|业务条件尚未确认)/.test(question));
   const questions = result.ok ? [] : hasSpecificGap ? newQuestions : [...(previous?.open_questions ?? []), ...newQuestions];
   const previousTrace = previous?.trace ?? "";
   const combinedTrace = previousTrace && trace && !trace.includes(previousTrace)
@@ -35,5 +36,6 @@ export function captureInvestigationProgress(
     findings: unique([...(previous?.findings ?? []), ...result.evidence], 20).map((line) => line.slice(0, 1500)),
     open_questions: unique(questions, 15).map((line) => line.slice(0, 1500)),
     trace: compactInvestigationTrace(combinedTrace.trim()),
+    repair_contract: result.repair_contract.acceptance_cases.length ? result.repair_contract : previous?.repair_contract,
   };
 }

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 
 import type { AdmissionPolicy } from "./quality.js";
+import type { BehaviorCheckConfig } from "./behaviorChecks.js";
 import {
   mcpServerConfigProblems,
   parseMcpServers,
@@ -29,6 +30,8 @@ export interface RepoConfig {
   path: string;
   /** 按顺序执行的机器验证命令。 */
   verify_cmds: string[];
+  /** Agent 之外保存的行为测试脚本；修改前冻结并运行，修改后重跑同一份。 */
+  behavior_checks?: BehaviorCheckConfig[];
   /** P4 工作区中允许保留的本地生成路径；不参与脏检查、reconcile、diff 或 changelist。 */
   ignore_paths?: string[];
   /** 启动前全目录脏扫描频率；大型专用 Agent 工作区推荐 never。 */
@@ -243,7 +246,7 @@ export function loadEnvFile(envPath?: string): void {
   }
 }
 
-function buildRepos(data: unknown): RepoConfig[] {
+function buildRepos(data: unknown, configDir: string): RepoConfig[] {
   const repos: RepoConfig[] = [];
   for (const item of Array.isArray(data) ? data : []) {
     if (!item || typeof item !== "object") continue;
@@ -259,12 +262,30 @@ function buildRepos(data: unknown): RepoConfig[] {
       name: String(d.name ?? ""),
       path: String(d.path ?? ""),
       verify_cmds: verifyCmds,
+      behavior_checks: parseBehaviorConfig(d.behavior_checks, configDir),
       ignore_paths: ignorePaths,
       preflight_reconcile: preflightReconcile as RepoConfig["preflight_reconcile"],
       additional_dirs: buildAdditionalDirs(d.additional_dirs),
     });
   }
   return repos;
+}
+
+function parseBehaviorConfig(value: unknown, configDir: string): BehaviorCheckConfig[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("behavior_checks 必须是数组");
+  const names = new Set<string>();
+  return value.map(raw => {
+    if (!raw || typeof raw !== "object" || typeof raw.name !== "string" || !raw.name.trim()
+      || names.has(raw.name) || typeof raw.suite !== "string" || !raw.suite.trim()
+      || !Array.isArray(raw.files) || !raw.files.length || raw.files.some((f: unknown) => typeof f !== "string" || !f || f.includes("..") || path.isAbsolute(f) || f.includes(":"))) throw new Error("行为测试须有唯一名称、suite 和仓库相对文件路径");
+    const timeout = Number(raw.timeout_sec ?? 30);
+    if (!Number.isFinite(timeout) || timeout < 1 || timeout > 300) throw new Error("行为测试 timeout_sec 须为 1–300 秒");
+    names.add(raw.name);
+    const suite = path.resolve(configDir, raw.suite);
+    if (!fs.existsSync(suite) || !fs.statSync(suite).isFile()) throw new Error(`行为测试脚本不存在: ${suite}`);
+    return { name: raw.name, suite, files: raw.files, timeout_sec: timeout };
+  });
 }
 
 function buildAdditionalDirs(data: unknown): AdditionalDirConfig[] {
@@ -405,7 +426,7 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
     cfg.workspaces.push({
       workspace_id: String(w.workspace_id ?? ""),
       owner: String(w.owner ?? ""),
-      repos: buildRepos(w.repos),
+      repos: buildRepos(w.repos, path.dirname(path.resolve(p))),
       default_repo: String(w.default_repo ?? ""),
     });
   }

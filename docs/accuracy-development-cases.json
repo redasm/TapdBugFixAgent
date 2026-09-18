@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "frozen_at": "2026-09-18T00:00:00.000Z",
+  "limitations": [
+    "Historical development cases, not an unseen test set.",
+    "Missing exact source/resource revisions and final patches; label analysis only.",
+    "Publication copy: case identifiers and descriptions are anonymized; timestamps are day-level. Input hashes cover sanitized summaries only. Outcomes and line-count semantics are preserved."
+  ],
+  "cases": [
+    {
+      "bug_id": "case-01",
+      "group": "case-01",
+      "split": "development",
+      "input_hash": "c7ecf68028f2e20bb287a2b075f50b4fa252fbe8e12e88c584e4e9aba1816c2e",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-03T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "地图标记创建条件异常",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-02",
+      "group": "case-02",
+      "split": "development",
+      "input_hash": "6d2cb649d919367d947bfd459ee21dc12530306eed469f9a01124ff71e57f02b",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-07T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "删除交互对象后控件状态未恢复",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-03",
+      "group": "case-03",
+      "split": "development",
+      "input_hash": "4af387bcb5f5f138898e380161f6a2ffe8694691eb79fdd3f34f57167ce18ced",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-07T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "配置删除后列表展示不一致",
+      "outcome": "rejected_wrong_location",
+      "reason": "记录称没有实际修改，需复核标签",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": [
+        "label_reason_mismatch_no_patch"
+      ]
+    },
+    {
+      "bug_id": "case-04",
+      "group": "case-04",
+      "split": "development",
+      "input_hash": "cba374975edb13d80819ff1479d09e670762df46d94fe6a2cfc776c934a0d3d8",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-07T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "缩放中心与预期不一致",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-05",
+      "group": "case-05",
+      "split": "development",
+      "input_hash": "2ec24384f833db99ba29ddf48be40ed278d69972d6af64d46935a4719d471d35",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-07T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "追踪状态切换时异常",
+      "outcome": "rejected_wrong_root_cause",
+      "reason": "保留数据创建职责，由显示层控制可见性",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-06",
+      "group": "case-06",
+      "split": "development",
+      "input_hash": "c82b0eecf6d69ff9c456f47e781af44c09fc540ba4f3c05e1d8601e1c049baf1",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-07T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "申请列表清理延迟",
+      "outcome": "rejected_wrong_location",
+      "reason": "点击后立即移除条目，回包后按实际数据刷新",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-07",
+      "group": "case-07",
+      "split": "development",
+      "input_hash": "2628127c605d4ec041fb93b474d8c0193f9225c5ddf4782f334ab62e84fe2e4a",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-08T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "列表缺少悬浮反馈",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-08",
+      "group": "case-08",
+      "split": "development",
+      "input_hash": "e70dc01c74c94bb24a93b0520b0e07165da2966ba344bef6392e74b2ef8131ff",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-08T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "地图不可用时缺少提示",
+      "outcome": "rejected_no_effect",
+      "reason": "用目标功能的专属配置判断是否可用",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-09",
+      "group": "case-09",
+      "split": "development",
+      "input_hash": "7420a135910a0c7fb4902828263325d252143f3f78dfb96f07ee63f3c6ba6370",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-08T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "申请筛选功能遗漏",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-10",
+      "group": "case-10",
+      "split": "development",
+      "input_hash": "8bd49784f6faa4713fb1157ff9f427cbe229617861d8a9dbc94b945781b94d8d",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-16T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "操作完成后页面未关闭",
+      "outcome": "accepted_modified",
+      "reason": "复用父视图的关闭链，移除重复关闭",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-11",
+      "group": "case-11",
+      "split": "development",
+      "input_hash": "1f446e77e1373a31f6a5ac92c38a85ad3608db70e2359e5ca7690642f9c3f414",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-16T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "边缘弹窗超出可视区域",
+      "outcome": "accepted_modified",
+      "reason": "将重复的视口适配逻辑抽成公共接口",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-12",
+      "group": "case-12",
+      "split": "development",
+      "input_hash": "a3955d0fb731ac6ac820bdbbace32367691fc10b14414d6064abbc85f7652985",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-17T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "流程结束后遮罩状态残留",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-13",
+      "group": "case-13",
+      "split": "development",
+      "input_hash": "ccc1364ae4218aff7036008d1e5414d1142f89b96c879b9f4a3c10ad204560b7",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-17T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "跨区域操作提示缺失",
+      "outcome": "accepted_modified",
+      "reason": "比较业务标识，不以资源路径替代业务标识",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    },
+    {
+      "bug_id": "case-14",
+      "group": "case-14",
+      "split": "development",
+      "input_hash": "69900a70663bcaf1b85fe5064610e080cf2bd2237cf6501b8facb53a8bb284e9",
+      "input_scope": "sanitized summary only; not original title or complete replay input",
+      "captured_at": "2026-09-18T00:00:00.000Z",
+      "replay": {
+        "status": "label_only"
+      },
+      "title": "引导超时后界面状态未恢复",
+      "outcome": "accepted_unchanged",
+      "reason": "原样通过",
+      "human_changed_lines": "0",
+      "legacy_human_changed_lines": "0",
+      "review_flags": []
+    }
+  ]
+}

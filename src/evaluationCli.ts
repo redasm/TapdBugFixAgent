@@ -1,38 +1,18 @@
-/** JSONL 文件适配器：让历史 Bug 数据集可在 CI 中重复比较不同模型/Prompt。 */
-
+/** 冻结 JSON 数据集与 JSONL 配对试验的唯一文件入口。 */
 import fs from "node:fs";
-
-import {
-  compareEvaluationRuns,
-  evaluateRun,
-  type EvaluationCandidate,
-  type EvaluationCase,
-  type EvaluationReport,
-} from "./evaluation.js";
+import { comparePairedTrials, validateEvaluationDataset, type EvaluationDataset, type PairedTrial } from "./evaluationDataset.js";
 
 const readJsonLines = <T>(filePath: string): T[] => {
-  const text = fs.readFileSync(filePath, "utf-8");
-  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line, index) => {
+  const rows: T[] = [];
+  fs.readFileSync(filePath, "utf8").split(/\r?\n/).forEach((line, index) => {
+    if (!line.trim()) return;
     try {
-      return JSON.parse(line) as T;
+      rows.push(JSON.parse(line) as T);
     } catch (exc) {
       throw new Error(`${filePath}:${index + 1} 不是有效 JSON: ${(exc as Error).message}`);
     }
   });
-};
-
-export const evaluateFiles = (
-  datasetPath: string,
-  runs: Array<{ name: string; path: string }>,
-): EvaluationReport[] => {
-  const cases = readJsonLines<EvaluationCase>(datasetPath);
-  if (!cases.length) throw new Error("评测数据集为空");
-  const reports = runs.map((run) => evaluateRun(
-    cases,
-    readJsonLines<EvaluationCandidate>(run.path),
-    run.name,
-  ));
-  return compareEvaluationRuns(reports);
+  return rows;
 };
 
 export const parseRunSpec = (value: string): { name: string; path: string } => {
@@ -42,3 +22,20 @@ export const parseRunSpec = (value: string): { name: string; path: string } => {
   }
   return { name: value.slice(0, equals), path: value.slice(equals + 1) };
 };
+
+export function evaluateFiles(datasetPath: string, runs: Array<{ name: string; path: string }>) {
+  const dataset = JSON.parse(fs.readFileSync(datasetPath, "utf8")) as EvaluationDataset;
+  validateEvaluationDataset(dataset);
+  if (!runs.length) {
+    return { valid: true, cases: dataset.cases.length, ready: dataset.cases.filter(c => c.replay.status === "ready").length };
+  }
+  if (runs.some(run => !run.name.trim()) || new Set(runs.map(run => run.name)).size !== runs.length) {
+    throw new Error("试验组名称必须非空且唯一");
+  }
+  const trials = runs.flatMap(run => {
+    const rows = readJsonLines<PairedTrial>(run.path);
+    if (!rows.length) throw new Error(`试验组 ${run.name} 结果为空，无法进行配对比较`);
+    return rows.map(trial => ({ ...trial, run: run.name }));
+  });
+  return comparePairedTrials(dataset, trials);
+}

@@ -1,3 +1,4 @@
+import { contractFixture } from "./contractFixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -416,6 +417,7 @@ describe("two-stage repair workflow", () => {
   it("外部诊断链接读取失败不覆盖已有代码定位结果", () => {
     const url = "https://crashsight.qq.com/crash-reporting/crashes/app/issue/report";
     const base = {
+      repair_contract: contractFixture,
       root_cause: "空指针",
       evidence: ["[观察] Source/Foo.cpp:42 解引用为空", "[推断] 空指针导致崩溃"],
       reproduction: { command: "", before: "EXCEPTION_ACCESS_VIOLATION_READ" },
@@ -452,9 +454,9 @@ describe("two-stage repair workflow", () => {
   });
 
   it("解析调查结果时拒绝没有根因或证据的乐观结论", () => {
-    const invalid = parseInvestigation('FINAL_RESULT: {"root_cause":"猜测","evidence":[],"confidence":0.9}');
+    const invalid = parseInvestigation('FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"猜测","evidence":[],"confidence":0.9}');
     const valid = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42 立即显示成功","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts","tests/settings.test.ts"],"confidence":0.86,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42 立即显示成功","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts","tests/settings.test.ts"],"confidence":0.86,"blocked_reasons":[]}',
     );
 
     expect(invalid.ok).toBe(false);
@@ -464,10 +466,10 @@ describe("two-stage repair workflow", () => {
 
   it("调查协议拒绝未分类证据和不安全的计划路径", () => {
     const unclassified = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["Settings.ts:42"],"reproduction":{"before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["Settings.ts:42"],"reproduction":{"before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
     );
     const unsafePath = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 请求未等待"],"reproduction":{"before":"FAIL"},"planned_files":["../outside.ts"],"confidence":0.9,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 请求未等待"],"reproduction":{"before":"FAIL"},"planned_files":["../outside.ts"],"confidence":0.9,"blocked_reasons":[]}',
     );
 
     expect(unclassified.ok).toBe(false);
@@ -478,7 +480,7 @@ describe("two-stage repair workflow", () => {
 
   it("实施 Prompt 携带调查结论、限制范围并强制回归验证", () => {
     const investigation = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts","tests/settings.test.ts"],"confidence":0.86,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts","tests/settings.test.ts"],"confidence":0.86,"blocked_reasons":[]}',
     );
     const prompt = buildImplementationPrompt({
       bug: makeBug(),
@@ -506,7 +508,7 @@ describe("two-stage repair workflow", () => {
 
   it("实施 Prompt 定义完成标准、编辑前校验和诚实的分层验证", () => {
     const investigation = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts","tests/settings.test.ts"],"confidence":0.86,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts","tests/settings.test.ts"],"confidence":0.86,"blocked_reasons":[]}',
     );
     const prompt = buildImplementationPrompt({
       bug: makeBug(),
@@ -530,7 +532,7 @@ describe("two-stage repair workflow", () => {
 
   it("资源实施启用 MCP 后要求通过 MCP 修改并回读验证", () => {
     const investigation = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"Prefab 属性错误","evidence":["[观察] MCP 节点属性不匹配","[推断] 属性错误导致显示异常"],"reproduction":{"before":"截图中节点消失"},"planned_files":["Content/UI/Test.prefab"],"confidence":0.86,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"Prefab 属性错误","evidence":["[观察] MCP 节点属性不匹配","[推断] 属性错误导致显示异常"],"reproduction":{"before":"截图中节点消失"},"planned_files":["Content/UI/Test.prefab"],"confidence":0.86,"blocked_reasons":[]}',
     );
     const prompt = buildImplementationPrompt({
       bug: makeBug(), repoName: "app", repoPath: "C:\\repo", verifyCommands: [],
@@ -546,7 +548,7 @@ describe("two-stage repair workflow", () => {
 
   it("修复守则覆盖根因、重试、状态机、缓存、协议与边界风险", () => {
     const investigation = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.86,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.86,"blocked_reasons":[]}',
     );
     const prompt = buildImplementationPrompt({
       bug: makeBug(), repoName: "app", repoPath: "C:\\repo", verifyCommands: [],
@@ -615,7 +617,7 @@ describe("strict verification pipeline", () => {
 describe("independent read-only review", () => {
   it("评审 Prompt 包含完整目标、根因、验证证据和 diff，并明确禁止修改", () => {
     const investigation = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
     );
     const prompt = buildReviewPrompt({
       bug: makeBug(),
@@ -633,7 +635,7 @@ describe("independent read-only review", () => {
 
   it("评审 Prompt 只阻断可执行的补丁问题并检查关键正确性维度", () => {
     const investigation = parseInvestigation(
-      'FINAL_RESULT: {"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
+      'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"保存请求未 await","evidence":["[观察] Settings.ts:42","[推断] 根因由该观察事实支持"],"reproduction":{"command":"npm test -- settings","before":"FAIL"},"planned_files":["src/Settings.ts"],"confidence":0.9,"blocked_reasons":[]}',
     );
     const prompt = buildReviewPrompt({
       bug: makeBug(), investigation,
@@ -654,7 +656,7 @@ describe("independent read-only review", () => {
 
   it("解析分级、可执行 findings，存在 high/medium 时拒绝", () => {
     const result = parseReviewResult(
-      'FINAL_RESULT: {"approved":true,"note":"看起来可以","findings":[{"severity":"high","title":"遗漏错误路径","file":"src/Settings.ts","line":42,"evidence":"catch 仍显示成功","required_action":"失败时返回错误"}]}',
+      'FINAL_RESULT: {"approved":true,"note":"看起来可以","requirement_match":"pass","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"findings":[{"severity":"high","title":"遗漏错误路径","file":"src/Settings.ts","line":42,"evidence":"catch 仍显示成功","required_action":"失败时返回错误"}]}',
     );
 
     expect(result.approved).toBe(false);
@@ -664,7 +666,7 @@ describe("independent read-only review", () => {
 
   it("Reviewer 的不完整 finding 不会被静默丢弃后误批准", () => {
     const result = parseReviewResult(
-      'FINAL_RESULT: {"approved":true,"note":"通过","findings":[{"severity":"medium","title":"缺少证据","required_action":"补测试"}]}',
+      'FINAL_RESULT: {"approved":true,"note":"通过","requirement_match":"pass","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"findings":[{"severity":"medium","title":"缺少证据","required_action":"补测试"}]}',
     );
 
     expect(result.approved).toBe(false);
@@ -673,7 +675,7 @@ describe("independent read-only review", () => {
 
   it("Reviewer 拒绝时必须给出可执行 finding", () => {
     const result = parseReviewResult(
-      'FINAL_RESULT: {"approved":false,"note":"不通过","findings":[]}',
+      'FINAL_RESULT: {"approved":false,"note":"不通过","requirement_match":"pass","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"findings":[]}',
     );
 
     expect(result.approved).toBe(false);
@@ -687,18 +689,18 @@ describe("independent read-only review", () => {
     expect(result.findings[0].title).toContain("无法解析");
   });
 
-  it("仅缺少游戏内人工复现时降为 low，不阻断已通过机器验证的候选", () => {
+  it("medium finding 不因人工验证措辞自动降级", () => {
     const result = parseReviewResult(
-      'FINAL_RESULT: {"approved":false,"note":"代码逻辑正确，仅缺运行期确认","findings":[{"severity":"medium","title":"验证证据不足，依赖未验证配置","file":"GuideStepInfo.ts","line":264,"evidence":"tsc 已通过，但未运行游戏内 GM 复现，配置条件尚未验证","required_action":"运行期用 TestGuideGroup 并打日志确认"}]}',
+      'FINAL_RESULT: {"approved":false,"note":"代码逻辑正确，仅缺运行期确认","requirement_match":"pass","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"findings":[{"severity":"medium","title":"验证证据不足，依赖未验证配置","file":"GuideStepInfo.ts","line":264,"evidence":"tsc 已通过，但未运行游戏内 GM 复现，配置条件尚未验证","required_action":"运行期用 TestGuideGroup 并打日志确认"}]}',
     );
 
-    expect(result.findings[0].severity).toBe("low");
-    expect(result.approved).toBe(true);
+    expect(result.findings[0].severity).toBe("medium");
+    expect(result.approved).toBe(false);
   });
 
   it("已证明配置使代码不可达时仍保持阻断", () => {
     const result = parseReviewResult(
-      'FINAL_RESULT: {"approved":false,"note":"实际配置不满足条件","findings":[{"severity":"medium","title":"修复路径不可达","file":"GuideStepInfo.ts","line":264,"evidence":"已确认实际配置为 Priority=0、TimeScale=1，因此新逻辑不可达","required_action":"修正启动条件"}]}',
+      'FINAL_RESULT: {"approved":false,"note":"实际配置不满足条件","requirement_match":"pass","behavioral_evidence":"static_only","reuse_and_lifecycle":"pass","unverified_items":[],"findings":[{"severity":"medium","title":"修复路径不可达","file":"GuideStepInfo.ts","line":264,"evidence":"已确认实际配置为 Priority=0、TimeScale=1，因此新逻辑不可达","required_action":"修正启动条件"}]}',
     );
 
     expect(result.findings[0].severity).toBe("medium");
