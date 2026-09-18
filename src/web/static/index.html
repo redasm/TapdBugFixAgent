@@ -12,9 +12,33 @@
     --term-bg: #0a0e13; --agent-h: 250px;   /* Agent 输出区高度，分割线拖动调整 */
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font: 14px/1.5 "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; }
-  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-  header h1 { font-size: 16px; font-weight: 600; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  /* 顶部栏：标题 / 状态 / 统计 / 操作按钮固定同一排，按可用宽度自适应紧凑（不再横向滚动、不裁切内容）。
+     宽度变窄时依次：压缩间距与内边距 → 统计切简写标签（.lb-short，完整含义保留在 title）→
+     按钮退化为图标（emoji + title/aria-label 保留语义）→ 统计折进「📊 统计」弹出面板（数值仍在 DOM 实时更新）。
+     所有规则都限定在 header 作用域，不影响详情抽屉里的 .actions / .stat；
+     任何断点都不得再引入 flex-wrap: wrap（600px 处曾强制多排）。 */
+  header {
+    --hd-gap: clamp(8px, 0.62vw, 14px);
+    --hd-pad-x: clamp(10px, 1vw, 20px);
+    --hd-stat-fs: 12.5px; --hd-stat-gap: clamp(5px, 0.4vw, 9px); --hd-stat-pad: 5px clamp(7px, 0.7vw, 12px);
+    --hd-btn-fs: 12.5px; --hd-btn-gap: clamp(5px, 0.45vw, 9px); --hd-btn-pad: 5px clamp(8px, 0.85vw, 14px);
+    display: flex; align-items: center; gap: var(--hd-gap); padding: 12px var(--hd-pad-x);
+    background: var(--panel); border-bottom: 1px solid var(--border); flex: 0 0 auto;
+    flex-wrap: nowrap; position: relative;
+  }
+  header .hd-icon { margin-right: 4px; }
+  header h1 { font-size: clamp(14px, 0.8vw, 16px); font-weight: 600; white-space: nowrap; display: flex; align-items: center; }
+  header > *, header .stat-group { flex: 0 0 auto; }
+  header h1, header .badge, header .stat, header .stat-group, header .actions > button { white-space: nowrap; }
+  header .stats { display: contents; }
+  header #statsCounts { margin-left: auto; }   /* 统计整体右对齐；宽屏富余空间全部由这里吸收 */
+  header .stat-group { display: flex; align-items: center; gap: var(--hd-stat-gap); }
+  header .stat { padding: var(--hd-stat-pad); font-size: var(--hd-stat-fs); }
+  header .stat .lb-short { display: none; }
+  header .actions { gap: var(--hd-btn-gap); flex-wrap: nowrap; }
+  header .actions > button { display: inline-flex; align-items: center; gap: 4px; padding: var(--hd-btn-pad); font-size: var(--hd-btn-fs); }
+  header .stats-toggle { display: none; }
   .badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; white-space: nowrap; }
   .badge.running { background: rgba(34,197,94,.15); color: var(--green); }
   .badge.paused { background: rgba(245,158,11,.15); color: var(--amber); }
@@ -35,12 +59,13 @@
   button:disabled { opacity: .4; cursor: not-allowed; }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
   button.danger { background: var(--red); }
-  .stats { display: flex; gap: 10px; margin-left: auto; flex-wrap: wrap; }
-  .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; font-size: 12px; color: var(--muted); }
-  .stat b { color: var(--text); }
+  header .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; color: var(--muted); }
+  header .stat b { color: var(--text); margin-left: 2px; }
+  header .stats-toggle { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; color: var(--muted); }
 
-  /* 上下结构：上行 = 分组 bug 列表 + 右侧抽屉；下行 = Agent 输出区（固定底部全宽） */
-  main.layout { display: flex; flex-direction: column; gap: 12px; padding: 14px 20px; height: calc(100vh - 58px); }
+  /* 上下结构：上行 = 分组 bug 列表 + 右侧抽屉；下行 = Agent 输出区（固定底部全宽）。
+     高度由 body 纵向 flex 决定（header 固定高，main 占满剩余空间），不再按顶部栏像素高度硬算。 */
+  main.layout { display: flex; flex-direction: column; gap: 12px; padding: 14px 20px; flex: 1; min-height: 0; }
   .top-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
   .list-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
   .toolbar { display: flex; gap: 8px; align-items: center; }
@@ -140,15 +165,64 @@
   #toast { position: fixed; top: 66px; left: 50%; transform: translateX(-50%) translateY(-8px); background: var(--panel2); color: var(--green); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 100; max-width: 80vw; }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   #toast.err { color: var(--red); }
+  /* 顶部栏自适应分档（每档都为该档最窄宽度留出余量，保证恒为一行且不裁切）：
+     ≥2400 完整标签 + 文字按钮 → ≤2399 简写标签 + 文字按钮 → ≤1849 按钮图标化 →
+     ≤1450 更紧的短标签（仍然 10 个统计全在一排）→ ≤1200 质量指标折进「📊 统计」面板 →
+     ≤900 全部统计折叠 → ≤630 标题只留图标 → ≤430 极窄收边。 */
+  @media (max-width: 2399px) {
+    header { --hd-stat-fs: 11.5px; --hd-stat-pad: 5px 9px; --hd-stat-gap: 7px; --hd-btn-fs: 12px; --hd-btn-pad: 5px 11px; --hd-btn-gap: 7px; }
+    header .stat .lb-full { display: none; }
+    header .stat .lb-short { display: inline; }
+  }
+  @media (max-width: 1849px) {
+    header { --hd-stat-fs: 11.5px; --hd-stat-pad: 4px 8px; --hd-stat-gap: 6px; --hd-btn-pad: 5px 9px; --hd-btn-gap: 5px; }
+    header .actions > button .tx { display: none; }   /* 保留 .ic 图标 + title/aria-label */
+  }
+  @media (max-width: 1450px) {   /* 1201–1450：10 个统计仍在一排，靠更紧的短标签/内边距换空间 */
+    header { --hd-stat-fs: 10.5px; --hd-stat-pad: 3px 6px; --hd-stat-gap: 4px; --hd-btn-pad: 4px 6px; --hd-gap: 7px; --hd-pad-x: 12px; }
+    header #verBadge { display: none; }
+  }
+  @media (max-width: 1200px) {   /* ≤1200：5 个质量指标折进「📊 统计」面板，5 个关键计数仍留在这一排 */
+    header { --hd-stat-fs: 11px; --hd-stat-pad: 4px 7px; }
+    header .stats-toggle { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; font-size: 11px; }
+    header #statsQuality {
+      position: absolute; top: 100%; right: var(--hd-pad-x); display: none; flex-wrap: wrap; gap: 6px;
+      padding: 10px 12px; background: var(--panel); border: 1px solid var(--border); border-top: 0;
+      border-radius: 0 0 10px 10px; box-shadow: 0 10px 24px rgba(0,0,0,.4); z-index: 40;
+      max-width: min(540px, calc(100vw - 20px));
+    }
+    header.stats-open #statsQuality { display: flex; }
+    header.stats-open #statsQuality .lb-full { display: inline; }   /* 面板里有空间，展开显示完整名称 */
+    header.stats-open #statsQuality .lb-short { display: none; }
+  }
+  @media (max-width: 900px) {   /* ≤900：统计全部折进面板（数值仍在 DOM 实时更新，点 📊 查看） */
+    header { --hd-stat-fs: 11px; --hd-stat-pad: 4px 8px; --hd-stat-gap: 6px; --hd-pad-x: 12px; }
+    header .stats { display: none; position: absolute; top: 100%; right: var(--hd-pad-x); flex-direction: column; gap: 8px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--border); border-top: 0; border-radius: 0 0 10px 10px; box-shadow: 0 10px 24px rgba(0,0,0,.4); z-index: 40; max-width: min(540px, calc(100vw - 20px)); }
+    header.stats-open .stats { display: flex; }
+    header .stat-group { flex-wrap: wrap; }
+    header #statsQuality { position: static; display: flex; padding: 0; border: 0; background: transparent; box-shadow: none; max-width: none; }
+    header #statsCounts { margin-left: 0; }
+    header .stats-toggle { margin-left: auto; }
+    header.stats-open .stats .lb-full { display: inline; }
+    header.stats-open .stats .lb-short { display: none; }
+  }
+  @media (max-width: 630px) {
+    header { --hd-gap: 8px; --hd-btn-pad: 4px 7px; }
+    header .hd-name { display: none; }   /* 标题只留 🛠（title 保留完整名称） */
+    header .stats-toggle { padding: 4px 8px; font-size: 11px; }
+  }
+  @media (max-width: 430px) {
+    header { --hd-gap: 6px; --hd-btn-gap: 4px; --hd-btn-pad: 4px 6px; --hd-pad-x: 10px; --hd-stat-pad: 4px 6px; }
+    header .badge { padding: 2px 7px; font-size: 11px; }
+    header .hd-icon { margin-right: 0; }
+    header .stats-toggle { padding: 4px 7px; }
+    header .stats-toggle .tx { display: none; }   /* 📊 图标 + title/aria-label 兜底 */
+  }
   @media (max-width: 600px) {
     body { overflow-x: hidden; }
-    header { padding: 12px; gap: 10px; }
-    header h1 { width: 100%; }
-    .stats { margin-left: 0; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); width: 100%; }
-    .stat { min-width: 0; text-align: center; }
-    header > .actions { width: 100%; flex-wrap: wrap; }
-    header > .actions button { flex: 1 1 104px; min-width: 96px; white-space: nowrap; }
-    main.layout { padding: 10px 12px; height: calc(100vh - 278px); }
+    /* 顶部栏恒为单行（分档规则见上方 @media 阶梯）：小窗口只收内边距，不再把 h1 / stats / actions 拆成多排；
+       主区高度沿用 main.layout 基础规则（body 纵向 flex 自动填满剩余高度），不再为多排顶部栏预留高度。 */
+    main.layout { padding: 10px 12px; }
     .toolbar { display: grid; grid-template-columns: 132px minmax(0,1fr); }
     .toolbar button { grid-column: 1 / -1; }
     .row { grid-template-columns: minmax(0,1fr) 42px 92px; grid-template-rows: auto auto; padding: 8px 12px; }
@@ -164,28 +238,33 @@
 <body>
 <div id="toast"></div>
 <header>
-  <h1>🛠 TapdBugFixAgent <span id="verBadge" class="muted" style="font-size:11px;font-weight:400" title="运行中服务的构建版本（改代码后不重启这里不会变）"></span></h1>
+  <h1 title="TapdBugFixAgent 管理台"><span class="hd-icon" aria-hidden="true">🛠</span><span class="hd-name">TapdBugFixAgent</span><span id="verBadge" class="muted" style="font-size:11px;font-weight:400;margin-left:4px" title="运行中服务的构建版本（改代码后不重启这里不会变）"></span></h1>
   <span id="controlBadge" class="badge stopped">stopped</span>
-  <div class="stats">
-    <span class="stat">待处理 <b id="stQueued">0</b></span>
-    <span class="stat">待人工确认 <b id="stReviewPending">0</b></span>
-    <span class="stat">机器验证通过 <b id="stVerified">0</b></span>
-    <span class="stat">资源待人工 <b id="stManual">0</b></span>
-    <span class="stat">失败 <b id="stFailed">0</b></span>
-    <span class="stat" title="按完整候选版本统计"><span>候选精确率</span> <b id="stCandidatePrecision">-</b></span>
-    <span class="stat"><span>候选原样接受率</span> <b id="stCandidateUnchanged">-</b></span>
-    <span class="stat"><span>候选反馈覆盖率</span> <b id="stFeedbackCoverage">-</b></span>
-    <span class="stat"><span>候选覆盖率</span> <b id="stCandidateCoverage">-</b></span>
-    <span class="stat"><span>端到端有效率</span> <b id="stEndToEnd">-</b></span>
+  <div class="stats" id="headerStats">
+    <div class="stat-group" id="statsCounts">
+      <span class="stat" title="待处理：排队中与处理中的任务数（pending + in_progress）"><span class="lb-full">待处理</span><span class="lb-short">待处理</span> <b id="stQueued">0</b></span>
+      <span class="stat" title="待人工确认：等待人工确认的任务数（review_pending）"><span class="lb-full">待人工确认</span><span class="lb-short">待确认</span> <b id="stReviewPending">0</b></span>
+      <span class="stat" title="机器验证通过：机器验证通过的任务数（verified）"><span class="lb-full">机器验证通过</span><span class="lb-short">验证</span> <b id="stVerified">0</b></span>
+      <span class="stat" title="资源待人工：需人工处理资源的任务数（manual_only）"><span class="lb-full">资源待人工</span><span class="lb-short">资源</span> <b id="stManual">0</b></span>
+      <span class="stat" title="失败：处理失败的任务数（failed）"><span class="lb-full">失败</span><span class="lb-short">失败</span> <b id="stFailed">0</b></span>
+    </div>
+    <div class="stat-group" id="statsQuality">
+      <span class="stat" title="候选精确率：已评审完整候选中被接受的比例"><span class="lb-full">候选精确率</span><span class="lb-short">精确</span> <b id="stCandidatePrecision">-</b></span>
+      <span class="stat" title="候选原样接受率：已评审候选中人工未改动、原样接受的比例"><span class="lb-full">候选原样接受率</span><span class="lb-short">原样</span> <b id="stCandidateUnchanged">-</b></span>
+      <span class="stat" title="候选反馈覆盖率：候选已提交人工反馈结论的比例"><span class="lb-full">候选反馈覆盖率</span><span class="lb-short">反馈</span> <b id="stFeedbackCoverage">-</b></span>
+      <span class="stat" title="候选覆盖率：已产出候选的任务占比"><span class="lb-full">候选覆盖率</span><span class="lb-short">覆盖</span> <b id="stCandidateCoverage">-</b></span>
+      <span class="stat" title="端到端有效率：从采集到人工接受全链路有效的比例"><span class="lb-full">端到端有效率</span><span class="lb-short">有效</span> <b id="stEndToEnd">-</b></span>
+    </div>
   </div>
+  <button id="btnStatsToggle" class="stats-toggle" type="button" title="展开/收起折叠的统计指标（数值实时更新）" aria-label="统计指标" aria-controls="headerStats" aria-expanded="false"><span class="ic" aria-hidden="true">📊</span><span class="tx">统计</span></button>
   <div class="actions">
-    <button id="btnSettings" class="ghost">⚙ 设置</button>
-    <button id="btnStart" data-act="start">▶ 开启</button>
-    <button id="btnPause" data-act="pause" class="ghost">⏸ 暂停</button>
-    <button id="btnResume" data-act="resume" class="ghost">⏯ 恢复</button>
-    <button id="btnStop" data-act="stop" class="danger">⏹ 关闭</button>
-    <button id="btnRetryFailed" class="ghost" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）">↻ 重试全部失败</button>
-    <button id="btnResync" class="danger" title="停止自动处理并等待当前任务退出后，保留候选产物、changelist 关联和人工结论，仅清除可重试状态，再从 Tapd 重新拉取最新 bug 列表">⟳ 重新同步待处理</button>
+    <button id="btnSettings" class="ghost" type="button" title="设置：Pi 模型 / Perforce / Tapd 连接" aria-label="设置"><span class="ic" aria-hidden="true">⚙</span><span class="tx">设置</span></button>
+    <button id="btnStart" data-act="start" type="button" title="开启自动处理" aria-label="开启"><span class="ic" aria-hidden="true">▶</span><span class="tx">开启</span></button>
+    <button id="btnPause" data-act="pause" class="ghost" type="button" title="暂停自动处理" aria-label="暂停"><span class="ic" aria-hidden="true">⏸</span><span class="tx">暂停</span></button>
+    <button id="btnResume" data-act="resume" class="ghost" type="button" title="恢复自动处理" aria-label="恢复"><span class="ic" aria-hidden="true">⏯</span><span class="tx">恢复</span></button>
+    <button id="btnStop" data-act="stop" class="danger" type="button" title="停止自动处理" aria-label="关闭"><span class="ic" aria-hidden="true">⏹</span><span class="tx">关闭</span></button>
+    <button id="btnRetryFailed" class="ghost" type="button" title="把所有失败任务重置为待处理并入队（开启状态下会按优先级重新处理）" aria-label="重试全部失败"><span class="ic" aria-hidden="true">↻</span><span class="tx">重试全部失败</span></button>
+    <button id="btnResync" class="danger" type="button" title="停止自动处理并等待当前任务退出后，保留候选产物、changelist 关联和人工结论，仅清除可重试状态，再从 Tapd 重新拉取最新 bug 列表" aria-label="重新同步待处理"><span class="ic" aria-hidden="true">⟳</span><span class="tx">重新同步待处理</span></button>
   </div>
 </header>
 
@@ -409,6 +488,16 @@ function progressHTML(job) {
   </div>`;
 }
 
+// 顶部按钮文案统一走这里：只改 .tx 文案 span，保留 .ic 图标 span
+// （窄窗口下 .tx 被 CSS 隐藏、只显示图标，整块 textContent 赋值会把图标结构一起抹掉）
+function setBtnText(btn, text) {
+  if (!btn) return;
+  const tx = btn.querySelector('.tx');
+  if (tx) tx.textContent = text; else btn.textContent = text;
+  // 图标态下读屏只能拿到 aria-label，必须跟随动态文案（title 的 hover 说明保持原样不动）
+  btn.setAttribute('aria-label', text);
+}
+
 function renderStatus() {
   const st = SNAPSHOT.status || {};
   const c = st.control || 'stopped';
@@ -433,7 +522,7 @@ function renderStatus() {
   const failedN = counts.failed || 0;
   const bf = $('btnRetryFailed');
   bf.disabled = !failedN;
-  bf.textContent = failedN ? `↻ 重试全部失败 (${failedN})` : '↻ 重试全部失败';
+  setBtnText(bf, failedN ? `重试全部失败 (${failedN})` : '重试全部失败');
   const running = c === 'running';
   const stopping = !running && !!st.current_bug;
   $('btnStart').disabled = running;
@@ -748,6 +837,18 @@ document.querySelectorAll('header button[data-act]').forEach(btn => {
     if (r) renderStatus();
   };
 });
+// 顶部栏统计面板：窄窗口下统计项折叠进弹出面板（只切 class，数值始终在 DOM 里实时更新）
+const STATS_TOGGLE = $('btnStatsToggle');
+function setStatsOpen(open) {
+  document.querySelector('header').classList.toggle('stats-open', open);
+  STATS_TOGGLE.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+STATS_TOGGLE.onclick = () => setStatsOpen(!document.querySelector('header').classList.contains('stats-open'));
+document.addEventListener('click', (e) => {
+  const hd = document.querySelector('header');
+  if (hd.classList.contains('stats-open') && !hd.contains(e.target)) setStatsOpen(false);
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setStatsOpen(false); });
 $('btnRefresh').onclick = refresh;
 $('btnDrawerClose').onclick = closeDrawer;
 $('fSearch').oninput = renderList;
@@ -875,7 +976,7 @@ $('btnResync').onclick = async () => {
   )) return;
   const btn = $('btnResync');
   btn.disabled = true;
-  btn.textContent = '⟳ 同步中…';
+  setBtnText(btn, '同步中…');
   try {
     const r = await api('/api/resync', 'POST', {});
     if (r) {
@@ -886,7 +987,7 @@ $('btnResync').onclick = async () => {
     }
   } finally {
     btn.disabled = false;
-    btn.textContent = '⟳ 重新同步待处理';
+    setBtnText(btn, '重新同步待处理');
   }
 };
 

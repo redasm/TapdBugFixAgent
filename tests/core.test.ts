@@ -4462,4 +4462,63 @@ describe("web 前端 bug_id 内插引号", () => {
     expect(html).toContain("// 请求成功 = 当前 token 有效，记住它");
     expect(html).toContain('id="verBadge"');
   });
+
+  // 回归：顶部栏曾用 overflow-x 横向滚动来「保持单行」，长指标/窄窗口下需要拖动才能看到操作按钮。
+  // 现改为按可用宽度自适应压缩（间距/标签/图标/折叠），恒为一行且不裁切内容。
+  it("顶部栏单行自适应：不用横向滚动也不裁切，按宽度分档压缩", () => {
+    expect(html).toMatch(/header \{[^}]*flex-wrap: nowrap/);
+    expect(html).not.toMatch(/header \{[^}]*overflow/);   // 不靠滚动/裁切伪装适配
+    expect(html).toContain("header .stats { display: contents; }");            // 宽档：两组统计都是 header 的直接 flex 项
+    expect(html).toContain("header .stat .lb-short { display: none; }");       // 宽档用完整标签
+    expect(html).toContain("header .actions > button .tx { display: none; }"); // 窄档按钮退化为图标
+    expect(html).toContain("header.stats-open #statsQuality { display: flex; }");
+    expect(html).toContain("header.stats-open .stats { display: flex; }");     // 更窄：统计折进可展开面板
+    // 旧的多排假设：h1 独占整行 / stats 变 2 列网格 / actions 换行并拉满宽度
+    expect(html).not.toMatch(/header\s+h1\s*\{[^}]*width:\s*100%/);
+    expect(html).not.toMatch(/header \{[^}]*flex-wrap:\s*wrap/);
+    // 所有断点里唯一允许换行的只有弹出面板内的统计分组（面板是下拉层，不是顶部栏那一排）
+    for (const block of html.match(/@media[^{]*\{(?:[^{}]|\{[^{}]*\})*\}/g) ?? []) {
+      for (const rule of block.match(/[^{}]+\{[^{}]*flex-wrap:\s*wrap[^{}]*\}/g) ?? []) {
+        expect(rule).toMatch(/(#statsQuality|\.stat-group)\s*\{/);
+      }
+    }
+  });
+
+  it("顶部栏文字与按钮不被压缩折行，主区改由 flex 填满（不再按顶部栏像素高度硬算）", () => {
+    expect(html).toMatch(/header \{[^}]*flex: 0 0 auto/);
+    expect(html).toContain("header > *, header .stat-group { flex: 0 0 auto; }");
+    expect(html).toMatch(/header[^{]*\.stat[^{]*\{[^}]*white-space: nowrap/);
+    expect(html).toMatch(/header[^{]*\.actions > button[^{]*\{[^}]*white-space: nowrap/);
+    expect(html).toMatch(/body \{[^}]*height: 100vh[^}]*flex-direction: column/);
+    expect(html).toMatch(/main\.layout \{[^}]*flex: 1[^}]*min-height: 0/);
+    expect(html).not.toMatch(/main\.layout \{[^}]*height:\s*calc\(100vh/);
+  });
+
+  it("紧凑表示的语义兜底：统计有完整 title，按钮有图标 + title/aria-label，动态文案只改 .tx", () => {
+    const headerHtml = html.slice(html.indexOf("<header>"), html.indexOf("</header>"));
+    const stats = headerHtml.match(/<span class="stat" title="[^"]+">/g) ?? [];
+    expect(stats.length).toBe(10);                       // 10 个统计全部带完整含义 tooltip
+    // 回归：简写档隐藏 .lb-full，每个统计都必须有 .lb-short，否则「待处理/失败」会丢标签
+    expect(headerHtml.match(/class="lb-short"/g)?.length).toBe(10);
+    expect(headerHtml).toContain('class="lb-full">待处理</span><span class="lb-short">待处理');
+    expect(headerHtml).toContain('class="lb-full">失败</span><span class="lb-short">失败');
+    const acts = headerHtml.match(/<button id="btn(?:Settings|Start|Pause|Resume|Stop|RetryFailed|Resync)"[\s\S]*?<\/button>/g) ?? [];
+    expect(acts.length).toBe(7);                         // 全部操作都在顶部栏
+    for (const b of acts) {
+      expect(b).toMatch(/title="[^"]+"/);
+      expect(b).toMatch(/aria-label="[^"]+"/);
+      expect(b).toContain('class="ic"');
+      expect(b).toContain('class="tx"');
+    }
+    expect(headerHtml).toMatch(/id="btnStatsToggle"[^>]*aria-label="统计指标"[^>]*aria-controls="headerStats"[^>]*aria-expanded="false"/);
+    expect(headerHtml).toContain('id="headerStats"');
+    // 动态文案（重试全部失败 (N) / 同步中）只替换 .tx，不能整块 textContent 抹掉图标 span；
+    // 图标态下 aria-label 是读屏唯一文案来源，必须同步更新
+    expect(html).toContain("function setBtnText(btn, text)");
+    expect(html).toMatch(/const tx = btn\.querySelector\('\.tx'\)/);
+    expect(html).toMatch(/btn\.setAttribute\('aria-label', text\)/);
+    expect(html).toMatch(/setBtnText\(bf, failedN/);
+    expect(html).toMatch(/setBtnText\(btn, '同步中…'\)/);
+    expect(html).not.toMatch(/bf\.textContent =|btn\.textContent = '⟳/);
+  });
 });
