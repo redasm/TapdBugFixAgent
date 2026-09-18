@@ -109,7 +109,7 @@ export function assessBehaviorResults(checks: BehaviorVerification["checks"]): B
     }
     if (check.after.every(c => c.status === "pass") && !check.before.some(c => c.status === "error")) valid++;
   }
-  if (!checks.length) gaps.push("未配置匹配的业务行为测试，仅有静态验证；需人工验收");
+  if (!checks.length) gaps.push("未配置匹配的专项行为测试；已有构建/测试结果单独记录，仍需确认本 Bug 验收条件");
   if (checks.length && !reproduced) gaps.push("没有修复前失败、修复后通过的目标行为证据");
   if (checks.length && !normalCovered) gaps.push("缺少修复前后均通过的正常对照场景");
   return { level: valid === checks.length && reproduced && normalCovered && !failed && checks.length > 0 ? "L1" : "L0", ok: !failed, reproduced, checks, unverified_items: gaps };

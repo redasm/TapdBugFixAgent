@@ -24,3 +24,10 @@ run/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地服务输出可能包含连接地址、工作区路径和用户信息
+/service*.log
+
+# 本地调试设置与临时查询脚本
+/.claude/settings.local.json
+/tapd_query_tmp.mjs

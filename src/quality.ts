@@ -109,6 +109,7 @@ const crashDiagnostic = (text: string): boolean =>
 const inferModule = (title: string, description: string): string => {
   const text = `${title}\n${description}`;
   const pathPatterns = [
+    // Source 的父目录是插件名，支持直接安装及厂商/类别嵌套目录。
     /Engine[\\/]Plugins[\\/](?:[^\\/\s]+[\\/])*?([^\\/\s]+)[\\/]Source[\\/]/i,
     /Engine[\\/]Source[\\/]Runtime[\\/]([^\\/\s]+)/i,
     /TypeScript[\\/]Src[\\/]Game[\\/]Module[\\/]([^\\/\s]+)/i,

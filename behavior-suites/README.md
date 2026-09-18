@@ -4,7 +4,7 @@
 
 ## 配置
 
-在对应仓库的 `behavior_checks` 下配置：
+在本工具的 `config.yaml` 中、对应 `workspaces[].repos[].behavior_checks` 下配置。不会在目标仓库创建 Agent 配置或测试目录。已有的 Jest、pytest、dotnet 测试工程优先通过 `verify_cmds` 复用，详见 [测试接入配置](../docs/testing-configuration.md)；本目录用于可选的专项脚本。
 
 ```yaml
 behavior_checks:
@@ -14,7 +14,7 @@ behavior_checks:
   timeout_sec: 30
 ```
 
-`directory` 相对 `config.yaml` 所在目录，也支持绝对路径。每个项目应使用自己的专用测试目录。内置三套测试针对 project 客户端。脚本须放在修复 Agent 修改范围之外，按受信任验证代码维护。
+`directory` 由用户指定，支持相对 `config.yaml`、绝对路径或 `'{repo}/qa/agent-suites'`（repo.path 下的显式目录）。示例 `behavior-suites` 指本工具旁的目录，不要求放入目标仓库。内置三套测试针对 my-client 客户端。脚本须放在修复 Agent 修改范围之外，按受信任验证代码维护。
 
 - **新增**：放入符合下面协议的 `.mjs`，下次修复自动发现，不需要修改配置或重启。
 - **删除**：删除 `.mjs`，下次修复不再使用；正在执行的修复继续使用其已冻结的版本。

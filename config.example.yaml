@@ -168,12 +168,21 @@ workspaces:
           - "Saved/"
           - "Binaries/"
         preflight_reconcile: never     # 推荐：不做全目录扫描；修复后仅对调查阶段 planned_files 做 reconcile 兜底
-        verify_cmds:                  # 按顺序执行；任一失败即停止
-          - "npm run typecheck"
-          - "npm test -- --runInBand"
+        # 配置只写在本工具 config.yaml；不向目标项目添加 Agent 配置或改写已有测试。
+        # 直接复用项目原生测试工程。cwd 相对上述 repo.path，也支持用户指定的绝对路径。
+        # tests 仅为示例名称，可以是 test、qa、独立测试工程等任意现有目录。
+        verify_cmds:                  # 按顺序执行；任一失败即停止；命令应运行一次后退出
+          - command: "npm run typecheck"
+            cwd: "."
+            timeout_sec: 600
+          - command: "npm test -- --run"
+            cwd: "tests"             # 有独立 package.json 的测试工程；否则用 . 并传目录参数
+            timeout_sec: 600
+        # 其它框架示例（按项目选用）：pytest tests；dotnet test tests/Product.Tests.csproj。
+        # 可选补充：本工具协议的 .mjs 专项测试；普通 tests 目录请使用上面的原生命令。
         # 每次修复前递归发现目录内 .mjs；脚本 export const files 声明适用源码。
-        # directory 相对本 config 文件；测试名为目录内相对路径（不含 .mjs）。
-        # 内置脚本针对 project；其它项目请换为自己的测试目录后启用。
+        # directory 由用户指定：绝对路径、相对本 config 文件，或 '{repo}/qa/agent-suites'。
+        # 内置脚本针对 示例项目；其它项目请换为自己的测试目录后启用。
         behavior_checks:
           enabled: false
           directory: behavior-suites

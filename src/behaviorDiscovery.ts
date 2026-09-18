@@ -17,7 +17,7 @@ export interface DiscoveredBehaviorSuite {
   timeout_sec: number;
 }
 
-export function parseBehaviorConfig(value: unknown, configDir: string): BehaviorChecksConfig | undefined {
+export function parseBehaviorConfig(value: unknown, configDir: string, repoPath?: string): BehaviorChecksConfig | undefined {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("behavior_checks 须为目录配置对象，不再支持逐文件列表");
@@ -38,7 +38,9 @@ export function parseBehaviorConfig(value: unknown, configDir: string): Behavior
   if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout < 1 || timeout > 300) {
     throw new Error("行为测试 timeout_sec 须为 1–300 秒");
   }
-  const config = { enabled: raw.enabled ?? true, directory: path.resolve(configDir, raw.directory),
+  if (raw.directory.includes("{repo}") && !repoPath) throw new Error("behavior_checks.directory 使用 {repo} 时须配置仓库路径");
+  const directory = raw.directory.replaceAll("{repo}", repoPath ? path.resolve(repoPath) : "");
+  const config = { enabled: raw.enabled ?? true, directory: path.resolve(configDir, directory),
     disabled: [...new Set(disabled)], timeout_sec: timeout } as BehaviorChecksConfig;
   if (config.enabled && (!fs.existsSync(config.directory) || !fs.statSync(config.directory).isDirectory())) {
     throw new Error(`行为测试目录不存在: ${config.directory}`);

@@ -4,7 +4,7 @@ import type { AgentResult, Bug } from "./models.js";
 import { truncate } from "./models.js";
 
 /** 提取 bug 短号（swarm 校验用的 b<短号>）。
- *  Tapd 完整 id 形如 1123456780·001257090 = "1" + workspace_id("12345678") + 前导零序号；
+ *  Tapd 完整 id 形如 112345678·0001257090 = "1" + workspace_id("12345678") + 前导零序号；
  *  团队惯用短号 = 序号去前导零（1257090）。前缀不匹配时回退取末 7 位去前导零。 */
 export function bugShortId(bug: Pick<Bug, "id" | "workspace_id">): string {
   const id = String(bug.id ?? "");

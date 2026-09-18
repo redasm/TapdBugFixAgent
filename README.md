@@ -4,7 +4,7 @@
 产出 **Perforce pending changelist**；若配置了附加 Git 引擎目录，还会创建并本地提交独立修复分支，然后回写 Tapd 评论。
 配套 **Web 管理台** 实时监控与控制全流程。
 
-![运行效果](web_run.jpg)
+![运行效果（工单编号和标题已脱敏）](web_run.jpg)
 
 **安全约定**：永不 `p4 submit`、永不 `git push`、永不修改 Tapd 单子状态——P4 代码停在 pending changelist，Git 代码停在本地修复分支，由你 review 后人工 submit/push。
 配置 Unreal MCP 后，Agent 可通过受控工具读取、修改并验证 Unreal/LGUI 资源；未命中或 MCP 未启用的二进制资源仍列入「需人工处理资源」。
@@ -328,7 +328,9 @@ worker 轮询时自动转跳过并写明原因。
 
 新流程按尝试保存补丁与人工反馈，调查必须给出业务验收条件，并检索相关历史经验。管理台分开显示历史接受率、完整候选精确率、原样接受率和覆盖率。编译通过与行为验证分别记录。
 
-行为测试配置、14例开发基线和严格配对评测用法见 [实施说明](docs/accuracy-implementation.md)，调研依据见 [设计方案](docs/accuracy-improvement-2026-09-18.md)。构建并重启服务后新流程生效；按仓库配置 `behavior_checks` 才会执行对应专项。
+测试接入统一配置在本工具的 `config.yaml`，不向目标仓库添加配置。已有 `tests`、`qa` 或独立测试工程通过 `verify_cmds` 的命令、执行目录和超时直接复用，详见 [测试接入配置](docs/testing-configuration.md)。
+
+行为测试配置、14例开发基线和严格配对评测用法见 [实施说明](docs/accuracy-implementation.md)，调研依据见 [设计方案](docs/accuracy-improvement-2026-09-18.md)。构建并重启服务后新流程生效；可选的 `behavior_checks` 用于逐条记录专项断言的修复前后结果。
 
 行为测试按目录自动发现，适用源码由脚本的 `export const files` 声明。新增/删除 `.mjs` 从下一次修复生效；无需在配置中逐项维护文件。停用、改名和脚本模板见 [行为测试维护指南](behavior-suites/README.md)。
 

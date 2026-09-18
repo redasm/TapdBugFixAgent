@@ -96,6 +96,14 @@ describe("behavior directory discovery", () => {
 });
 
 describe("behavior directory configuration", () => {
+  it("accepts user-selected absolute paths or explicit repo-relative paths without creating files", () => {
+    const { root, directory } = setup();
+    const before = fs.readdirSync(root);
+    expect(parseBehaviorConfig({ directory }, root)?.directory).toBe(directory);
+    expect(parseBehaviorConfig({ directory: "{repo}/suites" }, path.dirname(root), root)?.directory).toBe(directory);
+    expect(() => parseBehaviorConfig({ directory: "{repo}/suites" }, root)).toThrow("须配置仓库路径");
+    expect(fs.readdirSync(root)).toEqual(before);
+  });
   it("loads directory settings relative to config.yaml and rejects the old list protocol", () => {
     const { root, directory } = setup();
     const file = path.join(root, "config.yaml");

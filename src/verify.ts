@@ -6,8 +6,9 @@
  * 3. 运行仓库测试命令
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import type { OpenedFile, P4Client } from "./p4.js";
+import { parseVerificationCommands, resolveVerificationCommand, type VerificationCommand } from "./verificationCommands.js";
 
 export class VerificationError extends Error {}
 
@@ -70,6 +71,8 @@ export interface TestResult {
 
 export interface VerificationStep extends TestResult {
   command: string;
+  cwd: string;
+  timeout_sec: number;
 }
 
 export interface VerificationPipelineResult {
@@ -106,16 +109,21 @@ export function runTests(repoPath: string, testCmd: string, timeout = 600000): P
       shell: true,
       cwd: repoPath,
       windowsHide: true,
+      detached: process.platform !== "win32",
     });
-    let output = "";
+    let output = "", timedOut = false;
     const sink = (d: Buffer) => {
-      output += d.toString();
+      output = (output + d.toString()).slice(-100000);
     };
     child.stdout?.on("data", sink);
     child.stderr?.on("data", sink);
     const timer = setTimeout(() => {
-      child.kill();
-      resolve({ ok: false, output: `测试超时(${Math.round(timeout / 1000)}s)` });
+      timedOut = true;
+      if (process.platform === "win32" && child.pid) {
+        execFile("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true }, () => child.kill());
+      } else if (child.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+      }
     }, timeout);
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -123,7 +131,7 @@ export function runTests(repoPath: string, testCmd: string, timeout = 600000): P
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ ok: code === 0, output: output.slice(-1500) });
+      resolve({ ok: !timedOut && code === 0, output: timedOut ? `测试超时(${Math.round(timeout / 1000)}s)` : output.slice(-1500) });
     });
   });
 }
@@ -131,11 +139,11 @@ export function runTests(repoPath: string, testCmd: string, timeout = 600000): P
 /** 顺序执行机器验证；严格模式下无命令不是成功，而是“未验证”。 */
 export async function runVerificationPipeline(
   repoPath: string,
-  commands: string[],
+  commands: VerificationCommand[],
   required: boolean,
   timeout = 600000,
 ): Promise<VerificationPipelineResult> {
-  const normalized = commands.map((command) => command.trim()).filter(Boolean);
+  const normalized = parseVerificationCommands(commands).map(command => resolveVerificationCommand(repoPath, command, timeout));
   if (!normalized.length) {
     return {
       configured: false,
@@ -146,15 +154,15 @@ export async function runVerificationPipeline(
   }
 
   const steps: VerificationStep[] = [];
-  for (const command of normalized) {
-    const result = await runTests(repoPath, command, timeout);
-    steps.push({ command, ...result });
+  for (const { command, cwd, timeout_ms } of normalized) {
+    const result = await runTests(cwd, command, timeout_ms);
+    steps.push({ command, cwd, timeout_sec: timeout_ms / 1000, ...result });
     if (!result.ok) {
       return {
         configured: true,
         ok: false,
         steps,
-        summary: `验证失败: ${command}\n${result.output}`,
+        summary: `验证失败: ${command} (cwd: ${cwd})\n${result.output}`,
       };
     }
   }
@@ -162,7 +170,7 @@ export async function runVerificationPipeline(
     configured: true,
     ok: true,
     steps,
-    summary: steps.map((step) => `[PASS] ${step.command}`).join("\n"),
+    summary: steps.map((step) => `[PASS] ${step.command} (cwd: ${step.cwd})`).join("\n"),
   };
 }
 

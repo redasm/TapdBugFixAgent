@@ -7,6 +7,7 @@ import yaml from "js-yaml";
 
 import type { AdmissionPolicy } from "./quality.js";
 import { parseBehaviorConfig, type BehaviorChecksConfig } from "./behaviorDiscovery.js";
+import { parseVerificationCommands, resolveVerificationCommand, type VerificationCommand } from "./verificationCommands.js";
 import {
   mcpServerConfigProblems,
   parseMcpServers,
@@ -28,8 +29,8 @@ export const DEFAULT_EXCLUDE_STATUS = ["resolved", "closed", "rejected"];
 export interface RepoConfig {
   name: string;
   path: string;
-  /** 按顺序执行的机器验证命令。 */
-  verify_cmds: string[];
+  /** 按顺序执行原生构建/测试命令，可指定已有测试工程的执行目录。 */
+  verify_cmds: VerificationCommand[];
   /** 从专用目录发现行为测试；修改前冻结，修改后重跑同一份。 */
   behavior_checks?: BehaviorChecksConfig;
   /** P4 工作区中允许保留的本地生成路径；不参与脏检查、reconcile、diff 或 changelist。 */
@@ -50,7 +51,7 @@ export interface AdditionalDirConfig {
   /** 修复分支作者段；空值时回退到 p4.user / workspace.owner。 */
   author: string;
   /** 在该目录中按顺序执行的机器验证命令。 */
-  verify_cmds: string[];
+  verify_cmds: VerificationCommand[];
   /** 允许保留的本地生成路径；相对 Git 根目录，不参与干净检查、diff、提交或失败回滚。 */
   ignore_paths?: string[];
 }
@@ -251,9 +252,7 @@ function buildRepos(data: unknown, configDir: string): RepoConfig[] {
   for (const item of Array.isArray(data) ? data : []) {
     if (!item || typeof item !== "object") continue;
     const d = item as Record<string, unknown>;
-    const verifyCmds = Array.isArray(d.verify_cmds)
-      ? d.verify_cmds.map(String).map((v) => v.trim()).filter(Boolean)
-      : [];
+    const verifyCmds = parseVerificationCommands(d.verify_cmds);
     const ignorePaths = Array.isArray(d.ignore_paths)
       ? d.ignore_paths.map(String).map((value) => value.trim()).filter(Boolean)
       : [];
@@ -262,7 +261,7 @@ function buildRepos(data: unknown, configDir: string): RepoConfig[] {
       name: String(d.name ?? ""),
       path: String(d.path ?? ""),
       verify_cmds: verifyCmds,
-      behavior_checks: parseBehaviorConfig(d.behavior_checks, configDir),
+      behavior_checks: parseBehaviorConfig(d.behavior_checks, configDir, String(d.path ?? "")),
       ignore_paths: ignorePaths,
       preflight_reconcile: preflightReconcile as RepoConfig["preflight_reconcile"],
       additional_dirs: buildAdditionalDirs(d.additional_dirs),
@@ -276,9 +275,7 @@ function buildAdditionalDirs(data: unknown): AdditionalDirConfig[] {
   for (const item of Array.isArray(data) ? data : []) {
     if (!item || typeof item !== "object") continue;
     const d = item as Record<string, unknown>;
-    const verifyCmds = Array.isArray(d.verify_cmds)
-      ? d.verify_cmds.map(String).map((value) => value.trim()).filter(Boolean)
-      : [];
+    const verifyCmds = parseVerificationCommands(d.verify_cmds);
     const ignorePaths = Array.isArray(d.ignore_paths)
       ? d.ignore_paths.map(String).map((value) => value.trim()).filter(Boolean)
       : [];
@@ -506,6 +503,10 @@ export function validateConfig(cfg: Config): string[] {
       if (cfg.quality.require_verification && !repo.verify_cmds.length) {
         problems.push(`仓库 ${repo.name ?? ""} 未配置 verify_cmds；候选补丁不会标记为已验证`);
       }
+      for (const command of repo.verify_cmds) {
+        const { cwd } = resolveVerificationCommand(repo.path, command);
+        if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) problems.push(`仓库 ${repo.name} 的验证执行目录不存在: ${cwd}`);
+      }
       for (const ignored of repo.ignore_paths ?? []) {
         const normalized = ignored.replace(/\\/g, "/");
         if (path.isAbsolute(ignored) || normalized.split("/").includes("..")) {
@@ -538,6 +539,10 @@ export function validateConfig(cfg: Config): string[] {
         }
         if (cfg.quality.require_verification && !dir.verify_cmds.length) {
           problems.push(`附加目录 ${dir.name || "(未命名)"} 未配置 verify_cmds；候选补丁不会标记为已验证`);
+        }
+        for (const command of dir.verify_cmds) {
+          const { cwd } = resolveVerificationCommand(dir.path, command);
+          if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) problems.push(`附加目录 ${dir.name} 的验证执行目录不存在: ${cwd}`);
         }
       }
     }

@@ -231,8 +231,8 @@ describe("descgen", () => {
     expect(desc).toContain("a.xlsx");
   });
 
-  it("bugShortId：真实 id = 1+workspace+前导零序号 → 去前导零短号", () => {
-    // 真实形态：workspace 12345678，id 1123456780·001257090 → b1257090
+  it("bugShortId：示例 id = 1+workspace+前导零序号 → 去前导零短号", () => {
+    // 示例形态：workspace 12345678，id 112345678·0001257090 → b1257090
     expect(bugShortId({ id: "1123456780001257090", workspace_id: "12345678" })).toBe("1257090");
     // 序号无前导零
     expect(bugShortId({ id: "1123456780001256834", workspace_id: "12345678" })).toBe("1256834");
@@ -245,15 +245,15 @@ describe("descgen", () => {
     expect(bugShortId({ id: "0", workspace_id: "12345678" })).toBe("0");
   });
 
-  it("bugShortId + 标题 = Tapd「复制Bug单信息」的文本格式（真实单验证）", () => {
-    // 真实单：id 1123456780001257090，标题自带【模块】前缀（swarm 校验用）
+  it("bugShortId + 标题 = Tapd「复制Bug单信息」的文本格式（示例单验证）", () => {
+    // 示例单：id 1123456780001257090，标题自带【模块】前缀（swarm 校验用）
     const bug = makeBug({
       id: "1123456780001257090",
       workspace_id: "12345678",
-      title: "【爬塔二期】【排行榜】排名显示错误，预期显示13实际显示了9",
+      title: "【示例模块】【排行榜】排名显示错误，预期显示13实际显示了9",
     });
     const desc = buildDescription(bug, makeResult({ summary: "修复" }));
-    expect(desc.split("\n")[0]).toBe("【b1257090】【爬塔二期】【排行榜】排名显示错误，预期显示13实际显示了9");
+    expect(desc.split("\n")[0]).toBe("【b1257090】【示例模块】【排行榜】排名显示错误，预期显示13实际显示了9");
   });
 });
 
@@ -1342,7 +1342,7 @@ describe("planned_files 工作区校验", () => {
 
   it("未知根别名不能绕过 Git 分支准备和变更采集", () => {
     const checked = requireExistingPlannedFiles(
-      investigation("engine:Engine/Source/Foo.cpp"),
+      investigation("unknown-engine:Engine/Source/Foo.cpp"),
       [{ alias: "project", path: "C:/project" }, { alias: "engine", path: "E:/engine" }],
     );
     expect(checked.ok).toBe(false);
@@ -2768,6 +2768,9 @@ describe("worker 两阶段修复协议", () => {
       .toEqual(["[project] project-test"]);
     expect(verificationCommands(repo, ["engine:Engine/Source/Foo.cpp"]))
       .toEqual(["[engine] engine-test"]);
+    repo.verify_cmds = [{ command: "npm test -- --run", cwd: "tests", timeout_sec: 90 }];
+    expect(verificationCommands(repo, ["project:TypeScript/Src/Foo.ts"])[0])
+      .toContain("npm test -- --run (执行目录: tests");
   });
 
   it("Git 工作区已有改动只进入阻塞，不消耗模型重试", async () => {
@@ -3458,7 +3461,7 @@ describe("worker 两阶段修复协议", () => {
     expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
   });
 
-  it("仅在机器验证实际通过后调用 Reviewer 并标记评审通过", async () => {
+  it("空白验证命令作为配置错误转人工评审，不调用 Reviewer", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     w.config.review.enabled = true;
     w.config.workspaces[0].repos[0].verify_cmds = ["   "];
@@ -3490,7 +3493,8 @@ describe("worker 两阶段修复协议", () => {
     await w.processBug(bug);
 
     expect(calls).toHaveLength(2);
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("manual_review");
+    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("命令不能为空");
   });
 
   it("Agent 修改 planned_files 之外的文件时拒绝自动候选，但保留到人工评审 changelist", async () => {

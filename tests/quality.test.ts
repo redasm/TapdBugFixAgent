@@ -89,7 +89,7 @@ describe("BugContextBuilder", () => {
     const description = [
       "异常详情地址: https://crashsight.qq.com/crash-reporting/crashes/app/issue/report?pid=10",
       "出错堆栈: UUIDynmaicTextureAtlasMgr::RemoveFromAtlas",
-      "D:\\WS\\Engine\\Plugins\\custom\\LGUI\\LGUI\\Source\\Private\\UIDynmaicTextureAtlasMgr.cpp:173",
+      "D:\\WS\\Engine\\Plugins\\Vendor\\LGUI\\LGUI\\Source\\Private\\UIDynmaicTextureAtlasMgr.cpp:173",
     ].join(" ");
     const bug = makeBug({
       title: "【CrashSight一键提单】Fatal Error UUIDynmaicTextureAtlasMgr::RemoveFromAtlas",
@@ -108,6 +108,15 @@ describe("BugContextBuilder", () => {
     expect(formatBugContext(context)).toContain("外部诊断链接");
     expect(result.disposition).toBe("auto_fix");
     expect(result.reasons).toEqual([]);
+  });
+
+  it.each([
+    ["D:/Engine/Plugins/DirectPlugin/Source/Private/Example.cpp:12", "DirectPlugin"],
+    ["D:/Engine/Plugins/AnotherVendor/NestedPlugin/Source/Private/Example.cpp:12", "NestedPlugin"],
+    ["D:/Engine/Plugins/Category/Vendor/DeepPlugin/Source/Private/Example.cpp:12", "DeepPlugin"],
+    ["D:/Engine/Source/Runtime/Core/Private/Example.cpp:12", "Core"],
+  ])("插件路径识别不依赖厂商名称：%s", (description, module) => {
+    expect(buildBugContext(makeBug({ title: "Crash", description, module: "", raw: {} })).module).toBe(module);
   });
 
   it("只有受登录保护的 Sentry 链接和 Crash 标题时也允许进入只读调查", () => {

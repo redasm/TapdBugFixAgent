@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { defaultSearchPaths } from "./search.js";
+import { formatVerificationCommand } from "./verificationCommands.js";
 import { evidenceHash, hasPatchEvidence } from "./attemptAudit.js";
 import { sourceEvidence, runtimeEvidence } from "./sourceEvidence.js";
 import { scopeAmendment, validateAmendedScope } from "./scopeAmendment.js";
@@ -638,12 +639,12 @@ export class Worker {
     const plannedRoots = this.plannedRoots(plannedFiles ?? []);
     return [
       ...(!plannedFiles || plannedRoots.has("project")
-        ? repo.verify_cmds.map((command) => `[project] ${command}`)
+        ? repo.verify_cmds.map((command) => `[project] ${formatVerificationCommand(command)}`)
         : []),
       ...(repo.additional_dirs ?? []).flatMap((dir) =>
         plannedFiles && !plannedRoots.has(dir.name.toLowerCase())
           ? []
-          : dir.verify_cmds.map((command) => `[${dir.name.toLowerCase()}] ${command}`)),
+          : dir.verify_cmds.map((command) => `[${dir.name.toLowerCase()}] ${formatVerificationCommand(command)}`)),
     ];
   }
 
@@ -825,7 +826,7 @@ export class Worker {
       opened: actualOpened,
       gitFiles: rootedGitFiles,
       diff,
-      summary: pipelines.map(({ name, result }) => `[${name}][L0 静态检查] ${result.summary}`).join("\n")
+      summary: pipelines.map(({ name, result }) => `[${name}][配置的构建/测试命令] ${result.summary}`).join("\n")
         + `\n行为验证: ${behavior.level === "L1" ? "L1 目标复现及对照通过" : "待验收"}\n${behavior.unverified_items.join("\n")}`,
       verified: pipelines.every(({ result }) => result.ok && result.configured),
       behavior, pipelines,
