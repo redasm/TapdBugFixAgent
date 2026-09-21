@@ -21,6 +21,14 @@ import { evidenceHash } from "./attemptAudit.js";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { Config, PiConfig } from "./config.js";
+import {
+  AGENT_ROLE_PURPOSE,
+  SUB_AGENT_ORCHESTRATION_DEPTH,
+  agentRoleModel,
+  agentRoleTimeoutS,
+  piProviderModelIds,
+  type AgentRole,
+} from "./agentRoles.js";
 import { p4EnvFromConfig } from "./p4.js";
 import {
   inspectMcpServer,
@@ -35,12 +43,73 @@ import {
   type AgentMediaInput,
 } from "./media.js";
 
+let piCallSeq = 0;
+
+/** 本地短调用关联 ID：把一次 PiAgent.run 产生的全部进度/错误/结束行归属到一起。
+ *  只含序号与随机后缀，不含 prompt、参数或凭据；进程重启后重新计数，跨进程不保证唯一。
+ *  用途：旧调用的 close/stderr 延迟到达时，能和新调用区分开（此前两者日志完全无法归属）。 */
+function newPiCallId(): string {
+  piCallSeq += 1;
+  // 后缀补齐到 4 位：Math.random() 可能给出很短（甚至空）的 36 进制串。
+  const suffix = Math.random().toString(36).slice(2, 6).padEnd(4, "0");
+  return `pi#${piCallSeq.toString(36)}-${suffix}`;
+}
+
+/** 统一的进度关联标签；所有本次调用的进度行都以它开头。 */
+function piCallTag(callId: string): string {
+  return `[${callId}]`;
+}
+
+/** 首个事件只记录 type 作为诊断标识：限制为短标识符，无法识别（缺失/非字符串/含换行等）记为 unknown，
+ *  绝不输出事件 payload 或 JSON 原文。 */
+function piEventTypeLabel(type: unknown): string {
+  const text = typeof type === "string" ? type.trim() : "";
+  return /^[A-Za-z0-9_.-]{1,40}$/.test(text) ? text : "unknown";
+}
+
 export class AgentRuntimeError extends Error {}
 
 export class AgentCancelledError extends AgentRuntimeError {}
 
 /** 外部运行依赖不可用；应等待环境恢复，不消耗 Bug 自动重试次数。 */
 export class AgentInfrastructureError extends AgentRuntimeError {}
+
+/** provider/模型服务的可用性故障类型。
+ *  - transient：限流、网络抖动、5xx —— 短期指数退避即可恢复；
+ *  - quota：额度/余额耗尽 —— 短期重试无意义，需要人工补充额度或更换 Key；
+ *  - auth：鉴权失效、Key 无效/无权限 —— 同样需要人工处理。
+ *  后两者仍保留有界冷却并在到期后自动探测，避免永久静默停机，但必须给出人工恢复提示。 */
+export type ProviderFailureKind = "transient" | "quota" | "auth";
+
+/** provider/模型服务不可用（限流/网络/5xx/额度/鉴权）。
+ *  必须与 AgentInfrastructureError 分开：后者是编排侧基础设施（如 required MCP 预检），
+ *  往往指向当前工作区/配置问题；本错误是外部模型服务的可用性问题，不得标记成工作区阻塞，
+ *  也不得消耗 Bug 的普通修复尝试次数。 */
+export class ProviderUnavailableError extends AgentRuntimeError {
+  readonly kind: ProviderFailureKind;
+  constructor(message: string, kind: ProviderFailureKind = "transient") {
+    super(message);
+    this.kind = kind;
+  }
+}
+
+/** 由 provider 错误文本判定故障类型。
+ *  判定顺序必须是 quota → auth → transient：真实报文形如
+ *  `429 {"error":{"message":"API Key 额度已用完，请使用还有额度的Key"}}`，
+ *  若先按 429/限流处理会退化成短期退避，把队列反复喂给已经欠费的 provider。
+ *  quota 只认明确的额度/计费词——刻意不收 `不足/超出/exceeded/insufficient` 这类泛词：
+ *  `429 rate limit exceeded` 会被误判成额度耗尽（错误地进入长冷却），
+ *  `403 权限不足` 会被从 auth 抢成 quota。 */
+export function classifyProviderFailure(message: string): ProviderFailureKind {
+  const text = String(message ?? "");
+  if (/(额度|余额|欠费|已用完|quota|insufficient[ _-]?quota|billing|payment|credits?)/i.test(text)) {
+    return "quota";
+  }
+  if (/(\b40[13]\b|unauthor|authentication|invalid[ _-]?api[ _-]?key|api[ _-]?key.{0,12}(无效|错误|失效|过期)|鉴权|认证失败|权限不足|无权限)/i.test(text)) {
+    return "auth";
+  }
+  return "transient";
+}
 
 /** Agent 已出现重复命令或超出工具预算；partialOutput 用于强制收敛已有证据。 */
 export class AgentInvestigationLimitError extends AgentRuntimeError {
@@ -620,7 +689,13 @@ export function formatRetryEvidence(entries: RetryEvidenceEntry[]): string {
 export interface AgentRunOptions {
   prompt: string;
   repoDir: string;
-  timeoutS: number;
+  /** 本阶段时限（秒）。省略时按角色配置 / agent_timeout_s 解析。 */
+  timeoutS?: number;
+  /** 显式子 Agent 角色：写入审计与进度，并作为 model/timeout 的默认来源。
+   *  角色只在编排器侧生效，每次调用仍是独立上下文，不存在子调用递归。 */
+  role?: AgentRole;
+  /** role 的兼容别名（两者同时给出时 role 优先）。 */
+  agentRole?: AgentRole;
   onProgress?: (msg: string) => void;
   onAudit?: (event: Record<string, unknown>) => void;
   cancelEvent?: CancelEvent;
@@ -667,7 +742,9 @@ export function effectivePiProviderId(pi: PiConfig): string {
 }
 
 /** 有效 `--model` 值（`<provider>/<model_id>`）。未配置 provider / model_id 返回 ""（pi 用默认模型）。
- *  model_id 若已带 "/"（直接写全限定名）则原样返回，否则拼前缀。 */
+ *  model_id 若已带 "/"（直接写全限定名）则原样返回，否则拼前缀。
+ *  注意：model_id 现在是**可选回退**——只配 base_url/api_key、模型全部由 agents.roles.<role>.model
+ *  提供时这里返回 ""（不传 --model，由角色配置逐个角色指定），provider 仍会正常注册。 */
 export function effectivePiModel(pi: PiConfig): string {
   const p = pi.provider;
   if (!p?.model_id) return "";
@@ -678,34 +755,37 @@ export function effectivePiModel(pi: PiConfig): string {
  *  - 只覆盖 providers.<id> 这一项，保留用户已配置的其它 provider / 内置 provider。
  *  - apiKey 优先取 p.api_key，否则把 p.api_key_env 写成 `$ENV_VAR`（运行期由 pi 解析，
  *    密钥不落盘）。两者都缺则使用 `$PI_API_KEY`。
- *  - 模型 id 取 p.model_id（带 "/" 时取最后一段，与 effectivePiModel 的 --model 值对应）；
- *    缺 model_id 则不写（交给 pi 报错）。
- *  modelsPath 参数仅测试用。
- */
-export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void {
+ *  - models 是**动态收集**的：`p.model_id`（可选回退）+ 所有属于本 provider 的
+ *    `agents.roles.<role>.model`。只填 base_url/api_key 也能注册 provider，模型由角色配置提供；
+ *    别的 provider 的角色模型不会被误注册进本 provider（见 roleModelIdsForProvider）。
+ *  - model_id 的作用收敛为两点：①作为默认模型项（缺失时为有效 `--model` 值）；②收集角色模型时的
+ *    裸名归属提示。model_id 与角色模型都可缺省时 models 为空数组——provider 仍会注册
+ *    （base_url/api_key 生效），只是没有可用模型，由 pi 报错，编排器在启动告警里已提示。
+ *  modelsPath 参数仅测试用；cfg 可选，用于收集角色模型（缺省 = 只注册 pi.provider 默认模型）。 */
+export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH, cfg?: Config): void {
   const p = pi.provider;
   if (!p?.base_url) return;
-  const rawModel = p.model_id ?? "";
-  const modelId = rawModel.includes("/") ? rawModel.split("/").pop() ?? "" : rawModel;
-  if (!modelId) return;
+  const providerId = effectivePiProviderId(pi);
+  // 模型集合与 piProviderModelIds / 启动告警逐字同源：model_id（可选回退）在前，
+  // 其后是归属本 provider 的角色模型；跨 provider 的角色模型不会混进来。
+  // 未传 cfg（旧调用方）时按「只有 pi.provider 默认模型」处理，与改造前逐字一致。
+  const modelIds = piProviderModelIds((cfg as Config | undefined) ?? ({ pi } as Config));
 
   const apiKey = p.api_key || `$${p.api_key_env || "PI_API_KEY"}`;
   const entry: Record<string, unknown> = {
     baseUrl: p.base_url,
     api: "anthropic-messages",
     apiKey,
-    models: [
-      {
-        id: modelId,
-        name: modelId,
-        reasoning: p.reasoning ?? true,
-        input: ["text", "image"],
-        contextWindow: p.context_window ?? 200000,
-        // Pi 的 anthropic-messages provider 及当前公司网关都要求 max_tokens <= 131072。
-        // 配置过大时网关返回 400，但 pi 进程仍可能 exit=0，因此在请求发出前钳制。
-        maxTokens: Math.min(Math.max(1, p.max_tokens ?? 32000), 131072),
-      },
-    ],
+    models: modelIds.map((modelId) => ({
+      id: modelId,
+      name: modelId,
+      reasoning: p.reasoning ?? true,
+      input: ["text", "image"],
+      contextWindow: p.context_window ?? 200000,
+      // Pi 的 anthropic-messages provider 及当前公司网关都要求 max_tokens <= 131072。
+      // 配置过大时网关返回 400，但 pi 进程仍可能 exit=0，因此在请求发出前钳制。
+      maxTokens: Math.min(Math.max(1, p.max_tokens ?? 32000), 131072),
+    })),
   };
   if (p.auth_header ?? true) entry.authHeader = true;
 
@@ -721,7 +801,7 @@ export function ensurePiModels(pi: PiConfig, modelsPath = PI_MODELS_PATH): void 
   const providers = (root.providers && typeof root.providers === "object"
     ? root.providers
     : {}) as Record<string, unknown>;
-  providers[effectivePiProviderId(pi)] = entry;
+  providers[providerId] = entry;
   root.providers = providers;
   fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
   fs.writeFileSync(modelsPath, JSON.stringify(root, null, 2) + "\n");
@@ -778,17 +858,37 @@ export class PiAgent {
 
   async run(opts: AgentRunOptions): Promise<AgentResult> {
     const audit = new PiAudit(), auditStarted=Date.now();
-    opts.onAudit?.({ kind: "agent_input", prompt_hash: evidenceHash(opts.prompt), model: opts.model || effectivePiModel(this.config.pi), timeout_s: opts.timeoutS, tools: opts.tools ?? null });
-    // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）
+    // 本次调用的本地关联 ID：所有进度/错误/结束行都带同一标签，便于区分延迟到达的旧调用输出。
+    const callId = newPiCallId();
+    const tag = piCallTag(callId);
+    /** 统一进度出口：只附加本次调用标签，不改变原有异常传播语义。 */
+    const say = (msg: string) => opts.onProgress?.(`${tag} ${msg}`);
+    // 集中解析角色：显式传参 > agents.roles.<role> 配置 > 全局默认（pi.provider 模型 / agent_timeout_s）。
+    // 未指定角色时 model/timeout 的取值与改造前逐字一致。
+    const role = opts.role ?? opts.agentRole ?? null;
+    const model = opts.model?.trim()
+      || (role ? agentRoleModel(this.config, role) : "")
+      || effectivePiModel(this.config.pi);
+    const timeoutS = opts.timeoutS
+      ?? (role ? agentRoleTimeoutS(this.config, role, this.config.agent_timeout_s) : this.config.agent_timeout_s);
+    // 审计只落角色、模型、时限、工具与 prompt 哈希，绝不把 prompt 明文写进日志。
+    opts.onAudit?.({
+      kind: "agent_input", call_id: callId, role, role_purpose: role ? AGENT_ROLE_PURPOSE[role] : null,
+      orchestration_depth: SUB_AGENT_ORCHESTRATION_DEPTH,
+      prompt_hash: evidenceHash(opts.prompt), model, timeout_s: timeoutS,
+      tools: opts.tools ?? null, sandbox: opts.sandboxMode ?? "workspace-write",
+    });
+    // config.yaml 配置了 pi.provider 时，先合并写入 models.json（失败不阻断 spawn，pi 自带报错）。
+    // 传入完整 config：models 列表要动态收集属于本 provider 的 agents.roles.<role>.model。
     try {
-      ensurePiModels(this.config.pi);
+      ensurePiModels(this.config.pi, PI_MODELS_PATH, this.config);
     } catch (exc) {
       const msg = (exc as Error).message;
-      opts.onProgress?.(`[警告] 写入 pi models.json 失败（已忽略）: ${msg}`);
+      say(`[警告] 写入 pi models.json 失败（已忽略）: ${msg}`);
     }
 
     if (opts.additionalDirs?.length) {
-      opts.onProgress?.(
+      say(
         "[警告] Pi 通过提示词获知附加目录，目录访问范围不受操作系统沙箱隔离",
       );
     }
@@ -843,8 +943,8 @@ export class PiAgent {
     // 表现为「处理中无进度 + 每次跑满 agent_timeout 超时」。--mode json 不隐含非交互。
     // 另一个挂起点是 spawn 的 stdin（见下方 stdio: ["ignore","pipe","pipe"]）：
     // 二者缺一都会让 pi 永远等输入，二者同时满足才能让 --print 真正执行。
-    // 模型覆盖：由 provider 构造 `--model <provider>/<model_id>`；未配置则不传（pi 用默认模型）
-    const model = opts.model?.trim() || effectivePiModel(this.config.pi);
+    // 模型覆盖：由 provider 构造 `--model <provider>/<model_id>`；未配置则不传（pi 用默认模型）。
+    // 取值已在调用开始时按「显式 > 角色配置 > provider 默认」解析完成。
     if (model) args.push("--model", model);
     if (opts.thinkingLevel) args.push("--thinking", opts.thinkingLevel);
     const activeTools = opts.tools?.length
@@ -875,11 +975,14 @@ export class PiAgent {
       args.push("--extension", extension);
     }
 
-    opts.onProgress?.(
-      `Pi: 准备调用模型 ${model || "(Pi 默认模型)"}（sandbox=${opts.sandboxMode ?? "workspace-write"}，timeout=${opts.timeoutS}s）`,
+    // 角色可见性单独一行：未指定角色时不产生任何额外输出，原有进度行保持逐字不变。
+    // 只写角色名与用途，不落 prompt 明文。
+    if (role) say(`Pi: 角色 role=${role}（${AGENT_ROLE_PURPOSE[role]}）`);
+    say(
+      `Pi: 准备调用模型 ${model || "(Pi 默认模型)"}（sandbox=${opts.sandboxMode ?? "workspace-write"}，timeout=${timeoutS}s）`,
     );
     if (mcpServers.length) {
-      opts.onProgress?.(
+      say(
         `MCP: Pi 配置已注入 ${mcpServers.length} 个服务：${mcpServers.map((server) => server.name).join(", ")}`,
       );
     }
@@ -926,10 +1029,19 @@ export class PiAgent {
       stderrBuf = final ? "" : tail;
       for (const line of parts) {
         const text = line.trim();
-        if (text) opts.onProgress?.(`Pi stderr: ${text.slice(0, 500)}`);
+        if (text) say(`Pi stderr: ${text.slice(0, 500)}`);
       }
-      if (final && tail.trim()) opts.onProgress?.(`Pi stderr: ${tail.trim().slice(0, 500)}`);
+      if (final && tail.trim()) say(`Pi stderr: ${tail.trim().slice(0, 500)}`);
     };
+    // spawn 事件：只有真正启动成功才会触发（失败走 'error'）。Windows 上 shell:true，
+    // 因此 pid 是 cmd.exe 外壳进程，不是 pi 的 Node 进程——只声明事实，不冒充 pi PID。
+    proc.on("spawn", () => {
+      const pid = proc.pid;
+      say(
+        `Pi: 已启动子进程 pid=${pid ?? "未知"}（距调用开始=${Date.now() - auditStarted}ms`
+        + `${isWin ? "；Windows 下为 cmd.exe 外壳 PID，非 pi Node 进程 PID" : ""}）`,
+      );
+    });
     proc.stderr?.on("data", (d: Buffer) => {
       const text = d.toString();
       errChunks.push(text);
@@ -942,11 +1054,12 @@ export class PiAgent {
     let textBuf = "";
     const progressTrace: string[] = [];
     let lastProgressAt = Date.now();
+    let firstEventLogged = false;
     const rememberProgress = (message: string) => {
       lastProgressAt = Date.now();
       progressTrace.push(message);
       if (progressTrace.length > 500) progressTrace.shift();
-      opts.onProgress?.(message);
+      say(message);
     };
     const commandGuard = new CommandExecutionGuard(
       opts.maxCommandExecutions,
@@ -963,8 +1076,16 @@ export class PiAgent {
     };
     const onLine = (line: string) => {
       outLines.push(line);
+      let firstEventType: string | undefined;
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
+        // null / 基础类型 / 数组不是 pi 事件：按非事件行忽略，不计入事件数也不做首事件记录。
+        if (!event || typeof event !== "object" || Array.isArray(event)) return;
+        // 首个成功解析的 JSON 事件：只记录 type（不输出 JSON 内容或事件 payload）。
+        if (!firstEventLogged) {
+          firstEventLogged = true;
+          firstEventType = piEventTypeLabel(event.type);
+        }
         activity.observe(event);
         audit.observe(event);
         const delta = event.assistantMessageEvent as { type?: string } | undefined;
@@ -988,6 +1109,9 @@ export class PiAgent {
         }
         // 非 JSON 行由后续进度解析自然忽略。
       }
+      if (firstEventType !== undefined) {
+        say(`Pi 首个事件: type=${firstEventType}（距调用开始=${Date.now() - auditStarted}ms）`);
+      }
       if (!opts.onProgress) return;
       try {
         const p = parseProgress(line);
@@ -1006,7 +1130,7 @@ export class PiAgent {
     const rl = readline.createInterface({ input: proc.stdout! });
     rl.on("line", onLine);
 
-    const deadline = Date.now() + opts.timeoutS * 1000;
+    const deadline = Date.now() + timeoutS * 1000;
     const completionGraceMs = Math.max(0, opts.completionGraceSeconds ?? 0) * 1000;
     const hardDeadline = deadline + completionGraceMs;
     const firstWriteDeadline = opts.maxSecondsBeforeWrite
@@ -1027,7 +1151,7 @@ export class PiAgent {
         const now = Date.now();
         if (now - lastActivityReport >= 30000) {
           lastActivityReport = now;
-          opts.onProgress?.(`Pi 状态: ${activity.summary(now)}`);
+          say(`Pi 状态: ${activity.summary(now)}`);
         }
         const outputStillProgressing = completionGraceMs > 0
           && now - lastProgressAt <= 10_000
@@ -1036,7 +1160,7 @@ export class PiAgent {
           killProcessTree(proc);
           clearInterval(watchdog);
           reject(new AgentTimeoutError(
-            `Agent 调用超时(${opts.timeoutS}s): pi；${activity.summary(now)}`,
+            `Agent 调用超时(${timeoutS}s): pi；${activity.summary(now)}`,
             piRecoveryTrace(outLines),
             writeProgressGuard.hasWritten,
           ));
@@ -1054,14 +1178,14 @@ export class PiAgent {
       }, 200);
       proc.on("error", (err) => {
         clearInterval(watchdog);
-        opts.onProgress?.(`Pi: 启动异常 · ${err.message}`);
+        say(`Pi: 启动异常 · ${err.message}`);
         reject(new AgentRuntimeError(`无法执行 pi: ${err.message}`));
       });
       proc.on("close", (code) => {
         clearInterval(watchdog);
         flushStderr(true);
         if (guardFailure) {
-          opts.onProgress?.(`Pi: ${guardFailure.message}`);
+          say(`Pi: ${guardFailure.message}`);
           reject(guardFailure);
           return;
         }
@@ -1086,7 +1210,7 @@ export class PiAgent {
           providerError ? `Pi provider error: ${providerError}` : "",
           finalText.slice(-2500),
         ].filter(Boolean).join("\n").trim();
-        opts.onProgress?.(`Pi: 进程结束（exit=${code ?? -1}）`);
+        say(`Pi: 进程结束（exit=${code ?? -1}）`);
         resolve(ar);
       });
     });
@@ -1095,7 +1219,7 @@ export class PiAgent {
     try {
       completed = await result;
     } finally {
-      opts.onAudit?.({ kind: "agent_usage", ...audit.result(), elapsed_seconds: (Date.now()-auditStarted)/1000 });
+      opts.onAudit?.({ kind: "agent_usage", call_id: callId, role, ...audit.result(), elapsed_seconds: (Date.now()-auditStarted)/1000 });
       // 清理 Windows 临时 prompt 文件
       if (promptTmpDir) {
         try {
@@ -1106,11 +1230,19 @@ export class PiAgent {
       }
     }
     if (!completed.ok && media.length && isMediaCapabilityError(completed.log)) {
-      opts.onProgress?.("Pi: 当前接口拒绝或无法抓取多媒体 URL，自动降级为普通链接重试");
+      say("Pi: 当前接口拒绝或无法抓取多媒体 URL，自动降级为普通链接重试（下一次调用使用新的关联 ID）");
       return this.run({ ...opts, media: undefined, prompt: effectivePrompt });
     }
     if (!completed.ok && completed.log.includes("Pi provider error:")) {
-      throw new AgentInfrastructureError(completed.log);
+      // 只把 provider 错误那一行交给分类器：completed.log 还含助手输出，可能提到
+      // “额度/权限/工作区”等词，整段匹配会造成误判。
+      const providerLine = completed.log
+        .split("\n")
+        .find((line) => line.includes("Pi provider error:")) ?? completed.log;
+      throw new ProviderUnavailableError(
+        providerLine.trim(),
+        classifyProviderFailure(providerLine),
+      );
     }
     return completed;
   }

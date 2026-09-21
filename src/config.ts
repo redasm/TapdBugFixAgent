@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 
 import type { AdmissionPolicy } from "./quality.js";
+import { parseAgentsConfig, piProviderModelsProblem, type AgentsConfig } from "./agentRoles.js";
 import { parseBehaviorConfig, type BehaviorChecksConfig } from "./behaviorDiscovery.js";
 import { parseVerificationCommands, resolveVerificationCommand, type VerificationCommand } from "./verificationCommands.js";
 import {
@@ -99,8 +100,6 @@ export interface ReviewConfig {
   enabled: boolean;
   /** Reviewer 拒绝后允许 Fixer 定向修正的轮数。 */
   max_fix_rounds: number;
-  /** 可选独立评审模型；空值沿用修复模型。 */
-  model: string;
 }
 
 /** Web 设置页可编辑的配置项，持久化到 overrides.yaml（不重写带注释的 config.yaml）。
@@ -120,7 +119,11 @@ const PI_PROVIDER_FIELDS = [
   "model_id", "reasoning", "context_window", "max_tokens",
 ] as const;
 const TAPD_SCALAR_FIELDS = ["backend", "access_token", "api_user", "api_password"] as const;
-const REVIEW_FIELDS = ["enabled", "max_fix_rounds", "model"] as const;
+const REVIEW_FIELDS = ["enabled", "max_fix_rounds"] as const;
+
+/** 已移除配置字段的迁移提示：只提示、不生效，也不引入兼容层。 */
+export const REVIEW_MODEL_MIGRATION_NOTE =
+  "配置里的 review.model 已移除（不再生效）；需要 Reviewer 使用独立模型时，请配置 agents.roles.review.model";
 
 /** 读取 overrides.yaml（不存在或损坏 → null）。 */
 export function readSettingsOverrides(path = SETTINGS_PATH): SettingsOverrides | null {
@@ -188,7 +191,9 @@ export function saveSettingsOverrides(ov: SettingsOverrides, path = SETTINGS_PAT
   delete raw.agent;
   delete raw.codex;
   if (raw.review && typeof raw.review === "object") {
+    // 已移除的旧字段：保存时顺手清理，避免旧 overrides.yaml 长期残留无效配置。
     delete (raw.review as Record<string, unknown>).backend;
+    delete (raw.review as Record<string, unknown>).model;
   }
   mergeSettingsInto(raw, ov);
   fs.writeFileSync(path, yaml.dump(raw));
@@ -201,6 +206,9 @@ export interface Config {
   mcp_servers: McpServersConfig;
   quality: QualityConfig;
   review: ReviewConfig;
+  /** 显式子 Agent 角色层（agents.roles.<role>）；缺省 = 空覆盖，行为与改造前一致。
+   *  可选是为了让手写的 Config 字面量（测试/嵌入方）不必立刻补齐该字段。 */
+  agents?: AgentsConfig;
   exclude_status: string[];
   priority_weight: Record<string, number>;
   workspaces: WorkspaceConfig[];
@@ -208,6 +216,8 @@ export interface Config {
   p4: Record<string, string>;
   web: Record<string, string | number>;
   tapd: Record<string, unknown>;
+  /** 已移除旧字段的迁移提示（如 review.model）：只由 validateConfig 提示，不参与运行逻辑。 */
+  migration_notes?: string[];
   config_path: string;
 }
 
@@ -336,7 +346,8 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
       max_changed_files: 8,
       max_diff_lines: 500,
     },
-    review: { enabled: true, max_fix_rounds: 1, model: "" },
+    review: { enabled: true, max_fix_rounds: 1 },
+    agents: { roles: {}, problems: [] },
     exclude_status: [...DEFAULT_EXCLUDE_STATUS],
     priority_weight: { ...DEFAULT_PRIORITY_WEIGHT },
     workspaces: [],
@@ -349,6 +360,11 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
 
   const p = configPath ?? "config.yaml";
   let raw: Record<string, unknown> = {};
+  /** 已移除字段的迁移提示：只收集，供 validateConfig 提示，不改变任何运行语义。 */
+  const migrationNotes: string[] = [];
+  const noteRemoved = (note: string): void => { if (!migrationNotes.includes(note)) migrationNotes.push(note); };
+  const present = (value: unknown): boolean => value !== undefined && value !== null && String(value).trim() !== "";
+
   if (fs.existsSync(p)) {
     cfg.config_path = path.resolve(p);
     const parsed = yaml.load(fs.readFileSync(p, "utf-8"));
@@ -359,6 +375,13 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   cfg.max_bugs_per_run = Number(raw.max_bugs_per_run ?? cfg.max_bugs_per_run);
   cfg.max_attempts = Number(raw.max_attempts ?? cfg.max_attempts);
   cfg.agent_timeout_s = Number(raw.agent_timeout_s ?? cfg.agent_timeout_s);
+  // agent_timeout_s 是「每次调用/每个阶段」的预算（多轮调用会累加），不是整单总时限。
+  // NaN / Infinity / 非正值会让阶段时限失去意义，必须当场作为配置错误暴露。
+  if (!Number.isFinite(cfg.agent_timeout_s) || cfg.agent_timeout_s <= 0) {
+    throw new Error(
+      `agent_timeout_s 必须是正数（秒，表示每次 Agent 调用的时限）: ${String(raw.agent_timeout_s)}`,
+    );
+  }
 
   cfg.mcp_servers = parseMcpServers(raw.mcp_servers);
 
@@ -382,12 +405,18 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   }
 
 
+  // 评审只保留 enabled / max_fix_rounds；Reviewer 的模型唯一入口是
+  // agents.roles.review.model（未配置 = pi.provider 默认模型）。
   const reviewRaw = (raw.review ?? {}) as Record<string, unknown>;
   cfg.review.enabled = Boolean(reviewRaw.enabled ?? cfg.review.enabled);
   cfg.review.max_fix_rounds = Math.max(0, Number(
     reviewRaw.max_fix_rounds ?? cfg.review.max_fix_rounds,
   ));
-  cfg.review.model = String(reviewRaw.model ?? cfg.review.model);
+  if (present(reviewRaw.model)) noteRemoved(REVIEW_MODEL_MIGRATION_NOTE);
+
+  // 显式角色层：agents.roles.<role>（model / timeout_s）。旧 config 没有该段时为
+  // 空覆盖，worker/agent 的调用结构与时限派生规则完全不变。
+  cfg.agents = parseAgentsConfig(raw.agents);
 
   const filters = (raw.filters ?? {}) as Record<string, unknown>;
   if (Array.isArray(filters.exclude_status)) {
@@ -458,8 +487,14 @@ export function loadConfig(configPath?: string, envFile?: string, settingsPath =
   cfg.p4.password = process.env.P4PASSWD ?? cfg.p4.password ?? "";
   cfg.p4.ignore = process.env.P4IGNORE ?? cfg.p4.ignore ?? "";
 
-  // Web 设置页的 overrides.yaml 最后应用（优先级最高，覆盖 config.yaml 与 .env）
-  applySettingsOverrides(cfg, readSettingsOverrides(settingsPath));
+  // Web 设置页的 overrides.yaml 最后应用（优先级最高，覆盖 config.yaml 与 .env）。
+  // 旧 overrides.yaml 里的 review.model 同样不生效（REVIEW_FIELDS 已不含 model），只做迁移提示。
+  const overrides = readSettingsOverrides(settingsPath);
+  if (present((overrides?.review as Record<string, unknown> | undefined)?.model)) {
+    noteRemoved(REVIEW_MODEL_MIGRATION_NOTE);
+  }
+  applySettingsOverrides(cfg, overrides);
+  if (migrationNotes.length) cfg.migration_notes = migrationNotes;
 
   return cfg;
 }
@@ -473,6 +508,8 @@ function isPlaceholder(value: unknown): boolean {
 /** 返回配置问题列表（空表示 OK）。 */
 export function validateConfig(cfg: Config): string[] {
   const problems: string[] = [];
+  // 已移除字段的迁移提示（如 review.model）：不阻断启动，只提示新入口。
+  problems.push(...(cfg.migration_notes ?? []));
   const tapd = cfg.tapd as Record<string, unknown>;
   const backend = String(tapd.backend ?? "rest");
   if (backend === "mcp") {
@@ -551,6 +588,12 @@ export function validateConfig(cfg: Config): string[] {
     cfg.mcp_servers,
     cfg.workspaces.flatMap((workspace) => workspace.repos.map((repo) => repo.path)),
   ));
+  // 角色配置只提示不阻断：非法项已被 parseAgentsConfig 忽略，运行仍按默认角色行为。
+  problems.push(...(cfg.agents?.problems ?? []));
+  // provider 注册（models.json）只依赖 base_url/api_key，模型来自 model_id 或角色配置；
+  // 两者都缺时提示具体缺口，否则用户只会看到 pi 报「找不到模型」而不知道从哪补。
+  const providerModelsProblem = piProviderModelsProblem(cfg);
+  if (providerModelsProblem) problems.push(providerModelsProblem);
   if (!cfg.p4.client) problems.push("未配置 P4CLIENT（Agent 专用 p4 workspace）");
   return problems;
 }

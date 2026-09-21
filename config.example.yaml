@@ -24,9 +24,12 @@ pi:
 # enabled_tools / disabled_tools 控制可用工具范围；read_only_tools 是本项目的调查/评审白名单。
 # automates_manual_keywords 同时声明资源门禁关键词；server 禁用时仍转人工，启用时才允许自动处理。
 mcp_servers:
-  # 复用已登录 Chrome 读取 CrashSight / Sentry 等诊断页。
-  # 首次使用前在 Chrome 144+ 打开 chrome://inspect/#remote-debugging 并启用远程调试；
-  # Chrome 弹出连接授权时选择允许。不要使用 --isolated，否则不会复用登录态。
+  # 读取 CrashSight / Sentry 等诊断页。连接模式由 CHROME_DEVTOOLS_MODE 选择：
+  #   managed（推荐）＝由 MCP 自己启动一个持久独立 profile 的项目专用 Chrome，
+  #     走管道连接，因此不经过 Chrome 的远程调试授权弹窗；首次需在该专用浏览器里登录一次。
+  #   attach＝附着到你日常使用的 Chrome，复用已有登录态，但受 Chrome 144+
+  #     chrome://inspect/#remote-debugging 的连接授权约束，连接断开后需重新授权。
+  # 两种模式都不需要也不能用 --isolated（那是临时 profile，关闭即清）。
   chrome_devtools:
     enabled: false
     required: false
@@ -35,7 +38,14 @@ mcp_servers:
     args: ['{agent}\\dist\\chromeDaemonProxy.js']
     cwd: '{agent}'
     env:
-      CHROME_DEVTOOLS_SESSION_ID: '74617064'
+      CHROME_DEVTOOLS_MODE: managed
+      # managed 专用 profile 目录；留空默认项目内 .chrome-profile（已 gitignore）。
+      # CHROME_DEVTOOLS_PROFILE_DIR: ''
+      # 可选：指定 Chrome 可执行文件（managed 专用）。
+      # CHROME_DEVTOOLS_EXECUTABLE_PATH: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+      # 单次 daemon 调用预算：必须早于下面的 tool_timeout_sec（90s）结束，
+      # 否则外层超时先触发，只剩一条笼统的 MCP 超时，看不到真实原因。
+      CHROME_DEVTOOLS_CALL_TIMEOUT_MS: '75000'
     enabled_tools: &chrome_read_tools
       - list_pages
       - new_page
@@ -140,7 +150,90 @@ quality:
 review:
   enabled: true                     # 独立只读 Reviewer；high/medium finding 必须修正
   max_fix_rounds: 1                 # Reviewer 拒绝后最多定向修正一轮
-  model: ""                         # 可指定不同评审模型；空值沿用修复模型
+  # 评审模型不在这里配置（旧的 review.model 已移除、不再生效）：
+  # 需要 Reviewer 用独立模型时，只配下面的 agents.roles.review.model。
+
+# 显式角色层（可选段）。Orchestrator（worker 状态机）负责状态机 / 派发 / 验收，
+# 角色只决定「这一次调用用哪个模型、给多长时限」，不改变阶段顺序、phase 取值、
+# 错误类型与 P4/Git 流程。整段省略 = 与旧配置行为完全一致（这是默认形态）。
+# 角色 -> 阶段（audit 里 role 与 phase 是两个字段，phase 取值保持不变）：
+#   investigation  只读调查（含补充核查、范围复核）        phase: investigation
+#   implementation 首轮实施写入                            phase: implementation
+#   review         独立只读评审（含修正后的二次评审）       phase: review
+#   recovery       无工具收尾 / 预算收尾 / Reviewer 修正    phase: investigation | implementation | correction
+#   coordinator    调查前计划建议 + 交付前最终汇总           phase: coordinator_plan | coordinator_summary
+#                  （只读无工具，只产出文字，不参与任何决策；失败降级，人工取消向上传播）
+# 别名：investigator / implementer / reviewer 自动归一到规范角色名。
+# 只在编排器侧生效；每次 Pi 调用仍是独立上下文，两层编排（Orchestrator -> Pi 子进程）无递归。
+agents:
+  roles:
+    # investigation —— 只读调查（补充核查、范围复核复用同一角色）
+    #   职责：定位根因与证据、给出最小修改范围与 planned_files，不写代码。
+    #   权限/工具：sandbox 只读，工具白名单 read / grep / find / ls；可挂只读 MCP（诊断页、资源查询）。
+    #   典型调用点：主调查（audit phase = investigation）、超时或缺证据时的补充核查、实施前的范围复核。
+    #   model 留空：沿用 pi.provider 的模型；填裸模型名会自动补 provider 前缀（下同）。
+    #   timeout_s：该角色各调用点的单次时限（秒）；注释掉不写 = 沿用 agent_timeout_s 与原有阶段预算。
+    investigation:
+      model: ""                    # 空 = 沿用 pi.provider 的模型；也可只写裸模型名（自动补 provider 前缀）
+      # timeout_s: 1800            # 单次调用时限（秒）；不写则沿用 agent_timeout_s
+
+    # implementation —— 首轮实施写入
+    #   职责：按调查计划的 planned_files 做最小修复并跑最小相关验证，不重新全量调查。
+    #   权限/工具：sandbox workspace-write（必须真实落笔）；project 文件由编排器预打开，新建文件由编排器 p4 add。
+    #   典型调用点：编码阶段首次调用（audit phase = implementation）。
+    #   model 留空：沿用 pi.provider 的模型。
+    #   timeout_s：首轮实施的单次时限；不写 = 沿用 agent_timeout_s。
+    #              上面示例值 2400 只是"给大仓库留余量"的写法，会真实生效，请按需填写。
+    implementation:
+      model: ""
+      # timeout_s: 2400
+
+    # review —— 独立只读评审
+    #   职责：核对真实 diff、验收证据与复用情况，给出 findings 与 approved；只读，不直接改代码。
+    #   权限/工具：sandbox 只读，工具白名单 read / grep / find / ls。
+    #   典型调用点：候选产出后的评审与修正后的二次评审（audit phase = review）。
+    #   model：评审模型的唯一入口（旧的 review.model 已移除）；不配 = pi.provider 默认模型，
+    #          需要 Reviewer 用独立模型时只在这里配。
+    #   timeout_s：单次评审时限；不写 = 沿用 agent_timeout_s。
+    review:
+      model: ""                    # 评审模型的唯一入口：不配 = pi.provider 默认模型；
+                                   # 也可只写裸模型名（自动补 provider 前缀）
+      # timeout_s: 1200
+
+    # recovery —— 恢复/修正（一个角色覆盖三类补救调用）
+    #   1) 无工具收尾：调查超时后仅凭已有轨迹整理产出（tools 置空，每轮最多一次）；
+    #   2) 预算恢复：编码达预算且无真实改动时做定向收尾，要求立即落笔；
+    #   3) Reviewer 定向修正：评审被拒后按 findings 修正，以及该修正未落笔时的再次收尾。
+    #   权限/工具：跟随被接管阶段——收尾类无工具，编码/修正类 workspace-write；P4/Git 仍由编排器执行。
+    #   model 留空：沿用 pi.provider 的模型。
+    #   timeout_s：三类调用预算规则不同，因此这里故意不配置，以保留各自的派生预算：
+    #              收尾类默认 = min(agent_timeout_s, max(180, agent_timeout_s/3))（1800 → 600），
+    #              而 Reviewer 定向修正按 agent_timeout_s 起算（1800）；
+    #              显式填写会让修正类直接用该值，等于收紧修正预算，故保持留空。
+    recovery:
+      model: ""
+      # timeout_s: 600             # 故意留空：收尾走派生上限，定向修正仍用 agent_timeout_s 起算
+
+    # coordinator —— 计划建议 + 最终汇总（唯一不参与决策的角色）
+    #   **可选**：只在配置里出现本条、且解析出至少一个有效字段（model 或 timeout_s）时才启用
+    #            （它是新增调用点，会在既有调用序列里插入两次只读调用）；
+    #            删掉/注释掉整条 = 调用序列与改造前逐字一致，不产生任何额外模型调用。
+    #            注意：`coordinator: {}` 这种没有任何有效字段的写法会按既有规则被丢弃，
+    #            要启用请至少写上 model:（留空 = 沿用 pi.provider 默认模型）。
+    #   职责：只在两处被调用——① 主调查之前给出「调查计划建议」；② 最终交付之前把已确定的事实
+    #         整理成一段交付说明。两者都只是附加文字，不推进阶段、不决定文件白名单、不做 P4/Git。
+    #   权限/工具：sandbox 只读且 tools 置空（tools: []），不挂任何 MCP，也拿不到仓库内容。
+    #   失败降级：超时 / 异常退出 / 输出不是严格 JSON（只接受 FINAL_RESULT: 后或整段输出的单个
+    #             JSON 对象）/ 字段类型不符 → 记一条 warn 事件后按原流程继续，绝不影响任务结论。
+    #             唯一例外是人工取消：原样向上传播，整单终止并回到待处理队列。
+    #   交付边界：汇总以「协调者补充说明（未参与任何决策，不覆盖上述测试/文件/评审事实）」的附加
+    #             段落追加在交付描述末尾；result.summary、改动清单、验证结论、交付分类都不会被改写。
+    #   model 留空：沿用 pi.provider 的模型。
+    #   timeout_s：只收紧不放宽——计划调用取 min(它, 120s)、汇总调用取 min(它, 90s)；
+    #              不写则直接用这两个派生上限（协调者只是建议，不值得占用正式阶段的预算）。
+    coordinator:
+      model: ""
+      # timeout_s: 120             # 不写 = 计划 120s / 汇总 90s（派生上限），写了只会更短
 
 # 过滤条件
 filters:

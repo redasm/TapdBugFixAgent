@@ -19,6 +19,9 @@ dist/
 logs/
 run/
 
+# Chrome DevTools managed 模式的专用浏览器 profile（含运行期 cookie，绝不入库）
+.chrome-profile/
+
 # IDE / 系统
 .vscode/
 .idea/

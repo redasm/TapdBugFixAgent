@@ -1,19 +1,18 @@
 /** 独立只读评审协议：基于目标、调查证据、机器验证和完整 diff 输出可执行 findings。 */
 
-import { effectivePiModel, effectivePiProviderId, extractFinalJson } from "./agent.js";
+import { effectivePiModel, extractFinalJson } from "./agent.js";
+import { agentRoleModel } from "./agentRoles.js";
 import type { Config } from "./config.js";
 import type { Bug } from "./models.js";
 import type { InvestigationResult } from "./repairWorkflow.js";
 import { buildBugContext, formatBugContext } from "./quality.js";
 import { formatRepairContract } from "./repairContract.js";
 
-/** 评审模型允许只写模型 id，自动继承 Pi provider；空值沿用修复模型。 */
-export function effectiveReviewModel(config: Config): string {
-  const configured = config.review.model.trim();
-  if (!configured) return effectivePiModel(config.pi);
-  if (configured.includes("/")) return configured;
-  const providerId = config.pi.provider ? effectivePiProviderId(config.pi) : "";
-  return providerId ? `${providerId}/${configured}` : configured;
+/** Reviewer 模型的唯一解析入口：agents.roles.review.model > pi.provider 默认模型。
+ *  旧的 review.model 已移除；需要独立评审模型时只配置 agents.roles.review.model。
+ *  允许只写裸模型名（由 agentRoleModel 自动补 provider 前缀），空值 = 沿用 pi.provider 默认。 */
+export function reviewerModel(config: Config): string {
+  return agentRoleModel(config, "review") || effectivePiModel(config.pi);
 }
 
 export type FindingSeverity = "low" | "medium" | "high";
@@ -44,7 +43,18 @@ export interface ReviewPromptInput {
   verificationSummary: string;
 }
 
-export const buildReviewPrompt = (input: ReviewPromptInput): string => `你是独立的只读代码评审 Agent。不得修改工作区、不得执行 p4 edit/add/delete，只审查给定改动。
+export const buildReviewPrompt = (input: ReviewPromptInput): string => {
+  const limitations = input.investigation.verification_limitations ?? [];
+  const limitationSection = limitations.length
+    ? `
+# 已登记的验证限制（未执行/无法执行，禁止当作已验证）
+调查阶段明确无法执行以下验证（原文记录）：
+${limitations.map((item) => `- ${item}`).join("\n")}
+这些限制不是代码缺陷：不要因为“没有运行时验证”而给出 high/medium finding，也不得在任何结论里把它们写成“已通过”。
+逐条判断补丁是否已有静态或机器可执行证据覆盖；没有覆盖的，原样列入 unverified_items，并说明需要人工在何处验证。
+`
+    : "";
+  return `你是独立的只读代码评审 Agent。不得修改工作区、不得执行 p4 edit/add/delete，只审查给定改动。
 
 # 评审目标
 判断补丁是否真正满足原始需求并解决根因、是否保持最小范围、是否产生回归或遗漏关键路径，以及机器验证是否足以支撑结论。只报告补丁引入或本次补丁应解决但仍未解决的具体问题；既有且与本补丁无关的问题不得阻断。
@@ -57,7 +67,7 @@ ${formatBugContext(buildBugContext(input.bug))}
 
 # 业务验收条件（逐条核查，不预先相信调查结论）
 ${formatRepairContract(input.investigation.repair_contract)}
-
+${limitationSection}
 # 机器验证
 ${input.verificationSummary || "（没有机器验证证据）"}
 
@@ -94,6 +104,7 @@ ${input.investigation.planned_files.map((item) => `- ${item}`).join("\n")}
 - low: 不阻止提交的局部改进建议。
 - 只要存在 high 或 medium finding，approved 必须为 false。
 - 仅仅缺少必须在编辑器、真机或游戏运行时由人工执行的验证，不是代码缺陷：如果配置的机器验证已通过，且 diff/代码数据流没有显示修复无效，应写入 unverified_items，不作为代码缺陷，也不得宣称已通过运行时验证。
+- 上面“已登记的验证限制”必须逐条出现在 unverified_items 里（可以合并同类项，但不能省略任何一条），且不得改写成已通过。
 - “尚未读取到运行时配置”本身属于不确定性，不等于已证明配置条件不满足。只有能指出该 Bug 的实际配置值或确定的数据流使新逻辑不可达时，才可作为 medium/high。
 - 每条阻断 finding 必须指出 diff/代码中的具体证据、可触发的失败场景和可执行 required_action；无法说明失败场景时不要上报为阻断问题。
 - 不要输出表扬或泛化总结。没有 finding 时用简短 note 说明根因、范围和验证均通过检查。
@@ -104,6 +115,7 @@ FINAL_RESULT:
 \`\`\`json
 {"approved":true,"requirement_match":"pass|fail|unknown","behavioral_evidence":"static_only|behavior_tested|runtime_tested|unknown","reuse_and_lifecycle":"pass|fail|unknown","unverified_items":["未执行的验收场景"],"note":"结论","findings":[{"severity":"high|medium|low","title":"短标题","file":"相对路径","line":42,"evidence":"具体证据","required_action":"必须采取的修正"}]}
 \`\`\``;
+};
 
 const severity = (value: unknown): FindingSeverity | undefined => {
   const text = String(value ?? "").toLowerCase();

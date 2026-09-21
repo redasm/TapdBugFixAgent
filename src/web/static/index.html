@@ -9,7 +9,6 @@
     --bg: #0f1419; --panel: #171d24; --panel2: #1e2731; --border: #2a3440;
     --text: #d8e1ea; --muted: #8b98a5; --accent: #3b82f6; --accent2: #2563eb;
     --green: #22c55e; --amber: #f59e0b; --red: #ef4444; --blue: #38bdf8; --gray: #6b7280;
-    --term-bg: #0a0e13; --agent-h: 250px;   /* Agent 输出区高度，分割线拖动调整 */
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; height: 100vh; display: flex; flex-direction: column; }
@@ -51,6 +50,7 @@
   .badge.accepted, .badge.accepted_modified { background: rgba(34,197,94,.15); color: var(--green); }
   .badge.rejected, .badge.reopened { background: rgba(239,68,68,.15); color: var(--red); }
   .badge.manual_only { background: rgba(56,189,248,.15); color: var(--blue); }
+  .badge.provider_unavailable { background: rgba(239,68,68,.15); color: var(--red); }
   .badge.in_progress, .badge.pending { background: rgba(59,130,246,.15); color: var(--blue); }
   .badge.unprocessed { background: rgba(148,163,184,.18); color: var(--muted); }
   .badge.skipped { background: rgba(107,114,128,.15); color: var(--gray); }
@@ -63,9 +63,9 @@
   header .stat b { color: var(--text); margin-left: 2px; }
   header .stats-toggle { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; color: var(--muted); }
 
-  /* 上下结构：上行 = 分组 bug 列表 + 右侧抽屉；下行 = Agent 输出区（固定底部全宽）。
-     高度由 body 纵向 flex 决定（header 固定高，main 占满剩余空间），不再按顶部栏像素高度硬算。 */
-  main.layout { display: flex; flex-direction: column; gap: 12px; padding: 14px 20px; flex: 1; min-height: 0; }
+  /* 单一区域：分组 bug 列表 + 右侧详情抽屉。main 直接填满 header 以下的全部剩余高度
+     （高度由 body 纵向 flex 决定：header 固定高，main flex:1 占满，不再有任何固定高度的底部占位）。 */
+  main.layout { display: flex; flex-direction: column; padding: 14px 20px; flex: 1; min-height: 0; }
   .top-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
   .list-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
   .toolbar { display: flex; gap: 8px; align-items: center; }
@@ -75,8 +75,16 @@
   .empty { color: var(--muted); text-align: center; padding: 40px 0; }
 
   /* 分组列表 */
-  .group-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--muted); background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border); }
+  .group-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--muted); background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border); }
   .group-head .count { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; font-size: 11px; }
+  /* 「处理中 N」标题栏右侧的当前运行状态（当前阶段 / 使用模型）：与左侧标题同一行、靠右。
+     模型名过长用省略号截断（title 保留完整值），窄屏隐藏标签文字、必要时整块换行，绝不撑破列表宽度。 */
+  .group-stage { display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto; min-width: 0; flex: 0 1 auto; font-weight: 400; }
+  .group-stage .gs-item { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
+  .group-stage .gs-k { color: var(--muted); font-size: 11.5px; flex: 0 0 auto; }
+  .group-stage .gs-v { color: var(--text); font-family: Consolas, "Courier New", monospace; font-size: 11.5px; font-weight: 600; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .group-stage .gs-item.empty .gs-v { color: var(--muted); font-weight: 400; }
+  .group-stage .gs-sep { color: var(--border); flex: 0 0 auto; }
   .row { display: grid; grid-template-columns: 155px minmax(0,1fr) 70px 100px 70px 120px; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--border); cursor: pointer; align-items: center; font-size: 13px; }
   .row:hover { background: var(--panel2); }
   .row.selected { background: rgba(59,130,246,.10); box-shadow: inset 2px 0 0 var(--accent); }
@@ -86,33 +94,16 @@
   .row .state-cell { display: flex; align-items: center; gap: 5px; min-width: 0; }
   .row .row-action { padding: 2px 6px; font-size: 11px; white-space: nowrap; }
 
-  /* 右侧详情抽屉（推挤式：开 = 460px，关 = 0；不遮挡底部 Agent 区） */
+  /* 右侧详情抽屉（推挤式：开 = 460px，关 = 0；不遮挡列表内容） */
   .drawer { flex: 0 0 auto; width: 460px; max-width: 460px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; transition: max-width .25s ease, opacity .2s ease; }
   .drawer.closed { max-width: 0; opacity: 0; border-color: transparent; }
   .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
   .drawer-head h3 { font-size: 14px; }
   .drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px; }
   @media (max-width: 900px) {
-    .drawer { position: fixed; right: 0; top: 58px; bottom: calc(var(--agent-h) + 32px); z-index: 20; border-radius: 0 0 0 10px; }
+    /* 抽屉改为覆盖式：只避让顶部栏与窗口边缘 */
+    .drawer { position: fixed; right: 0; top: 58px; bottom: 20px; z-index: 20; border-radius: 0 0 0 10px; }
   }
-
-  /* 底部 Agent 输出区（终端形式，高度由分割线拖动调整） */
-  .agent-pane { flex: 0 0 auto; height: var(--agent-h); background: var(--term-bg); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
-  /* 上下分割线：拖拽调整上下占比（向上拖 = 列表变大）。::before 扩大点击热区，::after 视觉细线 */
-  #divider { flex: 0 0 auto; height: 14px; cursor: row-resize; position: relative; z-index: 5; }
-  #divider::before { content: ''; position: absolute; top: -14px; bottom: -14px; left: 0; right: 0; }
-  #divider::after { content: ''; position: absolute; left: 0; right: 0; top: 5px; height: 4px; border-radius: 2px; background: transparent; }
-  #divider:hover::after, #divider.dragging::after { background: var(--accent); }
-  .agent-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); flex: 0 0 auto; font-size: 13px; min-width: 0; }
-  .agent-head .a-title { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .agent-head .a-pin { margin-left: auto; padding: 2px 10px; font-size: 11px; flex: 0 0 auto; }
-  /* 终端形式输出：黑底等宽，时间戳置灰，输出自动往下划 */
-  .agent-progress { flex: 1; min-height: 0; overflow-y: auto; list-style: none; padding: 6px 14px 10px; font-size: 12px; color: var(--muted); font-family: Consolas, "Courier New", monospace; background: transparent; scrollbar-width: thin; }
-  .agent-progress li { padding: 1px 0; font-family: Consolas, "Courier New", monospace; white-space: pre-wrap; word-break: break-all; }
-  .agent-progress li .ts { color: #5b6b7d; margin-right: 8px; }
-  .agent-progress li .spin { color: var(--blue); }
-  .agent-progress::-webkit-scrollbar { width: 8px; }
-  .agent-progress::-webkit-scrollbar-thumb { background: #2a3440; border-radius: 4px; }
 
   h3 { font-size: 14px; margin-bottom: 10px; color: var(--text); }
   .kv { display: grid; grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 13px; margin-bottom: 10px; }
@@ -223,6 +214,11 @@
     /* 顶部栏恒为单行（分档规则见上方 @media 阶梯）：小窗口只收内边距，不再把 h1 / stats / actions 拆成多排；
        主区高度沿用 main.layout 基础规则（body 纵向 flex 自动填满剩余高度），不再为多排顶部栏预留高度。 */
     main.layout { padding: 10px 12px; }
+    /* 「处理中」标题栏右侧的阶段/模型在窄窗口进一步压缩：隐藏标签文字（值自带 title）、
+       模型名更早省略号截断；空间不够时 .group-head 会把这整块折到下一行（仍靠右），不产生横向溢出。 */
+    .group-stage { gap: 4px; }
+    .group-stage .gs-k { display: none; }
+    .group-stage .gs-v { max-width: 14ch; }
     .toolbar { display: grid; grid-template-columns: 132px minmax(0,1fr); }
     .toolbar button { grid-column: 1 / -1; }
     .row { grid-template-columns: minmax(0,1fr) 42px 92px; grid-template-rows: auto auto; padding: 8px 12px; }
@@ -240,6 +236,7 @@
 <header>
   <h1 title="TapdBugFixAgent 管理台"><span class="hd-icon" aria-hidden="true">🛠</span><span class="hd-name">TapdBugFixAgent</span><span id="verBadge" class="muted" style="font-size:11px;font-weight:400;margin-left:4px" title="运行中服务的构建版本（改代码后不重启这里不会变）"></span></h1>
   <span id="controlBadge" class="badge stopped">stopped</span>
+  <span id="providerCooldown" class="badge provider_unavailable" style="display:none"></span>
   <div class="stats" id="headerStats">
     <div class="stat-group" id="statsCounts">
       <span class="stat" title="待处理：排队中与处理中的任务数（pending + in_progress）"><span class="lb-full">待处理</span><span class="lb-short">待处理</span> <b id="stQueued">0</b></span>
@@ -269,7 +266,8 @@
 </header>
 
 <main class="layout">
-  <!-- 上行：分组 bug 列表 + 右侧详情抽屉 -->
+  <!-- 唯一区域：分组 bug 列表 + 右侧详情抽屉（填满顶部栏以下的全部高度）。
+       底部原有的日志/状态面板与上下拖拽分割线均已移除，列表下方不留任何固定高度的空白区。 -->
   <div class="top-row">
     <div class="list-col">
       <div class="toolbar">
@@ -284,6 +282,7 @@
           <option value="needs_info">需要补充信息</option>
           <option value="manual_review">候选未完成</option>
           <option value="blocked_workspace">工作区待清理</option>
+          <option value="provider_unavailable">provider 待恢复</option>
           <option value="accepted">人工原样接受</option>
           <option value="accepted_modified">人工修改后接受</option>
           <option value="rejected">人工拒绝</option>
@@ -308,19 +307,6 @@
         <div class="empty">点击列表行查看详情</div>
       </div>
     </aside>
-  </div>
-
-  <!-- 上下分割线：可拖拽调整 Agent 输出区高度 -->
-  <div id="divider" title="拖动调整 Agent 输出区高度"></div>
-
-  <!-- 下行：Agent 输出区（终端形式，固定底部全宽，跟随当前处理中的 bug） -->
-  <div class="agent-pane" id="agentPane">
-    <div class="agent-head" id="agentHead">
-      <span class="badge stopped">等待中</span>
-      <span class="a-title">worker 空闲，等待领取下一条 bug…</span>
-      <button id="btnAgentPin" class="ghost a-pin" title="跳到最新输出并恢复自动跟随">⤓ 最新</button>
-    </div>
-    <ul class="agent-progress" id="agentProg"></ul>
   </div>
 </main>
 
@@ -388,9 +374,8 @@
 <script>
 const $ = id => document.getElementById(id);
 let TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('tapd_token') || '';
-let SNAPSHOT = { status: { control:'stopped', counts:{} }, items: [], current_detail: null };
+let SNAPSHOT = { status: { control:'stopped', counts:{} }, items: [] };
 let SELECTED_ID = null;
-let AGENT_PIN = true;   // Agent 输出区是否跟随最新输出（用户手动上翻时暂停跟随）
 let FEEDBACK_EDITING = false; // 从 pointerdown 起锁住详情 DOM，消除点击控件与 SSE 刷新的竞态
 
 function authHeaders() {
@@ -442,6 +427,7 @@ const STATE_LABEL = {
   pending:'待处理', in_progress:'处理中', candidate:'候选待验证', candidate_partial:'候选（资源待人工）',
   verified:'机器验证通过', review_pending:'待人工最终确认', needs_info:'需要补充信息', manual_review:'候选未完成',
   blocked_workspace:'工作区待清理',
+  provider_unavailable:'provider 待恢复',
   accepted:'人工原样接受', accepted_modified:'人工修改后接受', rejected:'人工拒绝', reopened:'提交后重开',
   manual_only:'资源待人工', failed:'失败', skipped:'跳过'
 };
@@ -457,6 +443,7 @@ const GROUP_ORDER = [
   ['needs_info', '需要补充信息'],
   ['manual_review', '候选未完成'],
   ['blocked_workspace', '工作区待清理'],
+  ['provider_unavailable', 'provider 待恢复'],
   ['failed', '失败'],
   ['reopened', '提交后重开'],
   ['rejected', '人工拒绝'],
@@ -505,6 +492,23 @@ function renderStatus() {
   badge.textContent = c;
   badge.className = 'badge ' + c;
   if (st.version) $('verBadge').textContent = 'v' + st.version;
+  // provider 全局冷却：不是任务状态而是外部服务健康状态，冷却期内整队列都不领取任务，
+  // 必须让用户看得见剩余时间，并知道额度/鉴权类需要自己去补额度或换 Key。
+  const cd = st.provider_cooldown;
+  const cdBadge = $('providerCooldown');
+  if (cdBadge) {
+    if (cd) {
+      const human = cd.kind === 'quota' || cd.kind === 'auth';
+      cdBadge.style.display = '';
+      cdBadge.textContent = `provider ${cd.kind} 冷却 ${cd.remaining_s}s` + (human ? '（需补额度/换 Key）' : '');
+      cdBadge.title = (human
+        ? 'provider 额度/鉴权不可用：请补充额度或更换可用 Key，然后点「重试全部失败」或对该单点「重试」提前解除冷却。'
+        : 'provider 暂时不可用（限流/网络/5xx），到期后自动恢复。')
+        + `\n连续失败 ${cd.failures} 次\n${cd.reason || ''}`;
+    } else {
+      cdBadge.style.display = 'none';
+    }
+  }
   const counts = st.counts || {};
   $('stQueued').textContent = (counts.pending||0) + (counts.in_progress||0);
   $('stReviewPending').textContent = counts.review_pending||0;
@@ -572,7 +576,9 @@ function renderList() {
     div.className = 'group';
     const head = document.createElement('div');
     head.className = 'group-head';
-    head.innerHTML = (g === 'in_progress' ? '🔵 ' : '') + escapeHtml(label) + ` <span class="count">${arr.length}</span>`;
+    // 当前阶段/使用模型只挂在「处理中」分组标题栏右侧：分组不存在（数量 0 或被过滤掉）就不渲染。
+    head.innerHTML = (g === 'in_progress' ? '🔵 ' : '') + escapeHtml(label) + ` <span class="count">${arr.length}</span>`
+      + (g === 'in_progress' ? groupStageHTML() : '');
     div.appendChild(head);
     for (const it of arr) {
       const row = document.createElement('div');
@@ -596,38 +602,37 @@ function renderList() {
   }
 }
 
-/** 底部 Agent 输出区（终端形式）：跟随当前处理中的 bug（SSE current_detail）。
- *  新输出追加在底部并自动往下划；用户手动上翻时暂停跟随，点「⤓ 最新」恢复。 */
-function renderAgentPane() {
-  const d = SNAPSHOT.current_detail;
-  const head = $('agentHead');
-  const prog = $('agentProg');
-  // 渲染前判断是否贴底（基于旧内容），贴底则保持自动跟随
-  if (prog.scrollHeight - prog.scrollTop - prog.clientHeight < 40) AGENT_PIN = true;
-  const pinBtn = '<button id="btnAgentPin" class="ghost a-pin" title="跳到最新输出并恢复自动跟随">⤓ 最新</button>';
-  if (!d) {
-    head.innerHTML = '<span class="badge stopped">等待中</span> <span class="a-title">worker 空闲，等待领取下一条 bug…</span>' + pinBtn;
-    prog.innerHTML = '';
-    return;
+/** 「处理中 N」分组标题栏右侧的当前运行状态：当前阶段 + 该阶段实际生效的模型。
+ *  数据只来自服务端 /api/status 的 current_stage（worker 内存里的编排阶段与该阶段角色模型，
+ *  字段为 current_stage_label / current_model），不在这里写死任何模型名；空值统一显示「—」。
+ *  只在 in_progress 分组标题出现（待处理、失败等分组不显示），没有处理中分组时页面上没有任何残留。
+ *  每次 renderList 重建分组时重新生成 HTML（不缓存任何 DOM 引用），列表行下方已有 bug id，故这里不重复。
+ *  所有插值走 escapeHtml；模型名过长由 CSS 省略号截断，title 保留完整值。 */
+function groupStageHTML() {
+  const stage = (SNAPSHOT.status || {}).current_stage || {};
+  const items = [
+    ['当前阶段', stage.current_stage_label ? String(stage.current_stage_label) : ''],
+    ['使用模型', stage.current_model ? String(stage.current_model) : ''],
+  ];
+  const cells = items.map(([label, value]) => {
+    const full = `${label}：${value || '—'}`;
+    return `<span class="gs-item${value ? '' : ' empty'}">`
+      + `<span class="gs-k">${label}</span>`
+      + `<b class="gs-v" title="${escapeHtml(full)}">${escapeHtml(value || '—')}</b></span>`;
+  });
+  return `<span class="group-stage" role="status" aria-live="polite" aria-label="当前运行状态：当前阶段与使用模型">`
+    + cells[0] + '<span class="gs-sep" aria-hidden="true">·</span>' + cells[1]
+    + '</span>';
+}
+
+/** 详情抽屉的模型单元格。正在处理的 bug（带 current_stage）：以编排器当前的阶段模型为准，
+ *  空串（准备/准入/机器验证等不调用模型的阶段）显示「—」——绝不能拿 job.model（上一阶段写的值）
+ *  冒充正在跑的模型；未处理的 bug 才回落到 job.model（历史记录）。 */
+function modelCellHTML(job) {
+  if (job.current_stage) {
+    return job.current_model ? escapeHtml(job.current_model) : '<span class="muted">—</span>';
   }
-  const busy = d.agent_state === 'in_progress';
-  const stLabel = d.agent_state ? (STATE_LABEL[d.agent_state] || d.agent_state) : '未处理';
-  head.innerHTML =
-    `<span class="badge ${d.agent_state || 'unprocessed'}">${escapeHtml(stLabel)}</span>` +
-    ` <b class="mono">${d.bug_id}</b>` +
-    ` <span class="a-title">${escapeHtml(d.title)}</span>` +
-    (d.model ? ` <span class="a-title">· 模型 <b class="mono">${escapeHtml(d.model)}</b></span>` : '') +
-    (d.started_at ? ` <span class="a-title">· ${escapeHtml(d.started_at.slice(5, 16))} 开始</span>` : '') +
-    pinBtn;
-  const progArr = d.progress || [];
-  if (!progArr.length) {
-    prog.innerHTML = '<li>' + (busy ? '<span class="spin">⟳</span> Agent 正在运行，尚无进度输出…' : '(无进度记录)') + '</li>';
-    return;
-  }
-  // 终端习惯：最新在底部。list_events 最新在最前 → 反转后新行追加在底，输出时自动下划。
-  prog.innerHTML = progArr.slice(0, 200).reverse().map(e =>
-    `<li><span class="ts">${escapeHtml(String(e.ts||'').slice(11,19))}</span>${escapeHtml(e.msg)}</li>`).join('');
-  if (AGENT_PIN) prog.scrollTop = prog.scrollHeight;
+  return job.model ? escapeHtml(job.model) : '<span class="muted">(CLI 默认)</span>';
 }
 
 /** 详情区实时刷新不能替换正在操作的人工结论控件，否则原生 select 会立即收起。 */
@@ -741,7 +746,8 @@ function renderDetail(job) {
       <dt>优先级</dt><dd>${escapeHtml(job.priority_label || job.priority || '-')}</dd>
       <dt>Changelist</dt><dd class="mono">${job.changelist ?? '-'}</dd>
       <dt>Agent</dt><dd>${escapeHtml(job.agent || '-')}</dd>
-      <dt>模型</dt><dd>${job.model ? escapeHtml(job.model) : '<span class="muted">(CLI 默认)</span>'}</dd>
+      <dt>模型</dt><dd>${modelCellHTML(job)}</dd>
+      ${job.current_stage ? `<dt>当前阶段</dt><dd>${escapeHtml(job.current_stage_label || job.current_stage)}</dd>` : ''}
       <dt>准入评分</dt><dd>${job.admission_score ?? '-'}</dd>
       <dt>Tapd 状态</dt><dd>${escapeHtml(job.tapd_status || '-')}</dd>
       <dt>Tapd 链接</dt><dd><a href="${escapeHtml(job.url || '')}" target="_blank" rel="noopener">在 Tapd 打开 ↗</a></dd>
@@ -854,42 +860,6 @@ $('btnDrawerClose').onclick = closeDrawer;
 $('fSearch').oninput = renderList;
 $('fState').onchange = renderList;
 
-// ---------- Agent 输出区：贴底跟随 + 分割线拖拽调高度 ----------
-$('agentProg').addEventListener('scroll', () => {
-  const p = $('agentProg');
-  AGENT_PIN = p.scrollHeight - p.scrollTop - p.clientHeight < 40;
-});
-// 按钮在 renderAgentPane 重建 head 时会替换 DOM，用事件委托绑定（监听不随重建失效）
-$('agentHead').addEventListener('click', (e) => {
-  const t = e.target;
-  if (t && t.id === 'btnAgentPin') { AGENT_PIN = true; $('agentProg').scrollTop = $('agentProg').scrollHeight; }
-});
-(function initDivider() {
-  const divider = $('divider');
-  divider.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    divider.classList.add('dragging');
-    document.body.style.userSelect = 'none';
-    const startY = e.clientY;
-    const startH = $('agentPane').offsetHeight;
-    const onMove = (ev) => {
-      // 跟手：分隔线随鼠标移动。鼠标上移 → 终端变大、列表变小。
-      // 上限收紧：top-row 至少保留 180px（= vh-58 顶栏-28 边距-38 布局间隙），终端不会把列表挤没/盖住。
-      const maxH = Math.max(120, window.innerHeight - 304);
-      const h = Math.min(Math.max(startH + (startY - ev.clientY), 120), maxH);
-      document.documentElement.style.setProperty('--agent-h', h + 'px');
-    };
-    const onUp = () => {
-      divider.classList.remove('dragging');
-      document.body.style.userSelect = '';
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  });
-})();
-
 async function actRetry(id) {
   const r = await api('/api/bugs/' + id + '/retry', 'POST', {});
   if (!r) return;
@@ -996,7 +966,6 @@ async function refresh() {
   if (st) { SNAPSHOT.status = st; renderStatus(); }
   const list = await api('/api/bugs');
   if (list) { SNAPSHOT.items = list.items; renderList(); }
-  renderAgentPane();
   if (SELECTED_ID) { const j = await api('/api/bugs/' + SELECTED_ID); if (j) renderDetail(j); }
 }
 
@@ -1008,10 +977,8 @@ function connectSSE() {
       const data = JSON.parse(e.data);
       SNAPSHOT.status = data.status;
       SNAPSHOT.items = data.items;
-      SNAPSHOT.current_detail = data.current_detail || null;
       renderStatus();
       renderList();
-      renderAgentPane();
       // 实时刷新选中 bug 详情（含 Agent 进度事件）
       if (SELECTED_ID) {
         const selectedId = SELECTED_ID;

@@ -402,11 +402,17 @@ describe("two-stage repair workflow", () => {
     expect(prompt).toContain("连续 3 次搜索或读取没有产生新的");
     expect(prompt).toContain("预算使用到约 60%");
     expect(prompt).toContain("不要用 `find`");
-    expect(prompt).toContain("不得在 Perforce 根执行 git status/log/blame/diff");
-    expect(prompt).toContain("p4 filelog");
-    expect(prompt).toContain('git -C "根的绝对路径"');
-    expect(prompt).toContain("rg` 无匹配时 exit code 1");
-    expect(prompt).toContain("rg ... | Select-Object -First");
+    // 只读沙箱既没有 shell 也不挂载 Perforce/Git 客户端：提示不得再要求执行不可用的 p4/git 命令
+    expect(prompt).toContain("不提供 shell");
+    expect(prompt).toContain("p4 与 git 命令都不可用");
+    expect(prompt).toContain("不得写入 blocked_reasons");
+    expect(prompt).not.toContain("p4 filelog");
+    expect(prompt).not.toContain("p4 annotate");
+    expect(prompt).not.toContain('git -C "根的绝对路径"');
+    // 验证限制与业务问题的分流必须在提示里写清
+    expect(prompt).toContain("verification_limitations");
+    expect(prompt).toContain("会转人工补充");
+    expect(prompt).toContain("基线不可确认");
   });
 
   it("调查 Prompt 强制读取 CrashSight 和 Sentry 外部诊断链接", () => {

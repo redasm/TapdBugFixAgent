@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS events (
     bug_id INTEGER,
     msg TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(agent_state);
 CREATE INDEX IF NOT EXISTS idx_events_bug ON events(bug_id);
 `;
@@ -93,6 +98,25 @@ export interface JobFeedbackInput {
 export interface QualityMetrics {
   candidates: ReturnType<AttemptAudit["metrics"]>;
 }
+
+/** 全局 provider 冷却：跨进程持久化，避免重启后立刻继续把整批工单喂给不可用的 provider。
+ *  只存放有界的冷却截止时间；到期自动恢复探测，不会永久停机；人工重试可提前解除。
+ *  刻意复用 settings KV 而不是给 jobs 加列，也不改动 user_version——旧库（v3）必须继续可打开，
+ *  否则历史误阻塞任务无法被恢复。 */
+export interface ProviderCooldown {
+  /** 冷却截止时间（epoch ms）。 */
+  until_ms: number;
+  /** transient | quota | auth（写入方决定，这里只存字符串以免与 agent.ts 循环依赖）。 */
+  kind: string;
+  reason: string;
+  /** 连续 provider 失败次数，用于指数退避；成功或被人工解除后清零。 */
+  failures: number;
+}
+
+const _PROVIDER_COOLDOWN_KEY = "provider_cooldown";
+/** 显式解除冷却的 generation 计数：用于识别「本次尝试开始后人工已解除过冷却」。
+ *  否则一次迟到的 provider 错误会在人工点「重试」之后又把冷却打开，用户点了重试却毫无反应。 */
+const _PROVIDER_EPOCH_KEY = "provider_cooldown_epoch";
 
 const _FEEDBACK_OUTCOMES = new Set<FeedbackOutcome>([
   "accepted_unchanged", "accepted_modified", "rejected_wrong_root_cause",
@@ -207,6 +231,74 @@ export class StateStore {
       .prepare("UPDATE control SET state=?, updated_at=? WHERE id=1")
       .run(state, nowStr());
     return state;
+  }
+
+  // ---------- settings / provider 全局冷却 ----------
+  getSetting(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key=?").get(key) as
+      | { value: string | null }
+      | undefined;
+    return row?.value ?? null;
+  }
+
+  setSetting(key: string, value: string | null): void {
+    if (value === null) {
+      this.db.prepare("DELETE FROM settings WHERE key=?").run(key);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO settings(key, value, updated_at) VALUES (?,?,?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .run(key, value, nowStr());
+  }
+
+  /** 读取冷却记录（即使已过期也返回，保留 failures 计数连续性）。损坏/缺失返回 null。 */
+  peekProviderCooldown(): ProviderCooldown | null {
+    const raw = this.getSetting(_PROVIDER_COOLDOWN_KEY);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<ProviderCooldown>;
+      const until = Number(parsed.until_ms);
+      if (!Number.isFinite(until) || until <= 0) return null;
+      const failures = Number(parsed.failures);
+      return {
+        until_ms: until,
+        kind: String(parsed.kind ?? "transient"),
+        reason: String(parsed.reason ?? ""),
+        failures: Number.isFinite(failures) && failures > 0 ? failures : 0,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** 仍在冷却期内的记录；已过期返回 null（记录保留以便失败计数继续增长）。 */
+  activeProviderCooldown(now = Date.now()): ProviderCooldown | null {
+    const cooldown = this.peekProviderCooldown();
+    return cooldown && cooldown.until_ms > now ? cooldown : null;
+  }
+
+  setProviderCooldown(cooldown: ProviderCooldown): void {
+    this.setSetting(_PROVIDER_COOLDOWN_KEY, JSON.stringify(cooldown));
+  }
+
+  /** 清空冷却（含 failures 计数）。返回是否确实清掉了记录。
+   *  同时推进 generation：调用方是「人工明确要求现在重试」，迟到回来的 provider 错误
+   *  不得在这次解除之后又把冷却重新打开。 */
+  clearProviderCooldown(): boolean {
+    const existed = this.peekProviderCooldown() !== null;
+    this.setSetting(_PROVIDER_COOLDOWN_KEY, null);
+    this.setSetting(_PROVIDER_EPOCH_KEY, String(this.providerCooldownEpoch() + 1));
+    return existed;
+  }
+
+  /** 当前 generation：尝试开始时取一次，写冷却前比对，识别期间是否发生过人工解除。 */
+  providerCooldownEpoch(): number {
+    const raw = this.getSetting(_PROVIDER_EPOCH_KEY);
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
   }
 
   // ---------- jobs ----------

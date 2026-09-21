@@ -37,7 +37,6 @@ function settingsForWeb(config: Config): Record<string, unknown> {
     review: {
       enabled: config.review.enabled,
       max_fix_rounds: config.review.max_fix_rounds,
-      model: config.review.model,
     },
     pi: {
       effective_model: effectivePiModel(config.pi),
@@ -76,7 +75,6 @@ function settingsFromBody(body: Record<string, unknown>): SettingsOverrides {
   const reviewRaw = (body.review ?? {}) as Record<string, unknown>;
   const review: NonNullable<SettingsOverrides["review"]> = {};
   if (typeof reviewRaw.enabled === "boolean") review.enabled = reviewRaw.enabled;
-  if (typeof reviewRaw.model === "string" && reviewRaw.model !== "") review.model = reviewRaw.model;
   if (reviewRaw.max_fix_rounds !== undefined && reviewRaw.max_fix_rounds !== "") {
     review.max_fix_rounds = Math.max(0, Number(reviewRaw.max_fix_rounds));
   }
@@ -272,16 +270,9 @@ export function createApp(config: Config, store: StateStore, worker: Worker): ex
           status: { ...worker.status(), quality: store.qualityMetrics() },
           items: await worker.listBugsForWeb(),
         };
-        // 底部 Agent 输出区：附加当前处理中 bug 的实时详情（含 debug 级进度事件），
-        // 前端无需每 2s 另发 /api/bugs/:id 请求；无当前 bug 时不附加（前端显示等待中）。
-        const cur = worker.currentBugId;
-        if (cur) {
-          try {
-            payload.current_detail = await worker.bugDetailForWeb(cur);
-          } catch {
-            // 取详情失败不阻断 snapshot 推送
-          }
-        }
+        // 快照只推状态与列表（status 里已含 current_stage：当前阶段 + 该阶段模型）。
+        // 原先还附加「当前处理中 bug 的实时详情」供底部日志面板渲染，日志面板移除后
+        // 前端不再消费该字段，这里一并去掉，避免每 2s 白跑一次详情查询与事件序列化。
         res.write(`event: snapshot\ndata: ${JSON.stringify(payload)}\n\n`);
       })();
     }, 2000);

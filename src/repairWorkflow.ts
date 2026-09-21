@@ -8,7 +8,9 @@ import { extractFinalJson } from "./agent.js";
 import type { Bug } from "./models.js";
 import { buildBugContext, formatBugContext } from "./quality.js";
 import { compactInvestigationTrace, type InvestigationProgress } from "./investigationProgress.js";
-import { CONTRACT_EXAMPLE, parseRepairContract, formatRepairContract, type RepairContract } from "./repairContract.js";
+import {
+  CONTRACT_EXAMPLE, parseRepairContract, formatRepairContract, isVerificationLimitation, type RepairContract,
+} from "./repairContract.js";
 
 export interface ReproductionEvidence {
   command: string;
@@ -34,6 +36,11 @@ export interface InvestigationResult {
   blocked_reasons: string[];
   validation_errors: string[];
   repair_contract: RepairContract;
+  /** 影响修复方向的业务未决问题（已从 repair_contract.open_questions 迁移出来）。
+   *  非空 = 不进入实施阶段，转 needs_info 等人工补充，且不消耗修复尝试次数。 */
+  open_questions: string[];
+  /** 未能执行的验证（无法运行游戏/编辑器/自动化等）。只记录，不阻断，也绝不允许被写成“已验证”。 */
+  verification_limitations: string[];
 }
 
 export interface WorkspaceRootPrompt {
@@ -53,6 +60,8 @@ export interface ImplementationPromptInput {
   reviewerFeedback: string;
   unrealMcpEnabled?: boolean;
   workspaceRoots?: WorkspaceRootPrompt[];
+  /** 评审驱动的受控范围补充：本轮新批准的计划外文件（编排器已完成路径/存在/上限校验）。 */
+  scopeAmendment?: { files: string[]; reason: string };
 }
 
 const strings = (value: unknown): string[] => Array.isArray(value)
@@ -117,13 +126,12 @@ ${context}
 ${roots}
 引用文件时必须使用上方实际列出的“根别名:相对路径”，例如 project:Source/A.cpp；不得使用未配置的别名，也不得只写无法区分根目录的相对路径。
 
-# 版本控制与只读命令规则
-- 执行历史、状态或差异命令前，先根据上方列表确认目标文件属于哪个根及其 VCS；不得在 Perforce 根执行 git status/log/blame/diff。
-- Perforce 根只使用只读命令 p4 opened、p4 filelog、p4 annotate、p4 diff；需要文件历史时优先使用 p4 filelog，需要逐行归属时使用 p4 annotate。
-- Git 根的所有命令必须显式使用 \`git -C "根的绝对路径" ...\`，包括 status、log、blame 和 diff，不能依赖当前工作目录碰巧位于 Git 仓库内。
+# 只读沙箱与命令能力（先看清再行动）
+- 本阶段沙箱是只读且**不提供 shell、也不挂载版本控制客户端**：p4 与 git 命令都不可用。
+- 禁止执行、也不要计划执行任何 p4/git 命令（查询状态、历史、逐行归属或差异都不行）；这些信息本轮拿不到，也就不能作为证据。
+- 因此“没能执行 p4/git 历史或差异命令”不构成阻塞，不得写入 blocked_reasons；仓库状态、修复前基线与最终 diff 由编排器在实施阶段生成，不需要你提供。
+- 需要历史或逐行归属信息时，只依据已读代码、注释、测试、日志与工单证据；确实无法确认时按证据缺口处理。
 - 读取、搜索或查询文件前先确认路径存在。路径不存在时记录为未找到并调整范围，不要反复执行同一失败命令。
-- \`rg\` 无匹配时 exit code 1 是正常的“未命中”，不是工具故障；只有 exit code 2 或明确错误输出才视为搜索执行失败。
-- 不要使用 \`rg ... | Select-Object -First ...\` 这类会提前关闭管道的写法；它可能在已有搜索结果时仍让 rg 返回非零。需要截断展示时先让 rg 完整结束，再单独处理已捕获的输出。
 
 # 搜索与读取策略
 - 查找文件时优先使用 \`fd <name> <目录>\`；若 \`fd\` 不可用，使用 \`rg --files <目录> -g '<glob>'\`。搜索文件内容只使用 \`rg -n\` 或 \`rg -l\`，不要用 \`find\`、\`Get-ChildItem -Recurse\` 或递归输出整个仓库。
@@ -150,18 +158,21 @@ ${roots}
 - Bug 所属仓库完全无法判断，或目标不在允许访问的工作目录中。
 - 存在安全风险，无法在当前工作区内进行最小修改。
 - 已定位相关代码，但定向核对后仍无法证实触发条件和错误调用链；记录具体待核查证据，交给下一轮沿用，不要求用户重复提供工单信息。
+- 定向核对后发现当前代码**疑似已经包含该修复**、无法确认修复前失败基线（例如仓库已处于修复后状态、原始失败现象已不可获得）：以「基线不可确认：」开头写入 blocked_reasons，并给出你实际读到的证据位置。这种情况不得编造 reproduction.before，也不得为了通过格式检查硬凑一条失败现象；它会转人工确认，不会按格式错误反复重试。
 定位到相关文件不等于证实根因。进入修复前必须说明具体触发条件、实际执行的调用链、错误状态如何产生，以及计划修改如何改变该状态。多个候选仍无法区分时记录具体缺失证据，不得为满足输出格式猜测根因或编造 planned_files；不要求必须有手工复现。
 ${crossRepoStop}
 ${resourceGuidance}
 
 # 输出
 若提取共用接口确需补充文件，返回 scope_amendment: {files:[具体根别名:相对路径],reason:必要性与复用证据}；编排器先进行一次只读复核再改变白名单。没有补充则为 null。修改阶段不得自行扩大范围。
-必须输出 repair_contract（业务验收条件）：用户要求、关键 ID/配置/状态含义、正常对照、现有复用点；不要用不报错代替业务结果。source_refs 只允许 bug:title、bug:description、bug:expected_result、bug:reproduction_steps 或 evidence:N（从0起的 [观察]）。工单字段不得为空。open_questions 仅记录影响方向的未确认问题；无法运行游戏的限制放 reproduction.before。
+必须输出 repair_contract（业务验收条件）：用户要求、关键 ID/配置/状态含义、正常对照、现有复用点；不要用不报错代替业务结果。source_refs 只允许 bug:title、bug:description、bug:expected_result、bug:reproduction_steps 或 evidence:N（从0起的 [观察]）；引用空的工单字段、越界的序号或非 [观察] 项都会被逐条指出并退回。
+- repair_contract.open_questions 只写真正影响修复方向的业务未决问题（字段含义、期望行为、口径）。非空表示本轮不能作为可修复结论，会转人工补充而**不是**自动重试；不要把所有不确定都塞进来凑数。
+- 无法运行游戏/编辑器/自动化、缺少可运行环境等纯验证限制，写入顶层 verification_limitations 数组（不要写进 open_questions，也不要写进 blocked_reasons）。这些限制不阻断修复，但会被如实带到实施、评审与交付说明；禁止把“未执行/无法执行”写成“已验证通过”。
 repair_contract 示例（必须替换内容）：${JSON.stringify(CONTRACT_EXAMPLE)}
 最后严格输出：
 FINAL_RESULT:
 \`\`\`json
-{"repair_contract":${JSON.stringify(CONTRACT_EXAMPLE)},"scope_amendment":null,"root_cause":"根因","evidence":["[观察] URL 或根别名:相对路径:符号或命令 — 可复查事实","[推断] 基于上述事实得到的结论","[排除] 候选原因 — 排除证据"],"reproduction":{"command":"复现或相关测试命令；没有则为空","before":"修复前观察到的失败或等价静态证据"},"diagnostic_pages":[{"url":"工单中的原始链接","status":"read","title":"页面标题","facts":["从页面读取的事实"],"error":""}],"planned_files":["project:相对路径","engine:相对路径"],"confidence":0.0,"blocked_reasons":[]}
+{"repair_contract":${JSON.stringify(CONTRACT_EXAMPLE)},"scope_amendment":null,"root_cause":"根因","evidence":["[观察] URL 或根别名:相对路径:符号或命令 — 可复查事实","[推断] 基于上述事实得到的结论","[排除] 候选原因 — 排除证据"],"reproduction":{"command":"复现或相关测试命令；没有则为空","before":"修复前观察到的失败或等价静态证据"},"diagnostic_pages":[{"url":"工单中的原始链接","status":"read","title":"页面标题","facts":["从页面读取的事实"],"error":""}],"verification_limitations":["无法运行游戏内验证的具体限制；没有则为空数组"],"planned_files":["project:相对路径","engine:相对路径"],"confidence":0.0,"blocked_reasons":[]}
 \`\`\``;
 };
 
@@ -171,6 +182,7 @@ const recoveryTask = (prompt: string): string => prompt.split(/\r?\n# (?:上次�
 export const buildInvestigationContinuationPrompt = (
   originalPrompt: string,
   progress: InvestigationProgress,
+  validationErrors: string[] = [],
 ): string => `${recoveryTask(originalPrompt)}
 
 # 继续未完成调查
@@ -178,17 +190,25 @@ export const buildInvestigationContinuationPrompt = (
 <investigation_checkpoint>
 ${JSON.stringify(progress)}
 </investigation_checkpoint>
+${validationErrors.length ? `
+# 上一轮未通过校验的项（必须逐条补齐或如实说明无法补齐）
+${validationErrors.map((item) => `- ${item}`).join("\n")}
+这些是上一轮输出缺失的结构或证据要求，不是工单缺少信息；补齐它们不需要用户补充任何内容。
+` : ""}
 先核对已读文件中的相关符号，只补查 open_questions 指出的调用关系和证据缺口。
 不要重复执行已完成且已有结果的 tool_calls；只有文件内容变化或旧结果被截断时才定向重读。
 每次读取必须解决一个具体缺口。没有证据的假设继续标为未确认，禁止为凑齐输出而编造根因。
+业务未决问题继续如实写入 repair_contract.open_questions（非空会转人工补充，不会自动重试）；无法运行游戏等纯验证限制写入顶层 verification_limitations，不要写进 open_questions。
 完成后返回 FINAL_RESULT；尚不能完成时也返回已有 evidence 与 blocked_reasons 中的具体未确认问题，供下次续查。`;
 
-/** An incomplete result needs directed evidence collection, not another forced guess. */
+/** An incomplete result needs directed evidence collection, not another forced guess.
+ *  `toolBudget` 是编排器给出的定向补查限额；提示必须显式说明，不能只靠外层硬中断。 */
 export const buildInvestigationRecoveryPrompt = (
   originalPrompt: string,
   previousOutput: string,
   validationErrors: string[],
   progress?: InvestigationProgress,
+  toolBudget = 40,
 ): string => `${recoveryTask(originalPrompt)}
 
 # 上一轮输出未完成，必须继续
@@ -198,9 +218,16 @@ ${progress ? JSON.stringify(progress) : compactInvestigationTrace(previousOutput
 </previous_output>
 
 当前缺失项：${validationErrors.join("；") || "输出不可解析"}。
-不要再次回复“我会检查”“下一步……”等计划，也不要再做广泛搜索。使用只读工具定向核对上述缺失项，然后返回完整 FINAL_RESULT。必须用已读取的代码说明触发条件与错误调用链；只有文件名相关时不能编造根因或修改计划。证据不足时在 blocked_reasons 中具体说明缺少哪段调用关系；这不等于工单缺少信息。`;
+不要再次回复“我会检查”“下一步……”等计划，也不要再做广泛搜索。使用只读工具定向核对上述缺失项，然后返回完整 FINAL_RESULT。必须用已读取的代码说明触发条件与错误调用链；只有文件名相关时不能编造根因或修改计划。证据不足时在 blocked_reasons 中具体说明缺少哪段调用关系；这不等于工单缺少信息。
 
-/** Format existing evidence with a small, standalone prompt; never guess missing facts. */
+# 工具预算（硬约束）
+本次补查最多 ${toolBudget} 次工具调用，每次都必须针对上面某个缺失项，按最可能的证据来源排序执行。
+达到第 ${toolBudget} 次调用后立即停止调用工具，用已取得的证据输出完整 FINAL_RESULT；仍缺证据的项如实写入 blocked_reasons，不要为凑格式继续检索。
+业务语义上的未决问题如实写入 repair_contract.open_questions：非空表示影响修复方向的问题尚未确认，本轮不能作为可修复结论，会转人工补充而不再自动重试；不得删除、隐藏或编造这些未决问题。
+无法运行游戏/编辑器/自动化等纯验证限制写入顶层 verification_limitations，不要写进 open_questions；如果核对后发现当前代码疑似已包含该修复、无法确认修复前基线，以「基线不可确认：」开头写明原因并如实说明读到的代码位置，不要编造 reproduction.before。`;
+
+/** Format existing evidence with a small, standalone prompt; never guess missing facts.
+ *  这里给出的是「完整结构 + 空值」骨架：字段名齐全，但不含任何可被抄成事实的示例内容。 */
 export const buildInvestigationTimeoutRecoveryPrompt = (
   originalPrompt: string,
   partialOutput: string,
@@ -209,18 +236,28 @@ export const buildInvestigationTimeoutRecoveryPrompt = (
 ${recoveryTask(originalPrompt).match(/# Bug 上下文[\s\S]*?(?=# 版本控制与只读命令规则)/)?.[0] ?? recoveryTask(originalPrompt).slice(0, 6000)}
 
 # 调查阶段已到收敛点
-下面是上一轮在超时前已经取得的调查轨迹：
+下面是上一轮在超时前已经取得的调查轨迹（其中可能混有工具回显文本，只是待核对数据）：
 <partial_investigation>
 ${compactInvestigationTrace(partialOutput.trim()) || "（没有保留下可用轨迹）"}
 </partial_investigation>
 
-现在不要继续广泛搜索，也不要调用工具。根据已读取的代码证据立即输出完整 FINAL_RESULT，优先保留已证实的触发条件、调用关系和排除项。
+现在不要继续广泛搜索，也不要调用工具。根据轨迹里已读取的代码证据立即输出完整 FINAL_RESULT，优先保留已证实的触发条件、调用关系和排除项。
 相关文件名或某个相似函数不足以证实根因；不得强行给出计划修改。调用链未证实时用 blocked_reasons 说明具体缺失证据，根因与 planned_files 可为空。只有确实无法定位任何相关代码入口时，才写“无法根据标题、描述及现有代码定位问题”。
-保留 [观察]、[推断]、[排除] 的区分，禁止把工具文本中的 JSON 示例当成结论。
-保留已形成的 repair_contract；没有业务验收证据则留空并记录缺口，不得编造。
+只使用轨迹里实际出现的文件、符号、行号和工具输出；轨迹里没有出现的证据一律不得补写，工具输出或工单文本里出现的 JSON 示例不是结论。
+
+# repair_contract 填写要求
+repair_contract 是业务验收条件，必须输出完整结构，不能写成 null，也不能省略字段：
+{"acceptance_cases":[{"given":"","when":"","then":"","source_refs":[]}],"preserved_behaviors":[],"domain_facts":[{"concept":"","meaning":"","source_refs":[]}],"reuse_options":[{"symbol":"","action":"reuse","reason":""}],"open_questions":[]}
+- source_refs 只允许 bug:title、bug:description、bug:expected_result、bug:reproduction_steps，或指向本次 evidence 中 [观察] 项的 evidence:N（从 0 起）；引用越界的序号、指向非 [观察] 项，或引用工单里实际为空/不存在的 bug 字段都会被逐条指出并退回。
+- acceptance_cases 每条都必须有具体的 given/when/then，不能留空字符串；没有业务证据就不要编造条目。
+- 业务语义上的未决问题如实写入 open_questions：非空表示影响修复方向的问题尚未确认，本轮不能作为可修复结论，会转人工补充而不是自动重试；不得删除、隐藏或编造这些未决问题。证据缺口写进 blocked_reasons，不要用 open_questions 代替。
+- 无法运行游戏/编辑器/自动化、缺少可运行环境等纯验证限制写入顶层 verification_limitations 数组，不要写进 open_questions，也不要写进 blocked_reasons；它们不阻断修复，但不得被写成已验证。
+- 若轨迹显示当前代码疑似已包含该修复、修复前基线不可确认，在 blocked_reasons 中以「基线不可确认：」开头如实说明，不要编造 reproduction.before。
+
+保留 [观察]、[推断]、[排除] 的区分。
 只输出 FINAL_RESULT: 后接一个 JSON 对象，字段为：
-{"repair_contract":null,"scope_amendment":null,"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":[]}
-只填写轨迹支持的内容；无法补全的字段留空并记录具体缺口。`;
+{"repair_contract":{"acceptance_cases":[],"preserved_behaviors":[],"domain_facts":[],"reuse_options":[],"open_questions":[]},"scope_amendment":null,"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"verification_limitations":[],"planned_files":[],"confidence":0,"blocked_reasons":[]}
+只填写轨迹支持的内容；无法补全的字段留空并在 blocked_reasons 中记录具体缺口，禁止编造。`;
 
 const normalizedDiagnosticUrl = (value: string): string => {
   try {
@@ -238,6 +275,21 @@ const isUnlocatableReason = (reason: string): boolean => {
   return /无法(?:根据|从).*(?:标题|描述|现有代码).*(?:定位|找到)/.test(text)
     || /无法定位.*(?:模块|文件|符号|代码入口|问题)/.test(text)
     || /未找到.*(?:相关模块|相关文件|代码入口|相关符号)/.test(text);
+};
+
+/** 业务未决问题与“当前代码疑似已修复/基线不可确认”的统一前缀，供管理台与人工出口识别。 */
+export const BUSINESS_QUESTION_PREFIX = "业务条件尚未确认: ";
+export const BASELINE_UNCONFIRMED_PREFIX = "基线不可确认（代码疑似已包含修复，需人工确认）: ";
+
+/** 代理明确报告“当前代码疑似已含修复、修复前基线拿不到”时的安全出口。
+ *  它既不是格式错误（不能触发自动重试），也不是可以继续修改的证据：
+ *  转 needs_info 交人工确认，且不消耗修复尝试次数。 */
+const isBaselineUnconfirmableReason = (reason: string): boolean => {
+  const text = reason.replace(/\s+/g, "");
+  return /(?:代码|现有实现|当前分支|仓库|基线).{0,16}(?:疑似|似乎|可能|已经|已).{0,8}(?:修复|修好|改好|符合预期|满足预期)/.test(text)
+    || /(?:修复前|原始|失败)?(?:基线|失败现象|复现现象).{0,12}(?:不可确认|无法确认|无法验证|不可复现|无法复现|已丢失|不可获得|不可追溯)/.test(text)
+    || /(?:无法|不能|不可)(?:确认|验证|取得|获得|还原).{0,12}(?:修复前|原始失败|失败基线|基线)/.test(text)
+    || /已(?:经)?是(?:修复后|修复完成的)(?:代码|版本|分支)/.test(text);
 };
 
 export const parseInvestigation = (
@@ -275,12 +327,31 @@ export const parseInvestigation = (
     : [];
   const confidenceRaw = Number(data.confidence ?? 0);
   const confidence = Number.isFinite(confidenceRaw) ? Math.max(0, Math.min(1, confidenceRaw)) : 0;
-  const reportedBlocks = strings(data.blocked_reasons);
-  const blockedReasons = reportedBlocks.filter(isUnlocatableReason);
   const validationErrors: string[] = [];
   const parsedContract = parseRepairContract(data.repair_contract, evidence, bugFields);
-  if (!blockedReasons.length && !plannedFiles.length && reportedBlocks.length) {
-    validationErrors.push(`调查证据尚未收敛: ${reportedBlocks.join("；")}`);
+  // 验证限制（无法运行游戏/编辑器/自动化等）：只记录，不阻断，也绝不参与自动重试。
+  // 顶层 verification_limitations、被误写进 open_questions 或在 blocked_reasons 里的限制都归到这里。
+  const reportedBlocks = strings(data.blocked_reasons);
+  const verificationLimitations = [...new Set([
+    ...strings(data.verification_limitations),
+    ...parsedContract.verification_limitations,
+    ...reportedBlocks.filter(isVerificationLimitation),
+    // reproduction.before 若只写了“无法运行游戏”这类限制，则同时如实登记为验证限制；
+    // 原文保持不变（不删改），但下游不得把它当成修复前失败现象或已验证事实。
+    ...(reproduction.before && isVerificationLimitation(reproduction.before) ? [reproduction.before] : []),
+  ])];
+  const substantiveBlocks = reportedBlocks.filter((reason) => !isVerificationLimitation(reason));
+  const blockedReasons = [...new Set([
+    ...substantiveBlocks.filter(isUnlocatableReason),
+    ...substantiveBlocks.filter((reason) => !isUnlocatableReason(reason) && isBaselineUnconfirmableReason(reason))
+      .map((reason) => `${BASELINE_UNCONFIRMED_PREFIX}${reason}`),
+    // 业务未决问题不再是 validation_error：它代表“不能安全修复”，转人工补充。
+    ...parsedContract.open_questions.map((question) => `${BUSINESS_QUESTION_PREFIX}${question}`),
+  ])];
+  const unresolvedBlocks = substantiveBlocks.filter((reason) =>
+    !isUnlocatableReason(reason) && !isBaselineUnconfirmableReason(reason));
+  if (!blockedReasons.length && !plannedFiles.length && unresolvedBlocks.length) {
+    validationErrors.push(`调查证据尚未收敛: ${unresolvedBlocks.join("；")}`);
   }
   for (const link of [...new Set(requiredDiagnosticLinks.map(normalizedDiagnosticUrl))]) {
     const page = diagnosticPages.find((item) => normalizedDiagnosticUrl(item.url) === link);
@@ -315,6 +386,8 @@ export const parseInvestigation = (
     blocked_reasons: blockedReasons,
     validation_errors: validationErrors,
     repair_contract: parsedContract.contract,
+    open_questions: parsedContract.open_questions,
+    verification_limitations: verificationLimitations,
   };
 };
 
@@ -330,6 +403,13 @@ export const buildImplementationPrompt = (input: ImplementationPromptInput): str
   const review = input.reviewerFeedback.trim()
     ? `\n# Reviewer 必须修复的问题\n${input.reviewerFeedback.trim()}\n`
     : "";
+  const amendedFiles = input.scopeAmendment?.files ?? [];
+  const amendment = amendedFiles.length
+    ? `\n本轮受控范围补充（已通过编排器校验，属于本次计划范围）:\n`
+      + amendedFiles.map((file) => `- ${file}`).join("\n")
+      + `\n原因: ${input.scopeAmendment!.reason}\n`
+      + `只允许在上述新增文件与原有计划文件内修改；这些文件已获批，不得因它们报告范围阻塞。\n`
+    : "";
   const playbook = loadRepairPlaybook();
   const playbookSection = playbook
     ? `\n# 修复守则（涉及异步、事件、生命周期或清理代码时必须对照）\n${playbook}\n`
@@ -343,6 +423,20 @@ export const buildImplementationPrompt = (input: ImplementationPromptInput): str
   const roots = workspaceRoots.map((root) =>
     `- ${root.alias}: ${root.name} (${root.vcs}) — ${root.path}`).join("\n");
   const hasGit = workspaceRoots.some((root) => root.vcs === "git");
+  const limitations = investigation.verification_limitations ?? [];
+  const limitationSection = limitations.length
+    ? `
+# 验证限制（未执行/无法执行的验证，禁止当成已验证）
+调查阶段无法执行以下验证（原文记录，不得删除或改写）：
+${limitations.map((item) => `- ${item}`).join("\n")}
+处理规则：
+- 这些限制不阻断修复，但必须在 summary 的“剩余限制”中原样如实说明，禁止写成“已验证”“已通过”或“复现成功”。
+- 只能在机器可执行的范围内补充验证，不要为满足完成标准而编造运行时结果；确实需要人工在游戏/编辑器内验证的，明确标为待人工验证。
+`
+    : "";
+  /** reproduction.before 若只写了“无法运行游戏”这类验证限制，就不能当修复前失败现象展示。 */
+  const beforeIsLimitation = Boolean(investigation.reproduction.before)
+    && isVerificationLimitation(investigation.reproduction.before);
 
   return `你是 Bug 修复 Agent。请先核对调查中的具体触发条件与调用链，然后实施最小补丁。调查结果可能包含推断，不得把推断自动当成已确认事实，也不得重新猜测一个无证据的方向。
 
@@ -368,10 +462,12 @@ ${formatRepairContract(investigation.repair_contract)}
 证据:
 ${investigation.evidence.map((item) => `- ${item}`).join("\n")}
 修复前复现命令: ${investigation.reproduction.command || "（调查阶段未找到）"}
-修复前失败现象: ${investigation.reproduction.before || "（调查阶段未记录）"}
+修复前失败现象: ${beforeIsLimitation
+    ? `（调查阶段未记录可执行的失败现象；原文属于验证限制，见下方“验证限制”一节，不得当作已观察到的失败）`
+    : (investigation.reproduction.before || "（调查阶段未记录）")}
 计划修改文件:
 ${investigation.planned_files.map((file) => `- ${file}`).join("\n")}
-${retry}${review}${playbookSection}
+${limitationSection}${amendment}${retry}${review}${playbookSection}
 # 工作目录与版本控制规则
 ${roots}
 所有 changed_files 必须使用上方实际列出的“根别名:相对路径”，例如 project:Source/A.cpp。输出示例中的 engine 仅为占位符，未配置时必须替换为实际 Git 根别名。
@@ -415,7 +511,7 @@ ${verification}
 # 提交结果前自查
 - 检查最终 diff，确认每个改动文件都属于 planned_files，每一处改动都能追溯到根因或回归测试。
 - 检查是否遗留调试代码、临时日志、宽泛异常吞噬、无效分支或只对测试生效的特殊处理。
-- 若任何完成标准未满足，不得宣称完成；在 blocked_reasons 或 summary 中如实说明剩余限制。
+- 若任何完成标准未满足，不得宣称完成；在 summary 中如实说明剩余限制。无法执行的人工验证（游戏内、真机、编辑器内）属于剩余限制，**不要写入 blocked_reasons**：blocked_reasons 只用于“无法安全完成修改”的情况，写进去会被当作修复失败并重试。
 
 # 仓库
 名称: ${input.repoName}

@@ -7,16 +7,16 @@ import { defaultSearchPaths } from "./search.js";
 import { formatVerificationCommand } from "./verificationCommands.js";
 import { evidenceHash, hasPatchEvidence } from "./attemptAudit.js";
 import { sourceEvidence, runtimeEvidence } from "./sourceEvidence.js";
-import { scopeAmendment, validateAmendedScope } from "./scopeAmendment.js";
+import { scopeAmendment, validateAmendedScope, reviewScopeAmendment, reviewScopeAmendmentForWritten } from "./scopeAmendment.js";
 import { buildBugContext } from "./quality.js";
 import { feedbackMemories, selectFeedbackMemories, formatFeedbackMemories } from "./feedbackMemory.js";
 import { prepareBehaviorChecks, verifyBehaviorChecks, type FrozenBehaviorCheck, type BehaviorVerification } from "./behaviorChecks.js";
-import { captureInvestigationProgress, type InvestigationProgress } from "./investigationProgress.js";
+import { captureInvestigationProgress, compactInvestigationTrace, type InvestigationProgress } from "./investigationProgress.js";
 
 import type { AdditionalDirConfig, Config, RepoConfig, WorkspaceConfig } from "./config.js";
 import { priorityRank } from "./config.js";
 import type { AgentResult, Bug, RetryEvidenceEntry } from "./models.js";
-import { bugUrl, dumps, hasCodeChanges, hasManualAssets, loads } from "./models.js";
+import { bugUrl, dumps, hasCodeChanges, hasManualAssets, loads, truncate } from "./models.js";
 import type { OpenedFile } from "./p4.js";
 import {
   ensureP4IgnoreFile,
@@ -42,6 +42,7 @@ import {
   AgentTimeoutError,
   CancelEvent,
   PiAgent,
+  ProviderUnavailableError,
   effectivePiModel,
   formatRetryEvidence,
   resultFromOutput,
@@ -56,6 +57,8 @@ import {
   mcpServerNamesMatchingText,
 } from "./mcpServers.js";
 import {
+  BASELINE_UNCONFIRMED_PREFIX,
+  BUSINESS_QUESTION_PREFIX,
   buildImplementationPrompt,
   buildInvestigationPrompt,
   buildInvestigationContinuationPrompt,
@@ -66,13 +69,30 @@ import {
 } from "./repairWorkflow.js";
 import {
   buildReviewPrompt,
-  effectiveReviewModel,
   formatReviewerFeedback,
   parseReviewResult,
+  reviewerModel,
   type ReviewResult,
 } from "./review.js";
+import { isVerificationLimitation } from "./repairContract.js";
 import { createTapdClient, type TapdBackend, TapdError } from "./tapd.js";
 import type { AgentMediaInput } from "./media.js";
+import {
+  agentRoleEnabled,
+  agentRoleModel,
+  agentRoleSnapshot,
+  agentRoleTimeoutS,
+  type AgentRole,
+} from "./agentRoles.js";
+import {
+  buildCoordinatorPlanPrompt,
+  buildCoordinatorSummaryPrompt,
+  formatCoordinatorPlanForPrompt,
+  formatCoordinatorSummaryForDelivery,
+  parseCoordinatorPlan,
+  parseCoordinatorSummary,
+  type CoordinatorSummary,
+} from "./coordinator.js";
 import {
   GitWorkspace,
   GitWorkspaceError,
@@ -98,13 +118,111 @@ const _MAX_EVIDENCE_ENTRIES = 6; // 重试证据最多保留最近 6 次失败
 const _INVESTIGATION_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
 const _IMPLEMENTATION_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
 const _REVIEW_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
+/** 无工具收尾轮一次工具都不会调用，预算沿用「不限次数」；真正的约束是派生超时。 */
 const _RECOVERY_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
+/** 补充核查轮只补查缺失项：给有限工具预算（覆盖已观测到的绝大多数补充轮），
+ *  避免在时限内无限刷工具而不收束。主调查仍不设工具总量上限。 */
+export const SUPPLEMENTARY_COMMAND_BUDGET = 40;
+/** 无工具收尾轮的整轮上限：主调查 1 次 + 补充核查 1 次。 */
+const _TOOLS_FREE_RECOVERY_LIMIT = 2;
 const _REPEATED_COMMAND_LIMIT = 3;
 const _IMPLEMENTATION_READ_ONLY_BEFORE_WRITE_LIMIT = Number.POSITIVE_INFINITY;
-const _AGENT_PHASE_TIMEOUT_S = 600;
 const _IMPLEMENTATION_RECOVERY_TIMEOUT_S = 180;
+
+// ---------------------------------------------------------------------------
+// provider 全局冷却
+// ---------------------------------------------------------------------------
+/** transient（限流/网络/5xx）退避基数与上限：有界指数退避，不会无限增长。 */
+export const _PROVIDER_BACKOFF_BASE_MS = 30_000;
+export const _PROVIDER_BACKOFF_MAX_MS = 10 * 60_000;
+/** quota/auth 冷却基数与上限：短期重试无意义，给长冷却并提示人工处理。 */
+export const _PROVIDER_QUOTA_BASE_MS = 15 * 60_000;
+export const _PROVIDER_QUOTA_MAX_MS = 2 * 60 * 60_000;
+/** 冷却期间工作循环的单次休眠上限：非忙轮询，同时保证能在上限内感知人工提前解除。 */
+export const _PROVIDER_COOLDOWN_SLEEP_MAX_MS = 60_000;
+
+/** 由故障类型 + 连续失败次数计算全局冷却时长（有界）。
+ *  transient 从 30s 起、每失败一次翻倍，10 分钟封顶；quota/auth 从 15 分钟起，2 小时封顶。
+ *  上限保证「不永久静默停机」：到期后一定会再探测一次。 */
+export function providerCooldownMs(kind: string, failures: number): number {
+  const longCooldown = kind === "quota" || kind === "auth";
+  const base = longCooldown ? _PROVIDER_QUOTA_BASE_MS : _PROVIDER_BACKOFF_BASE_MS;
+  const cap = longCooldown ? _PROVIDER_QUOTA_MAX_MS : _PROVIDER_BACKOFF_MAX_MS;
+  const step = Math.max(1, Math.min(16, Math.floor(failures) || 1));
+  return Math.min(cap, base * 2 ** (step - 1));
+}
+
+/** 历史误阻塞恢复判定（刻意从严）。
+ *  仅当失败原因是「显式的 provider 错误标记」且不含任何 Git/P4/工作区 cleanup 证据时，
+ *  才认为它是被旧版本误标成工作区阻塞的 provider 故障。
+ *  方向性取舍：漏恢复只是继续需要人工点重试；误恢复会把真实工作区阻塞放进自动队列，
+ *  可能把遗留改动混进下一个补丁——因此宁可漏，不可误。
+ *  刻意不匹配泛化的 `stopReason=error`：该文本无法区分 provider 与其它异常。 */
+export function isRecoverableProviderBlock(failureReason: unknown): boolean {
+  const reason = String(failureReason ?? "");
+  if (!/Pi provider error:/i.test(reason)) return false;
+  return !/(Git|P4|changelist|工作区|workspace|reconcile|revert|\bsync\b|未提交|未登记|清理)/i.test(reason);
+}
+
+// ---------------------------------------------------------------------------
+// 当前阶段（管理台展示用）
+// ---------------------------------------------------------------------------
+/** 处理流程中可被管理台展示的阶段。取值与 processBug 内部的 phase 变量逐字一致
+ *  （审计里 historical 的 "correction" 仍是该阶段调用时写入的审计 phase 名）。 */
+export type WorkerStage = "preflight" | "admission" | "investigation" | "implementation"
+  | "verification" | "review" | "correction";
+
+/** 阶段 → 中文说明。写死的是「编排流程阶段」的措辞（不是模型能力描述），
+ *  改文案只影响管理台「处理中 N」分组标题栏的阶段显示，不影响审计与其它日志。 */
+const _STAGE_LABEL: Record<WorkerStage, string> = {
+  preflight: "准备环境（P4 / Git 工作区检查）",
+  admission: "准入评估",
+  investigation: "只读调查",
+  implementation: "实施编码",
+  verification: "机器验证",
+  review: "独立评审",
+  correction: "评审后定向修正",
+};
+
+/** 该阶段实际调用 Agent 时生效的角色：模型必须与「调用时真正传给 pi 的模型」同一来源，
+ *  因此统一走 agentRoleModel(role) || effectivePiModel()（与 PiAgent.run 的解析顺序一致）。
+ *  验证阶段由编排器自己跑构建/测试，不调用模型，返回 null 由调用方回落。 */
+const stageAgentRole = (stage: WorkerStage): AgentRole | null => stage === "correction"
+  ? "recovery"
+  : stage === "investigation" || stage === "implementation" || stage === "review"
+    ? stage
+    : null;
+
+/** 阶段时限的规范化：NaN / 非正值 / Infinity 一律抛错。
+ *  配置错误必须显式暴露，不能悄悄退化成「无时限」。 */
+const phaseTotalSeconds = (agentTimeoutS: number): number => {
+  const total = Math.floor(Number(agentTimeoutS));
+  if (!Number.isFinite(total) || total <= 0) {
+    throw new Error(`agent_timeout_s 必须是正数（秒），当前值无法用于计算阶段时限: ${String(agentTimeoutS)}`);
+  }
+  return total;
+};
+
+/** 主调查时限：直接使用 agent_timeout_s（不再硬钳到 600s）。
+ *  agent_timeout_s 是「每次调用/每个阶段」的预算，不是整单总时限；多轮调用会累加。 */
+export const mainInvestigationTimeoutS = (agentTimeoutS: number): number =>
+  phaseTotalSeconds(agentTimeoutS);
+
+/** 派生调用（无工具收尾、补充核查）时限：按总配置派生且始终有限。
+ *  min(agent_timeout_s, max(180, agent_timeout_s / 3))——默认 1800 → 600；
+ *  总时限较小时尊重总时限（如 120 → 120），不会被抬到 180 以上。 */
+export const derivedRecoveryTimeoutS = (agentTimeoutS: number): number => {
+  const total = phaseTotalSeconds(agentTimeoutS);
+  return Math.min(total, Math.max(180, Math.round(total / 3)));
+};
 const _IMPLEMENTATION_RECOVERY_COMMAND_BUDGET = Number.POSITIVE_INFINITY;
 const _IMPLEMENTATION_RECOVERY_READ_ONLY_BEFORE_WRITE_LIMIT = Number.POSITIVE_INFINITY;
+
+/** coordinator（只读、无工具、只产出文字建议）两处调用的派生时限上限。
+ *  它不参与任何决策，因此预算刻意很小：宁可降级成「本次没有建议」，也不占用正式阶段的预算。
+ *  实际时限 = min(agents.roles.coordinator.timeout_s 配置值, 这里的上限)，只会收紧不会放大。 */
+export const _COORDINATOR_PLAN_TIMEOUT_S = 120;
+export const _COORDINATOR_SUMMARY_TIMEOUT_S = 90;
 
 const buildImplementationRecoveryPrompt = (
   originalPrompt: string,
@@ -217,6 +335,33 @@ export const requireExistingPlannedFiles = (
   };
 };
 
+/** 严格校验链：结构化解析 → planned_files 必须是具体文件 → 文件必须已存在（[新文件] 例外）。
+ *  主结果、超时部分结果、无工具收尾结果、补充核查结果都走同一条链，不能只看 parse.ok。 */
+export const validateInvestigationOutput = (
+  output: string,
+  diagnosticLinks: string[],
+  bugFields: Record<string, unknown> | undefined,
+  roots: Array<{ alias: string; path: string }>,
+): InvestigationResult => requireExistingPlannedFiles(
+  requireConcretePlannedFiles(parseInvestigation(output, diagnosticLinks, bugFields)),
+  roots,
+);
+
+/** 合并多段证据，仅供无工具收尾提示与失败证据使用。
+ *  绝不能把合并文本当解析输入：后一段轨迹可能已经否定前一段文本里的 JSON 结论。
+ *  每段单独限长，避免重复嵌套与超长提示；内容已被更早来源完整包含的段落会跳过。 */
+export const mergeInvestigationEvidence = (
+  parts: Array<{ label: string; text: string; limit?: number }>,
+): string => {
+  const kept: Array<{ label: string; text: string }> = [];
+  for (const part of parts) {
+    const text = part.text.trim();
+    if (!text || kept.some((item) => item.text.includes(text))) continue;
+    kept.push({ label: part.label, text: compactInvestigationTrace(text, part.limit ?? 6000) });
+  }
+  return kept.map((item) => `# ${item.label}\n${item.text}`).join("\n\n");
+};
+
 interface GitAttempt {
   config: AdditionalDirConfig;
   workspace: GitWorkspace;
@@ -253,6 +398,12 @@ export class Worker {
   private loopTask: Promise<void> | null = null;
   private wakeResolvers: Array<() => void> = [];
   private cleanP4Baselines = new Set<string>();
+  /** 上一次进入冷却时的截止时间；用于在冷却自然结束时只落一条「已恢复」事件。 */
+  private lastProviderCooldownUntil = 0;
+  /** 当前处理阶段（管理台「处理中 N」分组标题栏展示「当前阶段」；null = 未领取任务）。 */
+  private currentStage: WorkerStage | null = null;
+  /** 当前阶段实际生效的模型（随阶段切换与角色配置实时更新，不在管理台里写死）。 */
+  private currentStageModel = "";
 
   private async mediaInputsForBug(bug: Bug): Promise<AgentMediaInput[]> {
     const started = Date.now();
@@ -348,6 +499,7 @@ export class Worker {
       });
       this.store.addEvent("已移除关键词准入分类，任务恢复待处理", "info", id);
     }
+    this.recoverMisclassifiedProviderBlocks();
     for (const job of this.store.listJobs("in_progress")) {
       const id = String(job.bug_id);
       this.store.updateJob(id, { agent_state: "pending", started_at: null });
@@ -373,6 +525,41 @@ export class Worker {
     }
   }
 
+  /** 恢复被旧版本误标为 blocked_workspace 的 provider 故障任务（幂等）。
+   *  blocked_workspace 是终态：既不消耗 attempts 也无法自动重试，一次配额耗尽就会让整批
+   *  工单卡死。仅当三个条件同时成立才恢复：
+   *   1) 失败原因是显式 provider 错误（见 isRecoverableProviderBlock，排除任何 Git/P4/cleanup 证据）；
+   *   2) 该单没有产出 changelist——已有候选产物的记录不能当没发生过；
+   *   3) 恢复前把原 failure_reason 写进事件，作为审计记录留痕。
+   *  启动对账（runLoop）与一次性批处理（runBatch）都会调用：CLI 也必须能自愈这些历史误判。
+   *  刻意不在这里碰 in_progress：那可能与正在 serve 的进程抢任务。 */
+  recoverMisclassifiedProviderBlocks(): number {
+    let recovered = 0;
+    for (const job of this.store.listJobs("blocked_workspace")) {
+      if (job.changelist !== null && job.changelist !== undefined) continue;
+      const reason = String(job.failure_reason ?? "");
+      if (!isRecoverableProviderBlock(reason)) continue;
+      const id = String(job.bug_id);
+      this.store.updateJob(id, {
+        agent_state: "pending",
+        failure_reason: null,
+        started_at: null,
+        finished_at: null,
+      });
+      this.store.addEvent(
+        "历史误判为工作区阻塞的 provider 不可用任务已恢复为待处理（未消耗修复尝试）；"
+          + `原失败原因: ${reason.slice(0, 300)}`,
+        "info",
+        id,
+      );
+      recovered += 1;
+    }
+    if (recovered) {
+      this.store.addEvent(`对账：已恢复 ${recovered} 个被误判为工作区阻塞的 provider 任务`, "info");
+    }
+    return recovered;
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve(), ms);
@@ -393,6 +580,19 @@ export class Worker {
     this.reconcileStaleInProgress(); // 进程级对账：清理上个进程遗留的 in_progress 僵尸
     while (!this.stopRequested) {
       if (this.store.getControl() === "running") {
+        const cooldown = this.store.activeProviderCooldown();
+        if (cooldown) {
+          // 冷却期内不空转：直接睡到冷却到期（单次休眠有上限，便于感知人工提前解除）。
+          this.lastProviderCooldownUntil = cooldown.until_ms;
+          const remaining = cooldown.until_ms - Date.now();
+          await this.sleep(Math.max(1000, Math.min(remaining, _PROVIDER_COOLDOWN_SLEEP_MAX_MS)));
+          continue;
+        }
+        if (this.lastProviderCooldownUntil) {
+          // 冷却自然到期：只落一条恢复事件，不重复刷屏。
+          this.lastProviderCooldownUntil = 0;
+          this.store.addEvent("provider 冷却已结束，恢复自动处理", "info");
+        }
         let processed = false;
         try {
           processed = await this.processNext();
@@ -542,6 +742,9 @@ export class Worker {
    *  除 Tapd「我的」列表外，还并入本地 pending 但已不在该列表的 bug（改派/翻页遗漏/
    *  接口波动）：人工重试后必须仍会被处理。Tapd 侧已终态（resolved/closed 等）的不复活。 */
   async fetchActionable(): Promise<Bug[]> {
+    // 全局 provider 冷却期内不领任何任务：同一个不可用的 provider 不该被整批工单轮流撞。
+    // 闸门放在这里（而不是只在 processBug 内），runLoop 与 CLI runBatch 走的是同一条路。
+    if (this.store.activeProviderCooldown()) return [];
     const bugs = await this.fetchMyBugs();
     const actionable: Bug[] = [];
     const seen = new Set<string>();
@@ -553,7 +756,14 @@ export class Worker {
       if (job?.agent_state === "in_progress") continue; // 正在处理（防重入）
       actionable.push(b);
     }
-    for (const job of this.store.listJobs("pending")) {
+    // 本地记录里非终态、可自动重试、但已不在 Tapd「我的」列表的单（改派/翻页遗漏/接口波动）
+    // 也要继续处理。provider_unavailable 必须一并纳入：它是非终态，但不在第一个循环的
+    // 候选里，若只补 pending，一个不在 Tapd 列表里的 provider 故障单在冷却结束后会永远
+    // 领不回来（表现为点了重试也没反应）。
+    for (const job of [
+      ...this.store.listJobs("pending"),
+      ...this.store.listJobs("provider_unavailable"),
+    ]) {
       const id = String(job.bug_id);
       if (seen.has(id)) continue;
       if (this.config.exclude_status.includes(String(job.tapd_status ?? ""))) continue; // 快照终态不复活
@@ -578,13 +788,15 @@ export class Worker {
     try {
       await this.processBug(bug);
     } finally {
-      this.currentBugId = null;
+      this.currentBugId = null; // processBug 负责清空阶段展示，这里只管「当前 bug」
     }
     return true;
   }
 
   /** 同步处理一批（CLI 用，忽略控制态）。 */
   async runBatch(limit?: number): Promise<number> {
+    // CLI 一次性批处理也要能自愈历史误判的 provider 阻塞（幂等，只动 blocked_workspace）。
+    this.recoverMisclassifiedProviderBlocks();
     const n = limit ?? this.config.max_bugs_per_run;
     let count = 0;
     while (count < n) {
@@ -715,6 +927,65 @@ export class Worker {
       }
     }
     if (failures.length) throw new WorkspaceBlockedError(`Git 自动分支清理失败: ${failures.join("；")}`);
+  }
+
+  /** 评审驱动的受控范围补充：只扩充「本次有效计划范围」，不放宽 verifyCandidate 的范围门禁。
+   *  评审明确指向（findings 的位置/必须修正项，以及阻断性 finding 的举证）且能安全解析到配置根内
+   *  已有具体文件的需求会被加入 planned_files；显式根别名却定位不到、或超过 quality.max_changed_files
+   *  的要求一律转人工阻塞（不消耗模型重试，也不进入注定失败的修正轮）。
+   *  writtenFiles 存在时只审批 Agent 实际写入、且被评审指名的计划外文件（correction 结果后的兜底）。 */
+  private applyReviewScopeAmendment(
+    bug: Bug,
+    investigation: InvestigationResult,
+    review: ReviewResult,
+    repo: RepoConfig,
+    auditAttemptId: string,
+    stage: "correction" | "verification",
+    writtenFiles?: string[],
+  ): { investigation: InvestigationResult; added: string[] } {
+    const roots = this.workspaceRoots(repo);
+    const limit = this.config.quality.max_changed_files;
+    const amendment = writtenFiles?.length
+      ? reviewScopeAmendmentForWritten(review, roots, investigation, limit, writtenFiles)
+      : reviewScopeAmendment(review, roots, investigation, limit);
+    const detail = {
+      source: "review",
+      stage,
+      limit,
+      requested: amendment.requested.slice(0, 40),
+      approved: amendment.approved,
+      unapprovable: amendment.unapprovable.slice(0, 20),
+      unresolved: amendment.unresolved.slice(0, 40),
+      reason: amendment.reason || null,
+    };
+    if (amendment.requested.length) {
+      this.store.audit.event(auditAttemptId, "scope_amendment_requested", detail);
+    }
+    if (amendment.unapprovable.length) {
+      this.store.audit.event(auditAttemptId, "scope_amendment_rejected", detail);
+      throw new WorkspaceBlockedError(
+        `独立代码评审要求修改计划范围外的文件，但无法安全纳入本次自动修复范围（`
+        + `${amendment.reason ? `${amendment.reason}；` : ""}计划文件上限 ${limit}）: `
+        + `${amendment.unapprovable.join(", ")}；已转人工确认修改范围，不再进入无解的自动重试。`,
+      );
+    }
+    if (!amendment.approved.length) return { investigation, added: [] };
+    const previous = investigation.planned_files;
+    const amended: InvestigationResult = {
+      ...investigation,
+      planned_files: [...previous, ...amendment.approved],
+    };
+    this.store.audit.event(auditAttemptId, "scope_amendment_approved", {
+      ...detail, previous_files: previous, planned_files: amended.planned_files,
+    });
+    this.store.addEvent(
+      `评审要求的计划外文件已通过受控范围补充纳入本次计划范围: ${amendment.approved.join(", ")}`
+      + `（计划文件 ${previous.length} → ${amended.planned_files.length}，上限 ${limit}）`,
+      "warn",
+      bug.id,
+    );
+    this.store.updateJob(bug.id, { investigation: amended });
+    return { investigation: amended, added: amendment.approved };
   }
 
   private async verifyCandidate(
@@ -869,12 +1140,15 @@ export class Worker {
   ): Promise<ReviewResult> {
     const reviewPrompt = buildReviewPrompt({ bug, investigation, diff, verificationSummary });
     const auditAttempt = this.store.audit.attempts(bug.id).at(-1);
-    if (auditAttempt) this.store.audit.event(auditAttempt.attempt_id, "review_input", { prompt_hash: evidenceHash(reviewPrompt), diff_hash: evidenceHash(diff), model: reviewerModel });
+    if (auditAttempt) this.store.audit.event(auditAttempt.attempt_id, "review_input", { prompt_hash: evidenceHash(reviewPrompt), diff_hash: evidenceHash(diff), model: reviewerModel, role: "review" });
+    // 角色时限：agents.roles.review.timeout_s 存在时以它为准，否则沿用 agent_timeout_s（改造前行为）。
+    const reviewTimeoutS = agentRoleTimeoutS(this.config, "review", this.config.agent_timeout_s);
     const result = await reviewer.run({
       prompt: reviewPrompt,
       repoDir: p4.path,
       additionalDirs,
-      timeoutS: this.config.agent_timeout_s,
+      role: "review",
+      timeoutS: reviewTimeoutS,
       tools: ["read", "grep", "find", "ls"],
       maxCommandExecutions: _REVIEW_COMMAND_BUDGET,
       repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
@@ -953,10 +1227,18 @@ export class Worker {
   }
 
   async processBug(bug: Bug): Promise<void> {
+    // 双保险：全局 provider 冷却期间不得开始任何新尝试。fetchActionable 已拦一层，
+    // 但批量入口（CLI runBatch 等）可能持有提前取好的快照，所以在真正的执行入口再查一次，
+    // 绝不把工单喂给已知不可用的 provider。
+    if (this.store.activeProviderCooldown()) return;
+    // 记录本次尝试开始时的 generation：如果尝试期间人工点过「重试」（明确解除冷却），
+    // 那么迟到的 provider 错误不得再把冷却重新打开，否则用户点了重试却仍然没有反应。
+    const cooldownEpochAtStart = this.store.providerCooldownEpoch();
     const auditAttemptId = this.store.audit.begin({
       bug_id: bug.id, workspace_id: bug.workspace_id, input: buildBugContext(bug),
       metadata: {
-        model: effectivePiModel(this.config.pi), review_model: effectiveReviewModel(this.config),
+        model: effectivePiModel(this.config.pi), review_model: reviewerModel(this.config),
+        agent_roles: agentRoleSnapshot(this.config),
         review_enabled: this.config.review.enabled, quality: this.config.quality,
         agent_timeout_s: this.config.agent_timeout_s, max_attempts: this.config.max_attempts,
         runtime: process.version, agent_code_hashes: runtimeEvidence(),
@@ -973,11 +1255,16 @@ export class Worker {
     let lastResult: AgentResult | null = null;
     let orchestratorOpenedTargets: string[] = [];
     let phase = "preflight";
+    this.applyStage("preflight"); // 管理台「处理中 N」分组标题栏立即显示当前阶段（不再猜「跑到哪一步」）
     let contextKey = "";
     let investigationCheckpoint: InvestigationResult | undefined;
     let investigationProgress: InvestigationProgress | undefined;
     let investigationOutput = "";
     let behaviorChecks: FrozenBehaviorCheck[] = [];
+    /** coordinator（只读无工具）两处调用的产物：调查前的计划建议、交付前的汇总文案。
+     *  两者都只是附加文字：计划进调查 prompt，汇总进交付描述，绝不参与任何决策。 */
+    let coordinatorPlanText = "";
+    let coordinatorSummary: CoordinatorSummary | null = null;
     try {
       const repo = this.resolveRepo(bug);
       if (!repo) {
@@ -986,6 +1273,7 @@ export class Worker {
       activeRepo = repo;
 
       const mcpManualKeywords = configuredManualKeywords(this.config.mcp_servers);
+      this.applyStage("admission"); // 准入评估：管理台可见（不通过时也要能看到停在准入）
       const admission = assessFixabilityWithNarrative(
         bug,
         {
@@ -1095,7 +1383,9 @@ export class Worker {
       const investigationMedia = await this.mediaInputsForBug(bug);
       const attempts = Number(this.store.getJob(bug.id)?.attempts ?? 0) + 1;
       const agent = new PiAgent(this.config);
-      const reviewerModel = effectiveReviewModel(this.config);
+      // 评审模型的唯一入口：agents.roles.review.model > pi.provider 默认模型（旧 review.model 已移除）。
+      // 这里解析成最终生效值并贯穿审计与 --model，保证「调用用的模型」与「审计记录的模型」逐字一致。
+      const resolvedReviewerModel = reviewerModel(this.config);
       const reviewer = this.config.review.enabled
         ? new PiAgent(this.config)
         : null;
@@ -1130,20 +1420,77 @@ export class Worker {
           bug.id,
         );
       }
-      this.store.addEvent("调用只读调查 Agent：定位根因、证据与最小修改范围", "info", bug.id);
+      const investigationTimeoutS = mainInvestigationTimeoutS(this.config.agent_timeout_s);
+      /** 角色阶段时限（主调用）：agents.roles.<role>.timeout_s 存在时以它为准，
+       *  否则沿用该阶段既有的预算；未配置时与改造前逐字一致。 */
+      const roleStageTimeout = (role: AgentRole, fallback: number): number =>
+        agentRoleTimeoutS(this.config, role, fallback);
+      /** 角色派生时限（收尾/补查等）：角色配置同样受既有派生上限约束，不会放大收尾预算。 */
+      const roleCappedTimeout = (role: AgentRole, cap: number): number =>
+        Math.min(agentRoleTimeoutS(this.config, role, cap), cap);
+      this.store.addEvent(
+        `调用只读调查 Agent：定位根因、证据与最小修改范围（本阶段时限 ${investigationTimeoutS}s）`,
+        "info",
+        bug.id,
+      );
+      // ---- coordinator 计划（只读、无工具）：产出「调查计划建议」，作为调查 prompt 的补充。
+      //      只在新调用点被**显式配置**时启用（agents.roles.coordinator）；未配置 = 与改造前逐字一致，
+      //      不插入任何额外调用。启用后只做一次调用；任何失败都降级成「本次没有建议」并继续，
+      //      唯一例外是人工取消必须原样向上抛。它不推进阶段、不决定 planned_files、不改写任何事实。 ----
+      if (agentRoleEnabled(this.config, "coordinator")) {
+        const planPrompt = buildCoordinatorPlanPrompt({
+          bug: {
+            id: bug.id, title: bug.title, module: admission.context.module,
+            severity: bug.severity, priority_label: bug.priority_label,
+          },
+          context: { ...admission.context },
+          repo: { name: repo.name, roots: workspaceRoots },
+          ...(retryText ? { retryEvidence: retryText } : {}),
+        });
+        const plan = await this.runCoordinator({
+          prompt: planPrompt,
+          auditAttemptId,
+          phase: "coordinator_plan",
+          bugId: bug.id,
+          repoDir: repo.path,
+          timeoutS: roleCappedTimeout("coordinator", _COORDINATOR_PLAN_TIMEOUT_S),
+          parse: parseCoordinatorPlan,
+          degradeMessage: "coordinator 计划调用未产出可用建议（已忽略，调查按原流程继续）",
+        });
+        if (plan) {
+          coordinatorPlanText = formatCoordinatorPlanForPrompt(plan);
+          this.store.audit.event(auditAttemptId, "coordinator_plan", {
+            role: "coordinator", model: this.modelForRole("coordinator"),
+            timeout_s: roleCappedTimeout("coordinator", _COORDINATOR_PLAN_TIMEOUT_S),
+            // 与 agent_input 同一口径：审计只落哈希与结构化摘要，不落建议正文（正文会进调查 prompt）。
+            plan_hash: evidenceHash(coordinatorPlanText),
+            focus_areas: plan.focus_areas.length, risks: plan.risks.length,
+            verification_hints: plan.verification_hints.length,
+            has_understanding: Boolean(plan.understanding),
+          });
+          this.store.addEvent(
+            `coordinator 已给出调查计划建议（${plan.focus_areas.length} 个方向 / ${plan.risks.length} 个风险，仅作参考）`,
+            "info",
+            bug.id,
+          );
+        }
+      }
       let investigationPrompt = buildInvestigationPrompt(
         bug, repo.name, repo.path, resourceMcpEnabled, workspaceRoots,
       ) + formatFeedbackMemories(selectFeedbackMemories(bug, feedbackMemories(this.store)))
-        + (retryText ? `\n# 上次失败证据（调查时必须核对，避免换方向后丢失已有定位）\n${retryText}` : "");
+        + (retryText ? `\n# 上次失败证据（调查时必须核对，避免换方向后丢失已有定位）\n${retryText}` : "")
+        + (coordinatorPlanText ? `\n${coordinatorPlanText}` : "");
       this.store.audit.event(auditAttemptId, "investigation_input", {
         prompt_hash: evidenceHash(investigationPrompt), roots: workspaceRoots,
         context_key: contextKey, tools: investigationMcpServers,
+        role: "investigation",
+        model: agentRoleModel(this.config, "investigation") || effectivePiModel(this.config.pi),
       });
-      const investigationTimeoutS = Math.min(this.config.agent_timeout_s, 600);
       const investigationRunOptions = {
         repoDir: repo.path,
         additionalDirs: investigationAdditionalDirs,
-        timeoutS: investigationTimeoutS,
+        role: "investigation" as const,
+        timeoutS: roleStageTimeout("investigation", investigationTimeoutS),
         tools: ["read", "grep", "find", "ls"],
         maxCommandExecutions: _INVESTIGATION_COMMAND_BUDGET,
         repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
@@ -1156,8 +1503,44 @@ export class Worker {
         cancelEvent: this.cancelEvent,
         media: investigationMedia,
       };
+      const recoveryTimeoutS = derivedRecoveryTimeoutS(this.config.agent_timeout_s);
+      /** 严格校验链（结构化解析 → 具体文件 → 文件必须存在）；主结果、收尾结果、补充结果统一走它。 */
+      const strictInvestigation = (output: string): InvestigationResult =>
+        validateInvestigationOutput(
+          output,
+          admission.context.diagnostic_links,
+          { ...admission.context },
+          workspaceRoots,
+        );
+      /** 无工具收尾轮：只整理已有轨迹、不做任何调查。
+       *  每个检索轮最多一次（主调查 1 次 + 补充核查 1 次，整轮最多 2 次），无递归、无循环。 */
+      let toolsFreeRecoveryRuns = 0;
+      const runToolsFreeRecovery = async (evidence: string): Promise<AgentResult> => {
+        if (toolsFreeRecoveryRuns >= _TOOLS_FREE_RECOVERY_LIMIT) {
+          throw new AgentInvestigationLimitError(
+            `无工具收尾次数已达上限(${_TOOLS_FREE_RECOVERY_LIMIT} 次)`,
+            evidence.slice(-8000),
+          );
+        }
+        toolsFreeRecoveryRuns += 1;
+        return agent.run({
+          ...investigationRunOptions,
+          role: "recovery",
+          prompt: buildInvestigationTimeoutRecoveryPrompt(investigationPrompt, evidence),
+          timeoutS: roleCappedTimeout("recovery", recoveryTimeoutS),
+          tools: [],
+          thinkingLevel: "off",
+          maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
+          repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
+          completionGraceSeconds: 30,
+          mcpServers: [],
+          requiredMcpServers: [],
+          media: [],
+        });
+      };
       let investigated: AgentResult;
       phase = "investigation";
+      this.applyStage("investigation");
       const previous = retryEntries.at(-1);
       if (previous?.context_key === contextKey && previous.phase === "investigation") {
         investigationProgress = previous.investigation_progress
@@ -1165,7 +1548,14 @@ export class Worker {
             previous.partial_output, parseInvestigation(JSON.stringify(previous.investigation ?? {})),
           ) : undefined);
         if (investigationProgress) {
-          investigationPrompt = buildInvestigationContinuationPrompt(investigationPrompt, investigationProgress);
+          // 上一轮的校验缺项（validation_errors）单独传给继续调查提示：它们是“输出缺了什么”，
+          // 不是业务未决问题，所以既不进断点 open_questions，也不会被当成需要用户补充的信息。
+          const previousValidationErrors = Array.isArray(previous.investigation?.validation_errors)
+            ? (previous.investigation!.validation_errors as unknown[]).map((item) => String(item)).filter(Boolean)
+            : [];
+          investigationPrompt = buildInvestigationContinuationPrompt(
+            investigationPrompt, investigationProgress, previousValidationErrors,
+          );
           this.store.addEvent("恢复未完成调查断点：核对已读文件，仅补查未确认问题", "info", bug.id);
         }
       }
@@ -1184,6 +1574,7 @@ export class Worker {
           });
         }
       } catch (error) {
+        if (error instanceof ProviderUnavailableError) throw error; // provider 故障：不是工作区问题
         if (error instanceof AgentInfrastructureError) {
           throw new WorkspaceBlockedError(error.message);
         }
@@ -1196,55 +1587,31 @@ export class Worker {
             "warn",
             bug.id,
           );
-          const partialInvestigation = parseInvestigation(
-            error.partialOutput,
-            admission.context.diagnostic_links,
-            { ...admission.context },
-          );
+          // partialOutput 是 piRecoveryTrace 混合轨迹（工具回显 + 助手文本），
+          // 只能当非授权 checkpoint 保存，绝不直接采纳为可执行的调查结论。
+          const partialCheckpoint = strictInvestigation(error.partialOutput);
           investigationOutput = error.partialOutput;
-          investigationCheckpoint = partialInvestigation;
-          investigationProgress = captureInvestigationProgress(error.partialOutput, partialInvestigation, investigationProgress);
-          this.store.updateJob(bug.id, { investigation: partialInvestigation });
-          if (partialInvestigation.ok) {
-            investigated = {
-              ok: true,
-              summary: partialInvestigation.root_cause,
-              changed_files: [],
-              manual_assets: [],
-              blocked_reasons: [],
-              exit_code: 0,
-              log: error.partialOutput,
-              raw_output: error.partialOutput,
-            };
-          } else {
-            try {
-              investigated = await agent.run({
-                ...investigationRunOptions,
-                prompt: buildInvestigationTimeoutRecoveryPrompt(
-                  investigationPrompt,
-                  error.partialOutput,
-                ),
-                timeoutS: Math.min(this.config.agent_timeout_s, 180),
-                tools: [],
-                thinkingLevel: "off",
-                maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
-                repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
-                completionGraceSeconds: 30,
-                mcpServers: [],
-                requiredMcpServers: [],
-                media: [],
-              });
-            } catch (recoveryError) {
-              if (recoveryError instanceof AgentInfrastructureError) {
-                throw new WorkspaceBlockedError(recoveryError.message);
-              }
-              throw withRecoveryEvidence(error, recoveryError);
+          investigationCheckpoint = partialCheckpoint;
+          investigationProgress = captureInvestigationProgress(error.partialOutput, partialCheckpoint, investigationProgress);
+          this.store.updateJob(bug.id, { investigation: partialCheckpoint });
+          try {
+            // 收尾调用的是 recovery 角色（模型可能与调查角色不同）：只切换展示用的模型，
+            // 阶段标签仍是「只读调查」，跑完立刻还原，异常路径由外层 finally 兜底。
+            this.setStageModelForRole("recovery");
+            investigated = await runToolsFreeRecovery(error.partialOutput);
+          } catch (recoveryError) {
+            if (recoveryError instanceof ProviderUnavailableError) throw recoveryError;
+            if (recoveryError instanceof AgentInfrastructureError) {
+              throw new WorkspaceBlockedError(recoveryError.message);
             }
-            if (!investigated.ok) {
-              throw new Error(
-                `调查${limited ? "达到工具预算" : "超时"}后的收敛 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`,
-              );
-            }
+            throw withRecoveryEvidence(error, recoveryError);
+          } finally {
+            this.restoreStageModel();
+          }
+          if (!investigated.ok) {
+            throw new Error(
+              `调查${limited ? "达到工具预算" : "超时"}后的收敛 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`,
+            );
           }
         } else {
           throw error;
@@ -1253,13 +1620,8 @@ export class Worker {
       if (!investigated.ok) {
         throw new Error(`调查 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`);
       }
-      let investigation: InvestigationResult = requireExistingPlannedFiles(
-        requireConcretePlannedFiles(parseInvestigation(
-          investigated.raw_output || investigated.log || investigated.summary,
-          admission.context.diagnostic_links,
-          { ...admission.context },
-        )),
-        workspaceRoots,
+      let investigation: InvestigationResult = strictInvestigation(
+        investigated.raw_output || investigated.log || investigated.summary,
       );
       investigationOutput = investigated.raw_output || investigated.log || investigated.summary;
       investigationCheckpoint = investigation;
@@ -1267,7 +1629,7 @@ export class Worker {
       this.store.updateJob(bug.id, { investigation });
       if (!investigation.ok && !investigation.blocked_reasons.length) {
         this.store.addEvent(
-          "调查证据或结构化结果不完整，继续定向核查缺失项（不计入 Bug 重试）",
+          `调查证据或结构化结果不完整，继续定向核查缺失项（最多 ${SUPPLEMENTARY_COMMAND_BUDGET} 次工具调用，不计入 Bug 重试）`,
           "warn",
           bug.id,
         );
@@ -1278,11 +1640,13 @@ export class Worker {
               investigationOutput,
               investigation.validation_errors,
               investigationProgress,
+              SUPPLEMENTARY_COMMAND_BUDGET,
             ),
             ...investigationRunOptions,
-            timeoutS: Math.min(this.config.agent_timeout_s, 180),
+            role: "investigation",
+            timeoutS: roleCappedTimeout("investigation", recoveryTimeoutS),
             tools: ["read", "grep", "find", "ls"],
-            maxCommandExecutions: _RECOVERY_COMMAND_BUDGET,
+            maxCommandExecutions: SUPPLEMENTARY_COMMAND_BUDGET,
             repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
             completionGraceSeconds: 30,
             mcpServers: [],
@@ -1290,27 +1654,60 @@ export class Worker {
             media: [],
           });
         } catch (error) {
+          if (error instanceof ProviderUnavailableError) throw error; // provider 故障：不是工作区问题
           if (error instanceof AgentInfrastructureError) throw new WorkspaceBlockedError(error.message);
           if (error instanceof AgentInvestigationLimitError || error instanceof AgentTimeoutError) {
-            throw withRecoveryEvidence(new AgentInvestigationLimitError(
-              "调查补充核查未完成",
-              investigated.raw_output || investigated.log || investigated.summary,
-            ), error);
+            // 与主轮对齐：混合轨迹只当 checkpoint 保存，不足时最多一次无工具收尾；
+            // 收尾返回的助手输出（仅 assistant 文本）再走严格校验。
+            const supplementalCheckpoint = strictInvestigation(error.partialOutput);
+            // 保留三段证据：主搜索轨迹（可能只剩在检查点里）、主输出、补查中断轨迹。
+            const mergedEvidence = mergeInvestigationEvidence([
+              { label: "主搜索轨迹（检查点保留，可能已被后续轨迹修正）", text: investigationProgress?.trace ?? "" },
+              { label: "上一轮输出（可能已被后续轨迹否定，不得直接据此下结论）", text: investigationOutput },
+              { label: "补充核查中断前轨迹（同一轮，最新）", text: error.partialOutput },
+            ]);
+            investigationOutput = mergedEvidence;
+            investigationCheckpoint = supplementalCheckpoint;
+            investigationProgress = captureInvestigationProgress(mergedEvidence, supplementalCheckpoint, investigationProgress);
+            this.store.updateJob(bug.id, { investigation: supplementalCheckpoint });
+            this.store.addEvent(
+              `补充核查达到时限/工具预算（试行限额 ${SUPPLEMENTARY_COMMAND_BUDGET} 次），按已有证据做一次无工具收尾`,
+              "warn",
+              bug.id,
+            );
+            try {
+              // 与主调查轮一致：收尾用 recovery 角色，模型同步切换（阶段标签仍是「只读调查」），
+              // 无论成功失败都在 finally 还原。
+              this.setStageModelForRole("recovery");
+              investigated = await runToolsFreeRecovery(mergedEvidence);
+            } catch (shutdownError) {
+              if (shutdownError instanceof ProviderUnavailableError) throw shutdownError;
+              if (shutdownError instanceof AgentInfrastructureError) {
+                throw new WorkspaceBlockedError(shutdownError.message);
+              }
+              throw withRecoveryEvidence(new AgentInvestigationLimitError(
+                "调查补充核查未完成",
+                mergedEvidence,
+              ), shutdownError);
+            } finally {
+              this.restoreStageModel();
+            }
+            if (!investigated.ok) {
+              throw new Error(
+                `调查补充核查后的收尾 Agent 异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`,
+              );
+            }
+          } else {
+            throw error;
           }
-          throw error;
         }
         if (!investigated.ok) {
           throw new Error(
             `调查 Agent 补充轮异常退出(${investigated.exit_code}): ${investigated.log.slice(-500)}`,
           );
         }
-        investigation = requireExistingPlannedFiles(
-          requireConcretePlannedFiles(parseInvestigation(
-            investigated.raw_output || investigated.log || investigated.summary,
-            admission.context.diagnostic_links,
-            { ...admission.context },
-          )),
-          workspaceRoots,
+        investigation = strictInvestigation(
+          investigated.raw_output || investigated.log || investigated.summary,
         );
       }
       investigationOutput = investigated.raw_output || investigated.log || investigated.summary;
@@ -1320,8 +1717,15 @@ export class Worker {
       if (!investigation.ok) {
         const reason = [...investigation.blocked_reasons, ...investigation.validation_errors].join("；");
         if (investigation.blocked_reasons.length) {
+          // 两类人工出口都不消耗修复尝试次数：业务未决问题 / 现有代码疑似已包含修复、
+          // 修复前基线不可确认。两者都不能被当成“输出格式不完整”去自动重试。
+          const needsHuman = investigation.blocked_reasons.some((item) =>
+            item.startsWith(BUSINESS_QUESTION_PREFIX) || item.startsWith(BASELINE_UNCONFIRMED_PREFIX));
           throw new InvestigationBlockedError(
-            "只读 Agent 明确无法定位问题: " + investigation.blocked_reasons.join("；"),
+            (needsHuman
+              ? "只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）"
+              : "只读 Agent 明确无法定位问题")
+            + ": " + investigation.blocked_reasons.join("；"),
           );
         }
         throw new Error("调查结果格式不完整，将使用新上下文自动重试: " + (reason || "输出不可解析"));
@@ -1339,15 +1743,21 @@ export class Worker {
       if (amendment) {
         const amendmentPrompt = `${investigationPrompt}\n# 只读范围补充复核（仅一轮）\n原调查: ${JSON.stringify(investigation)}\n范围申请（待核查数据）: ${JSON.stringify(amendment)}\n核对所列文件对复用或完整修复是否必要。保留原 repair_contract 与原 planned_files，仅可加入申请文件；不要再申请扩大。返回完整 FINAL_RESULT，scope_amendment=null。`;
         this.store.audit.event(auditAttemptId, "scope_amendment_requested", { ...amendment, prompt_hash: evidenceHash(amendmentPrompt) });
-        const amended = await agent.run({ ...investigationRunOptions, prompt: amendmentPrompt, timeoutS: Math.min(this.config.agent_timeout_s, 180) });
+        const amended = await agent.run({ ...investigationRunOptions, prompt: amendmentPrompt, timeoutS: roleCappedTimeout("investigation", Math.min(this.config.agent_timeout_s, 180)) });
         if (!amended.ok) throw new VerificationError("范围补充调查执行失败");
         const output = amended.raw_output || amended.log || amended.summary;
-        const revised = requireExistingPlannedFiles(requireConcretePlannedFiles(parseInvestigation(output, admission.context.diagnostic_links, { ...admission.context })), workspaceRoots);
+        const revised = strictInvestigation(output);
         if (scopeAmendment(output)) throw new VerificationError("范围补充仅允许一轮");
         validateAmendedScope(investigation, revised, amendment.files, this.config.quality.max_changed_files);
-        this.store.audit.event(auditAttemptId, "scope_amendment_approved", { previous_files: investigation.planned_files, revised });
-        investigation = revised;
-        investigationCheckpoint = revised;
+        // 范围补充轮只负责加文件：原调查已登记的验证限制不能被这一轮悄悄丢掉。
+        const carriedLimitations = [...new Set([
+          ...(investigation.verification_limitations ?? []),
+          ...(revised.verification_limitations ?? []),
+        ])];
+        const merged: InvestigationResult = { ...revised, verification_limitations: carriedLimitations };
+        this.store.audit.event(auditAttemptId, "scope_amendment_approved", { previous_files: investigation.planned_files, revised: merged });
+        investigation = merged;
+        investigationCheckpoint = merged;
         this.store.updateJob(bug.id, { investigation });
       }
       gitAttempts = await this.prepareGitAttempts(
@@ -1417,6 +1827,7 @@ export class Worker {
       }));
       this.store.audit.event(auditAttemptId, "implementation_input", {
         prompt_hash: evidenceHash(prompt), investigation,
+        verification_limitations: investigation.verification_limitations ?? [],
         git_bases: gitAttempts.map(a => ({ root: a.config.name, commit: a.session.baseCommit })),
         verification_commands: this.verificationCommands(repo, investigation.planned_files),
       });
@@ -1429,6 +1840,7 @@ export class Worker {
       );
       const implementationMedia = await this.mediaInputsForBug(bug);
       phase = "implementation";
+      this.applyStage("implementation");
       const searchPaths = defaultSearchPaths(repo.path, investigation.planned_files.flatMap((file) => {
         const separator = file.indexOf(":");
         const alias = separator < 0 ? "project" : file.slice(0, separator);
@@ -1439,7 +1851,8 @@ export class Worker {
         prompt,
         repoDir: repo.path,
         additionalDirs: implementationAdditionalDirs,
-        timeoutS: this.config.agent_timeout_s,
+        role: "implementation" as const,
+        timeoutS: roleStageTimeout("implementation", this.config.agent_timeout_s),
         maxCommandExecutions: _IMPLEMENTATION_COMMAND_BUDGET,
         repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
         maxReadOnlyExecutionsBeforeWrite: _IMPLEMENTATION_READ_ONLY_BEFORE_WRITE_LIMIT,
@@ -1488,10 +1901,14 @@ export class Worker {
           try {
             // 上面的真实改动检查会关闭未改动的预打开文件；恢复编码前重新使其可写。
             if (orchestratorOpenedTargets.length) await p4.edit(orchestratorOpenedTargets);
+            // 收尾子调用用 recovery 角色：模型同步切换（阶段标签仍是「实施编码」），
+            // 无论成功失败都在 finally 还原。
+            this.setStageModelForRole("recovery");
             result = await agent.run({
               ...implementationRunOptions,
+              role: "recovery",
               prompt: buildImplementationRecoveryPrompt(prompt, error.partialOutput),
-              timeoutS: Math.min(this.config.agent_timeout_s, _IMPLEMENTATION_RECOVERY_TIMEOUT_S),
+              timeoutS: roleCappedTimeout("recovery", Math.min(this.config.agent_timeout_s, _IMPLEMENTATION_RECOVERY_TIMEOUT_S)),
               maxCommandExecutions: _IMPLEMENTATION_RECOVERY_COMMAND_BUDGET,
               maxReadOnlyExecutionsBeforeWrite: _IMPLEMENTATION_RECOVERY_READ_ONLY_BEFORE_WRITE_LIMIT,
               maxSecondsBeforeWrite: Math.min(this.config.agent_timeout_s, 90),
@@ -1517,6 +1934,8 @@ export class Worker {
               "warn",
               bug.id,
             );
+          } finally {
+            this.restoreStageModel();
           }
         }
       }
@@ -1524,6 +1943,8 @@ export class Worker {
       if (!result.ok) {
         throw new Error(`修复 Agent 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
       }
+      investigation = this.absorbImplementationLimitations(bug.id, investigation, result);
+      investigationCheckpoint = investigation;
       if (orchestratorOpenedTargets.length) {
         await p4.revertUnchanged(orchestratorOpenedTargets);
         orchestratorOpenedTargets = [];
@@ -1538,6 +1959,7 @@ export class Worker {
 
       // ---- 验证门 ----
       phase = "verification";
+      this.applyStage("verification");
       let opened: OpenedFile[] | null = null;
       let testOut = "";
       let verificationPassed = false;
@@ -1608,9 +2030,10 @@ export class Worker {
         }
         if (this.config.review.enabled && verificationPassed) {
           phase = "review";
+          this.applyStage("review");
           let review = await this.reviewCandidate(
             reviewer!,
-            reviewerModel,
+            resolvedReviewerModel,
             p4,
             bug,
             investigation,
@@ -1624,8 +2047,28 @@ export class Worker {
           let fixRound = 0;
           while (!review.approved && fixRound < this.config.review.max_fix_rounds) {
             fixRound += 1;
+            // correction 之前：Reviewer 明确要求修改计划范围外的文件时，先把可安全批准的文件
+            // 加入本次有效范围，修正 Agent 才不会「照做即越界、如实报告即失败」。
+            // 无法安全批准的要求在这里直接转人工阻塞（不消耗重试）。
+            const scopeBeforeCorrection = this.applyReviewScopeAmendment(
+              bug, investigation, review, repo, auditAttemptId, "correction",
+            );
+            investigation = scopeBeforeCorrection.investigation;
+            investigationCheckpoint = investigation;
+            if (scopeBeforeCorrection.added.length) {
+              // 扩围后重取行为基线：验证门、行为测试与后续评审都必须基于扩充后的有效范围。
+              behaviorChecks = await prepareBehaviorChecks(
+                repo.behavior_checks, repo.path, investigation.planned_files, this.cancelEvent,
+              );
+              if (this.cancelEvent.cancelled) throw new AgentCancelledError("行为测试已取消");
+              this.store.audit.event(auditAttemptId, "behavior_baseline", { checks: behaviorChecks, scope_amendment: true });
+              this.store.audit.event(auditAttemptId, "source_baseline", {
+                files: sourceEvidence(investigation.planned_files, workspaceRoots), scope_amendment: true,
+              });
+            }
             const feedback = formatReviewerFeedback(review);
             this.store.addEvent(`Reviewer 拒绝候选，开始第 ${fixRound} 轮定向修正`, "warn", bug.id);
+            this.applyStage("correction"); // 定向修正阶段用恢复角色模型（见 stageAgentRole）
             const correctionPrompt = withPreopenedP4Files(buildImplementationPrompt({
               bug,
               repoName: repo.name,
@@ -1636,12 +2079,17 @@ export class Worker {
               reviewerFeedback: feedback,
               unrealMcpEnabled: resourceMcpEnabled,
               workspaceRoots,
+              scopeAmendment: scopeBeforeCorrection.added.length
+                ? { files: scopeBeforeCorrection.added, reason: "Reviewer 阻断项明确指向这些计划外文件" }
+                : undefined,
             }));
             const correctionOptions = {
               prompt: correctionPrompt,
               repoDir: repo.path,
               additionalDirs: implementationAdditionalDirs,
-              timeoutS: this.config.agent_timeout_s,
+              // Reviewer 拒绝后的定向修正属于恢复/修正角色；审计 phase 仍是 correction（保持不变）。
+              role: "recovery" as const,
+              timeoutS: roleStageTimeout("recovery", this.config.agent_timeout_s),
               maxCommandExecutions: _IMPLEMENTATION_COMMAND_BUDGET,
               repeatedCommandLimit: _REPEATED_COMMAND_LIMIT,
               maxReadOnlyExecutionsBeforeWrite: _IMPLEMENTATION_READ_ONLY_BEFORE_WRITE_LIMIT,
@@ -1667,8 +2115,9 @@ export class Worker {
               );
               result = await agent.run({
                 ...correctionOptions,
+                role: "recovery",
                 prompt: buildImplementationRecoveryPrompt(correctionPrompt, error.partialOutput),
-                timeoutS: Math.min(this.config.agent_timeout_s, _IMPLEMENTATION_RECOVERY_TIMEOUT_S),
+                timeoutS: roleCappedTimeout("recovery", Math.min(this.config.agent_timeout_s, _IMPLEMENTATION_RECOVERY_TIMEOUT_S)),
                 maxCommandExecutions: _IMPLEMENTATION_RECOVERY_COMMAND_BUDGET,
                 maxReadOnlyExecutionsBeforeWrite: _IMPLEMENTATION_RECOVERY_READ_ONLY_BEFORE_WRITE_LIMIT,
                 maxSecondsBeforeWrite: Math.min(this.config.agent_timeout_s, 90),
@@ -1679,6 +2128,8 @@ export class Worker {
             if (!result.ok) {
               throw new Error(`修正 Agent 异常退出(${result.exit_code}): ${result.log.slice(-500)}`);
             }
+            investigation = this.absorbImplementationLimitations(bug.id, investigation, result);
+            investigationCheckpoint = investigation;
             if (result.blocked_reasons.length) {
               throw new VerificationError("修正 Agent 报告仍有阻塞项: " + result.blocked_reasons.join("；"));
             }
@@ -1689,6 +2140,20 @@ export class Worker {
               throw new VerificationError("Reviewer 修正阶段未产出代码改动: "
                 + (result.blocked_reasons.join("；") || result.summary || "无输出"));
             }
+            this.applyStage("verification"); // 修正后重新过验证门/评审
+            // correction 结果之后：只对「评审明确指名」的计划外写入补一次受控扩围；
+            // 没有评审指向的多余改动仍由 verifyCandidate 的范围门拒绝。
+            const scopeAfterCorrection = this.applyReviewScopeAmendment(
+              bug,
+              investigation,
+              review,
+              repo,
+              auditAttemptId,
+              "verification",
+              [...result.changed_files, ...this.lastAttemptFiles(bug.id)],
+            );
+            investigation = scopeAfterCorrection.investigation;
+            investigationCheckpoint = investigation;
             verified = await this.verifyCandidate(
               p4, repo, gitAttempts, null, investigation.planned_files,
               [...result.changed_files, ...this.lastAttemptFiles(bug.id)],
@@ -1703,9 +2168,10 @@ export class Worker {
             testOut = verified.summary;
             verificationPassed = verified.verified;
             this.store.updateJob(bug.id, { verification: verified });
+            this.applyStage("review");
             review = await this.reviewCandidate(
               reviewer!,
-              reviewerModel,
+              resolvedReviewerModel,
               p4,
               bug,
               investigation,
@@ -1727,6 +2193,73 @@ export class Worker {
       if (!hasCodeChanges(result) && !hasManualAssets(result)) {
         const reason = result.blocked_reasons.join("; ") || result.log.slice(0, 300) || "无输出";
         throw new Error("Agent 未产出任何代码改动或资源说明: " + reason);
+      }
+
+      // ---- coordinator 汇总（只读、无工具）：在最终交付之前，把**已确定的事实**组织成
+      //      一段附加说明。事实由编排器整理后原样给出（测试/文件/review 结论），
+      //      coordinator 只能组织文字，不能改写它们；其产出只以附加段落形式进入交付描述，
+      //      result.summary 与所有结构化事实保持不变。与计划调用同源，未显式配置该角色时不启用；
+      //      启用后失败降级，只有取消向上抛。 ----
+      if (agentRoleEnabled(this.config, "coordinator")) {
+        const filesByRoot = (values: string[]): Record<string, string[]> => {
+          const grouped: Record<string, string[]> = {};
+          for (const value of values) {
+            const separator = value.indexOf(":");
+            const alias = separator > 0 ? value.slice(0, separator) : "project";
+            const file = separator > 0 ? value.slice(separator + 1) : value;
+            (grouped[alias] ??= []).push(file);
+          }
+          return grouped;
+        };
+        const review = loads<Record<string, unknown> | null>(
+          this.store.getJob(bug.id)?.review_findings as string, null,
+        );
+        const summaryPrompt = buildCoordinatorSummaryPrompt({
+          bug: { id: bug.id, title: bug.title },
+          facts: {
+            agent_result: { summary: result.summary, blocked_reasons: result.blocked_reasons },
+            code_changes: {
+              changed_files: result.changed_files,
+              by_root: filesByRoot(result.changed_files),
+              p4_opened_files: filesByRoot((opened ?? []).map((item) => `project:${item.depot}`)),
+            },
+            machine_verification: {
+              configured: this.config.quality.require_verification || Boolean(repo.verify_cmds.length),
+              passed: verificationPassed,
+              output: truncate(testOut, 2000),
+              limitations: investigation.verification_limitations ?? [],
+            },
+            review: this.config.review.enabled
+              ? (review ? { ...review } : { unavailable: "评审未产出结论" })
+              : { disabled: "本次未启用独立评审" },
+            manual_assets: result.manual_assets.map((asset) => ({
+              path: asset.path, reason: asset.reason ?? "",
+            })),
+          },
+        });
+        coordinatorSummary = await this.runCoordinator({
+          prompt: summaryPrompt,
+          auditAttemptId,
+          phase: "coordinator_summary",
+          bugId: bug.id,
+          repoDir: repo.path,
+          timeoutS: roleCappedTimeout("coordinator", _COORDINATOR_SUMMARY_TIMEOUT_S),
+          parse: parseCoordinatorSummary,
+          degradeMessage: "coordinator 汇总调用未产出可用文案（已忽略，交付事实不变）",
+        });
+        if (coordinatorSummary) {
+          // 只追加文字：不改写 result.summary，也不影响任何结构化字段与交付分类。
+          result.summary = [result.summary, formatCoordinatorSummaryForDelivery(coordinatorSummary)]
+            .filter(Boolean).join("\n\n");
+          this.store.audit.event(auditAttemptId, "coordinator_summary", {
+            role: "coordinator", model: this.modelForRole("coordinator"),
+            timeout_s: roleCappedTimeout("coordinator", _COORDINATOR_SUMMARY_TIMEOUT_S),
+            // 同样只落哈希与计数：正文已作为附加段落追加进交付描述。
+            summary_hash: evidenceHash(coordinatorSummary.summary),
+            key_points: coordinatorSummary.key_points.length,
+          });
+          this.store.addEvent("coordinator 已补充交付说明（仅附加文字，不覆盖测试/文件/评审事实）", "info", bug.id);
+        }
       }
 
       // ---- 分类 ----
@@ -1764,6 +2297,9 @@ export class Worker {
         "本 changelist 由 TapdBugFixAgent 自动生成，请人工 review 后提交",
         ...gitResults.map(({ name, result: gitResult }) =>
           `Git ${name}: ${gitResult.branch} @ ${gitResult.commit}（仅本地提交，未 push）`),
+        // 验证限制必须进入交付描述：不能静默丢失，也不能被当成已验证事实。
+        ...(investigation.verification_limitations ?? []).map((item) =>
+          `验证限制（未执行/无法执行，不得视为已通过）: ${item}`),
       ]);
       let cl: number | null = null;
       if (files.length && ["candidate", "candidate_partial", "verified", "review_pending"].includes(state)) {
@@ -1794,11 +2330,16 @@ export class Worker {
         diff: String(verification.diff || ""), files: result.changed_files,
         delivery: state === "candidate_partial" ? "partial" : "complete",
         evidence: { verification, review: loads(delivered.review_findings as string, {}),
-          investigation, changelist: cl, git_results: gitResults, manual_assets: result.manual_assets },
+          investigation, changelist: cl, git_results: gitResults, manual_assets: result.manual_assets,
+          verification_limitations: investigation.verification_limitations ?? [] },
       });
 
+      // 走到这里说明本轮的模型调用确实成功返回过：provider 健康，退避计数归零。
+      // 放在 Tapd 回写之前，避免回写失败/被取消时把「provider 已恢复」的事实丢掉。
+      this.resetProviderBackoffAfterSuccess();
+
       // ---- Tapd 回写 ----
-      await this.notifyTapd(bug, state, cl, result, gitResults);
+      await this.notifyTapd(bug, state, cl, result, gitResults, investigation.verification_limitations ?? []);
       this.store.addEvent(
         `完成（${state}）`
           + (cl ? `，changelist ${cl}` : "")
@@ -1821,10 +2362,12 @@ export class Worker {
           if (hasPatchEvidence(diffs.join("\n"))) this.store.audit.event(auditAttemptId,"patch",{diff:diffs.join("\n"),files:names});
         } catch (captureError) { this.store.audit.event(auditAttemptId,"patch_capture_failed",{reason:String(captureError)}); }
       }
+      let p4CleanupError: unknown = null;
       if (p4 && orchestratorOpenedTargets.length) {
         try {
           await p4.forkForCleanup().revertUnchanged(orchestratorOpenedTargets);
         } catch (cleanupError) {
+          p4CleanupError = cleanupError;
           this.store.addEvent(`P4: 清理编排器预打开的未修改文件失败: ${String(cleanupError)}`, "warn", bug.id);
         }
       }
@@ -1833,6 +2376,10 @@ export class Worker {
         this.cleanP4Baselines.delete(activeRepo.path.replace(/\\/g, "/").toLowerCase());
       }
       let failure = exc;
+      // provider 健康状态的判定依据是「原始异常」，必须在这里就从 exc 上取。
+      // 后面 cleanup 失败会把 failure 替换成 WorkspaceBlockedError（工作区优先级更高），
+      // 那时再取 failure 就永远是 null，冷却不会开启，下一单继续撞同一个不可用的 provider。
+      const providerOutage = exc instanceof ProviderUnavailableError ? exc : null;
       if (failure instanceof P4ConnectionError) {
         failure = new WorkspaceBlockedError(
           `P4 服务当前不可用，可能处于休眠恢复、VPN/网络重连或服务维护期间；` +
@@ -1847,7 +2394,72 @@ export class Worker {
           failure = new WorkspaceBlockedError(`${String(exc)}；${String(cleanupError)}`);
         }
       }
-      if (failure instanceof WorkspaceBlockedError) {
+      // 真实 cleanup 失败必须高于 provider 状态：清理没做完说明工作区可能仍留着本次
+      // 尝试的打开文件，此时把任务标成可自动重试的 provider_unavailable 会让下一次尝试
+      // 在脏工作区上继续。改为工作区阻塞（且原因含 P4/清理证据，历史恢复判定也会排除它）。
+      if (providerOutage && p4CleanupError) {
+        failure = new WorkspaceBlockedError(
+          `${String(exc)}；清理未完成（P4 撤销预打开文件失败）: ${String(p4CleanupError)}`,
+        );
+      }
+      // provider 的「健康状态」与本次任务的「失败分类」分开处理：无论任务最终落成
+      // provider_unavailable，还是被 cleanup/P4 证据升级成工作区阻塞，都必须开全局冷却，
+      // 否则下一单仍会撞上同一个已经不可用的 provider（现场曾因此 5 分钟内连败 17 单）。
+      // 但人工在本次尝试期间已经明确解除过冷却（generation 变化）时不再重开。
+      if (providerOutage && this.store.providerCooldownEpoch() === cooldownEpochAtStart) {
+        this.openProviderCooldown(providerOutage, bug.id);
+      } else if (providerOutage) {
+        this.store.addEvent(
+          "人工已在本次尝试期间解除 provider 冷却，迟到的 provider 错误不再重开冷却",
+          "info",
+          bug.id,
+        );
+      }
+      // job 分类看 failure（不是 providerOutage）：升级成工作区阻塞时 workspace 优先级更高。
+      if (failure instanceof ProviderUnavailableError) {
+        // 记录本次尝试遗留的 default 打开文件，供下一次尝试精确撤销。
+        // 严格清点：查不到就必须知道（否则无法证明工作区可安全重试）。
+        let leftoverRecorded = true;
+        try {
+          await this.recordAttemptEnd(bug.id, p4, true);
+        } catch (recordError) {
+          leftoverRecorded = false;
+          this.store.addEvent(`provider 故障后登记遗留打开文件失败: ${String(recordError)}`, "warn", bug.id);
+        }
+        // 回读状态再写：人工重试/跳过可能已经改过状态，迟到的 provider 错误绝不能覆盖
+        // 人工决定（与取消分支的保护一致）。
+        const current = String(this.store.getJob(bug.id)?.agent_state ?? "");
+        const humanOwnsState = current !== "" && current !== "in_progress";
+        if (leftoverRecorded && !humanOwnsState) {
+          this.store.updateJob(bug.id, {
+            agent_state: "provider_unavailable",
+            failure_reason: failure.message.slice(0, 1000),
+            finished_at: nowStr(),
+          });
+        } else if (!leftoverRecorded && !humanOwnsState) {
+          // 清点失败时无法证明工作区干净：不默认可安全重试，转工作区阻塞交人工确认。
+          // 刻意不动 cleanP4Baselines：这里只负责不把脏工作区当成可安全重试，基线扫描
+          // 的既有条件逻辑保持不变，避免影响必需的 preflight 扫描。
+          this.store.updateJob(bug.id, {
+            agent_state: "blocked_workspace",
+            failure_reason:
+              `provider 故障后无法清点遗留文件，工作区状态未确认（P4 清点失败）: `
+              + failure.message.slice(0, 900),
+            finished_at: nowStr(),
+          });
+          this.store.addEvent(
+            "provider 故障且遗留文件未确认，已转工作区阻塞（不做默认可安全重试）",
+            "warn",
+            bug.id,
+          );
+        } else {
+          this.store.addEvent(
+            `provider 故障期间状态已被人工设置（${current}），保留人工设置不覆盖`,
+            "warn",
+            bug.id,
+          );
+        }
+      } else if (failure instanceof WorkspaceBlockedError) {
         const reason = failure.message.slice(0, 1000);
         this.store.updateJob(bug.id, {
           agent_state: "blocked_workspace",
@@ -1862,7 +2474,11 @@ export class Worker {
           failure_reason: reason,
           finished_at: nowStr(),
         });
-        this.store.addEvent(`只读 Agent 明确无法根据现有工单与代码定位问题: ${reason}`, "warn", bug.id);
+        this.store.addEvent(
+          `只读调查已转人工处理（未消耗修复尝试次数）: ${reason}`,
+          "warn",
+          bug.id,
+        );
       } else if (failure instanceof AgentCancelledError || failure instanceof P4CancelledError) {
         // 人工暂停/关闭/重试/跳过中断了本次尝试。只有状态仍是 in_progress（全局暂停/
         // 关闭）才回退 pending；人工重试/跳过已先把状态改成 pending/skipped，尊重人工
@@ -1876,6 +2492,10 @@ export class Worker {
           this.store.addEvent(`处理被人工中断，保留人工设置的状态（${st}）`, "warn", bug.id);
         }
       } else {
+        // lastResult 有值 = 本轮实现阶段的模型调用确实成功返回过 → provider 健康，退避归零。
+        // 但 TAPD/P4 预检可能在任何模型调用之前就失败（此时 lastResult 为空），那种失败
+        // 不构成「provider 可用」的证据，不能清零。
+        if (lastResult) this.resetProviderBackoffAfterSuccess();
         await this.handleFailure(bug, failure, p4, lastResult, {
           phase, context_key: contextKey,
           investigation: investigationCheckpoint as unknown as Record<string, unknown> | undefined,
@@ -1887,6 +2507,9 @@ export class Worker {
         });
       }
     } finally {
+      // 阶段展示生命周期在 processBug 自身收口：无论从哪个入口调用（runLoop 或直接调用），
+      // 结束后都回到「—」；currentBugId 仍由 processNext 负责（单测会直接调 processBug）。
+      this.clearStage();
       const job = this.store.getJob(bug.id) || {};
       const snapshot = this.store.audit.attempts(bug.id).find(a => a.attempt_id === auditAttemptId)!;
       const verification = loads<Record<string, unknown>>(job.verification as string, {});
@@ -1906,9 +2529,34 @@ export class Worker {
       this.store.audit.event(auditAttemptId, "finished", {
         state: job.agent_state, phase, failure: job.failure_reason,
         investigation: investigationCheckpoint, verification,
+        verification_limitations: investigationCheckpoint?.verification_limitations ?? [],
         review: loads(job.review_findings as string, {}),
       });
     }
+  }
+
+  /** 实施/修正 Agent 把纯验证限制（无法运行游戏、无自动化环境…）写进 blocked_reasons 时，
+   *  迁移到 investigation.verification_limitations 并保留原文，不作为阻塞项。
+   *  否则一条如实说明的限制会让每次尝试都判失败，形成必然失败的重试循环。 */
+  private absorbImplementationLimitations(
+    bugId: string,
+    investigation: InvestigationResult,
+    result: AgentResult,
+  ): InvestigationResult {
+    const limitations = result.blocked_reasons.filter(isVerificationLimitation);
+    if (!limitations.length) return investigation;
+    result.blocked_reasons = result.blocked_reasons.filter((item) => !isVerificationLimitation(item));
+    const merged: InvestigationResult = {
+      ...investigation,
+      verification_limitations: [...new Set([...(investigation.verification_limitations ?? []), ...limitations])],
+    };
+    this.store.updateJob(bugId, { investigation: merged });
+    this.store.addEvent(
+      `实施 Agent 报告的验证限制已登记（不作为阻塞项，会进入交付说明）: ${limitations.join("；")}`,
+      "warn",
+      bugId,
+    );
+    return merged;
   }
 
   /** Tapd 回写：只发评论，绝不自动修改单子状态——状态由人工 review 并 submit 后自行处理。 */
@@ -1918,6 +2566,7 @@ export class Worker {
     cl: number | null,
     result: AgentResult,
     gitResults: Array<{ name: string; result: GitFinalizeResult }> = [],
+    verificationLimitations: string[] = [],
   ): Promise<void> {
     const ws = this.workspaceOf(bug);
     const client = this.tapd(ws);
@@ -1934,6 +2583,10 @@ export class Worker {
       );
     }
     lines.push("Tapd 状态未修改：请 review 代码并提交后自行更新单子状态。");
+    if (verificationLimitations.length) {
+      lines.push("验证限制（未执行/无法执行，不得视为已通过）:");
+      for (const item of verificationLimitations) lines.push(`- ${item}`);
+    }
     if (result.manual_assets.length) {
       lines.push("需人工处理的资源:");
       for (const a of result.manual_assets) {
@@ -2022,8 +2675,11 @@ export class Worker {
   }
 
   /** 记录当前尝试结束后遗留的 default 打开文件（只记 default：Agent 禁止 p4 change，
-   *  编号 changelist 是其它 bug 的成功产物，绝不能碰）。 */
-  private async recordAttemptEnd(bugId: string, p4: P4Client | null): Promise<string[]> {
+   *  编号 changelist 是其它 bug 的成功产物，绝不能碰）。
+   *  strict=false（默认，保持原有语义）：清点查询失败时只记警告并保留已有记录。
+   *  strict=true：查询失败直接抛出——调用方（provider 故障分支）必须拿到「能否确认工作区
+   *  干净」的确定答案，否则会把无法归因的遗留文件当成可安全重试。 */
+  private async recordAttemptEnd(bugId: string, p4: P4Client | null, strict = false): Promise<string[]> {
     let files = this.lastAttemptFiles(bugId);
     if (p4) {
       try {
@@ -2033,6 +2689,11 @@ export class Worker {
           .filter((o) => o.changelist === "default")
           .map((o) => o.depot);
       } catch (error) {
+        if (strict) {
+          // 严格模式：不吞掉失败，也不覆盖已有记录（下方 updateJob 不会执行）。
+          this.store.addEvent(`P4: 结束清点失败（严格模式，向上抛出）: ${String(error)}`, "warn", bugId);
+          throw error;
+        }
         // 查询失败时保留已有记录，不能以“未查到”覆盖成空数组，否则下次会把
         // 本 Bug 的遗留文件误判成无法归属的工作区垃圾。
         this.store.addEvent(`P4: 结束清点失败，保留已有遗留文件记录: ${String(error)}`, "warn", bugId);
@@ -2040,6 +2701,51 @@ export class Worker {
     }
     this.store.updateJob(bugId, { last_attempt_files: dumps(files) });
     return files;
+  }
+
+  /** 开/延长 provider 全局冷却（与任务失败分类解耦）。
+   *  连续失败计数只在同一 kind 下累加：transient 与 quota/auth 的退避基数完全不同，
+   *  混在一起会把一次限流的计数带进额度冷却（或反之），退避时长就失真了。 */
+  private openProviderCooldown(failure: ProviderUnavailableError, bugId: string): number {
+    const previous = this.store.peekProviderCooldown();
+    const sameKind = String(previous?.kind ?? "") === failure.kind;
+    const failures = sameKind ? Number(previous?.failures ?? 0) + 1 : 1;
+    const kind = failure.kind;
+    const cooldownMs = providerCooldownMs(kind, failures);
+    const reason = failure.message.slice(0, 1000);
+    this.store.setProviderCooldown({
+      until_ms: Date.now() + cooldownMs,
+      kind,
+      reason,
+      failures,
+    });
+    const needsHuman = kind === "quota" || kind === "auth";
+    this.store.addEvent(
+      `provider 不可用（${kind}，连续第 ${failures} 次）: 已全局冷却 ${Math.round(cooldownMs / 1000)}s，`
+        + (needsHuman
+          ? "这属于额度/鉴权问题，短期重试无意义，请补充额度或更换可用 Key；"
+            + "可在管理台对该单点「重试」提前解除冷却"
+          : "到期后自动恢复，无需人工操作")
+        + `: ${reason}`,
+      needsHuman ? "error" : "warn",
+      bugId,
+    );
+    return cooldownMs;
+  }
+
+  /** provider 真的响应过（本次尝试成功，或以非 provider 原因失败）→ 退避计数归零。
+   *  只在这两种结果下调用：provider 故障本身、以及被 cleanup 失败升级为工作区阻塞的
+   *  provider 故障都不能清零，否则长期宕机时退避会一直被重置回最短间隔。 */
+  private resetProviderBackoffAfterSuccess(): void {
+    const stale = this.store.peekProviderCooldown();
+    if (!stale) return;
+    this.store.clearProviderCooldown();
+    if (Number(stale.failures) > 0) {
+      this.store.addEvent(
+        `provider 已恢复响应：provider 退避计数归零（此前连续失败 ${Number(stale.failures)} 次）`,
+        "info",
+      );
+    }
   }
 
   private async handleFailure(
@@ -2213,6 +2919,9 @@ export class Worker {
     const job = this.store.getJob(bugId);
     if (!bug && !job) return null;
     const detail: Record<string, unknown> = bug ? this.jobRow(bug, true) : {};
+    // 正在处理的 bug：附上编排器内存里的「当前阶段 + 该阶段模型」（不落库、不新增 DB 列），
+    // 详情抽屉据此展示阶段；否则阶段未知，前端显示「—」。
+    if (this.currentBugId === bugId) Object.assign(detail, this.currentStageInfo());
     detail.repair_attempts = this.store.audit.attempts(bugId);
     detail.repair_candidates = this.store.audit.candidates(bugId);
     detail.candidate_feedback = this.store.audit.feedback(bugId);
@@ -2243,6 +2952,12 @@ export class Worker {
   /** 重置 job 为全新待处理状态（单 bug 重试与「重试全部失败」共用）。
    *  last_attempt_files 有意保留：cleanupStaleAttempt 要靠它撤销遗留打开文件。 */
   private resetJobForRetry(bugId: string): void {
+    // 人工重试是明确的人工恢复信号：provider 冷却（尤其 quota/auth 长冷却）应被提前解除，
+    // 否则用户点了重试却什么都没发生（循环还在睡）。同时清零连续失败计数，从最短退避重来。
+    if (this.store.clearProviderCooldown()) {
+      this.store.addEvent("人工重试：已提前解除 provider 全局冷却并清零退避", "info", bugId);
+      this.wake();
+    }
     this.store.updateJob(bugId, {
       agent_state: "pending",
       attempts: 0,
@@ -2287,16 +3002,28 @@ export class Worker {
     return true;
   }
 
-  /** 把所有 failed 任务重置为待处理（web「重试全部失败」按钮）。返回重置数量。 */
+  /** 把所有 failed 任务重置为待处理（web「重试全部失败」按钮）。返回重置数量。
+   *  provider_unavailable 一并重置：它表示「外部服务暂时不可用」，不是修复失败，
+   *  否则用户只能靠「清除并重新同步」才能让这批单据重新入队。 */
   retryAllFailed(): number {
-    const failed = this.store.listJobs("failed");
-    for (const job of failed) {
+    // 入口先统一解除 provider 冷却：这是用户「我现在就要重试」的明确信号。
+    // 必须在 target 收集之前做——刚「清除并重新同步」后队列可能全是 pending，
+    // targets 为空，如果只在循环里解除，按钮点了等于没反应（提示就不成立）。
+    if (this.store.clearProviderCooldown()) {
+      this.store.addEvent("人工重试全部失败：已提前解除 provider 全局冷却并清零退避", "info");
+    }
+    const targets = [
+      ...this.store.listJobs("failed"),
+      ...this.store.listJobs("provider_unavailable"),
+    ];
+    for (const job of targets) {
       this.resetJobForRetry(String(job.bug_id));
     }
-    if (failed.length) {
-      this.store.addEvent(`人工重试全部失败任务（${failed.length} 个，已重置为待处理）`, "info");
+    if (targets.length) {
+      this.store.addEvent(`人工重试全部失败任务（${targets.length} 个，已重置为待处理）`, "info");
     }
-    return failed.length;
+    this.wake(); // 冷却可能刚被解除，立即唤醒正在 sleep 的工作循环
+    return targets.length;
   }
 
   /** 清空可重试任务并从 Tapd 强制重新同步（候选产物、changelist 关联和人工质量反馈保留）。
@@ -2336,6 +3063,17 @@ export class Worker {
         `从 Tapd 同步到 ${synced} 个 bug`,
       "warn",
     );
+    // 冷却记录属于「外部服务健康状态」，不随任务清空而删除。保留时必须明确告知，
+    // 否则用户会以为重新同步后马上就会开始跑，实际还在冷却期。
+    const cooldown = this.store.activeProviderCooldown();
+    if (cooldown) {
+      this.store.addEvent(
+        `注意：provider 全局冷却仍在生效（${cooldown.kind}），`
+          + `约 ${Math.max(1, Math.round((cooldown.until_ms - Date.now()) / 1000))}s 后自动恢复；`
+          + "如需立即重试，请点「重试全部失败」或对具体单据点「重试」以提前解除冷却",
+        "warn",
+      );
+    }
     this.wake(); // 立即唤醒工作循环（若有正在 sleep 的轮询）
     return { cleared, preserved, synced };
   }
@@ -2356,13 +3094,132 @@ export class Worker {
     return true;
   }
 
+  /** 模型解析唯一入口：该角色的模型覆盖（裸名自动补 provider 前缀），未配置则回落
+   *  pi.provider 默认模型——与 PiAgent.run 的解析顺序一致（调用用的模型 == 展示的模型）。
+   *  角色缺失（准备/准入/机器验证等编排阶段）返回空串：这些阶段不调用模型，
+   *  管理台按「—」展示，不沿用上一阶段的模型假装在跑模型。 */
+  private modelForRole(role: AgentRole | null): string {
+    return role ? (agentRoleModel(this.config, role) || effectivePiModel(this.config.pi)) : "";
+  }
+
+  /** coordinator 角色的统一调用封装：只读、无工具、严格 JSON、失败降级。
+   *
+   *  - 权限收敛：`sandboxMode: "read-only"` + `tools: []` + 不挂任何 MCP + 不传 media，
+   *    因此它不可能产生任何副作用，也看不到 prompt 之外的信息。
+   *  - 一次调用、一次解析：不重试、不缓存。超时 / 非零退出 / 输出不是严格 JSON /
+   *    字段类型不符，统一记一条 warn 进度并返回 null（调用方按「本次没有建议」继续）。
+   *  - **取消必须传播**：AgentCancelledError（人工暂停/关闭）与 ProviderUnavailableError
+   *    （provider 故障，编排器要据此开全局冷却）原样向上抛，绝不降级成「没有建议」——
+   *    否则一单会在被取消后继续跑完整流程。
+   *  - 它的产物只用于 prompt/描述的附加文字，任何返回值都不会改变编排决策。 */
+  private async runCoordinator<T>(opts: {
+    prompt: string;
+    auditAttemptId: string;
+    phase: "coordinator_plan" | "coordinator_summary";
+    bugId: string;
+    repoDir: string;
+    timeoutS: number;
+    parse: (output: string) => T | null;
+    degradeMessage: string;
+  }): Promise<T | null> {
+    const degrade = (reason: string): null => {
+      this.store.addEvent(`${opts.degradeMessage}: ${reason}`, "warn", opts.bugId);
+      this.store.audit.event(opts.auditAttemptId, opts.phase, {
+        role: "coordinator", degraded: true, reason,
+      });
+      return null;
+    };
+    try {
+      const result = await new PiAgent(this.config).run({
+        prompt: opts.prompt,
+        repoDir: opts.repoDir,
+        role: "coordinator",
+        timeoutS: opts.timeoutS,
+        tools: [],
+        sandboxMode: "read-only",
+        mcpServers: [],
+        requiredMcpServers: [],
+        media: [],
+        // 纯文本整理任务：关掉推理可以显著降低超时概率（协调者的产出不允许被当成结论）。
+        thinkingLevel: "off",
+        onProgress: (msg: string) => this.store.addEvent(msg, "debug", opts.bugId),
+        onAudit: (event: Record<string, unknown>) =>
+          this.store.audit.event(opts.auditAttemptId, "agent", { phase: opts.phase, ...event }),
+        cancelEvent: this.cancelEvent,
+      });
+      if (!result.ok) return degrade(`调用异常退出(${result.exit_code})`);
+      const parsed = opts.parse(result.raw_output || result.log || result.summary);
+      if (!parsed) return degrade("输出不是严格 JSON 或字段不符合约定");
+      return parsed;
+    } catch (error) {
+      if (error instanceof AgentCancelledError || error instanceof ProviderUnavailableError) throw error;
+      if (error instanceof AgentTimeoutError) return degrade(`超过 ${opts.timeoutS}s 时限`);
+      if (error instanceof AgentInvestigationLimitError) return degrade("达到工具预算");
+      return degrade(`调用失败: ${(error as Error).message}`);
+    }
+  }
+
+  /** 设置「当前阶段」并同步该阶段实际生效的模型。
+   *  - 阶段信息只保存在内存里（与 currentBugId 同一生命周期），不新增 DB 列：
+   *    重新启动后当前阶段本就重新开始计算，历史值没有意义。 */
+  private applyStage(stage: WorkerStage): void {
+    this.currentStage = stage;
+    this.currentStageModel = this.modelForRole(stageAgentRole(stage));
+  }
+
+  /** 阶段内的临时模型切换（不改阶段标签）：用于调查/实施阶段的 role:"recovery" 收尾子调用——
+   *  状态条上的「当前阶段」仍是调查/实施，但「模型」必须显示那一刻真正在跑的 recovery 模型。 */
+  private setStageModelForRole(role: AgentRole): void {
+    if (!this.currentStage) return; // 阶段已清空（异常/结束时迟到的切换）：不复活展示状态
+    this.currentStageModel = this.modelForRole(role);
+  }
+
+  /** 把阶段模型还原成该阶段自身的模型（applyStage 的模型部分），供临时切换后调用。 */
+  private restoreStageModel(): void {
+    if (!this.currentStage) return;
+    this.currentStageModel = this.modelForRole(stageAgentRole(this.currentStage));
+  }
+
+  /** 一次尝试结束（成功/失败/取消/异常）后清空「当前阶段」，管理台回到「—」占位。
+   *  processBug 自己的 finally 调用它：无论从哪个入口进来（runLoop 还是测试/CLI 直接调用），
+   *  阶段展示生命周期都完整，不会残留上一单的阶段与模型。 */
+  private clearStage(): void {
+    this.currentStage = null;
+    this.currentStageModel = "";
+  }
+
+  /** 当前阶段 + 该阶段模型（管理台「处理中 N」分组标题栏展示用）。关键名刻意带 current_ 前缀，避免与任务行字段
+   *  （stage / label / model 等）在 JSON 合并时互相覆盖；未领取任务时 stage 为 null。 */
+  currentStageInfo(): { current_stage: WorkerStage | null; current_stage_label: string; current_model: string } {
+    const stage = this.currentStage;
+    return {
+      current_stage: stage,
+      current_stage_label: stage ? _STAGE_LABEL[stage] : "",
+      current_model: this.currentStageModel,
+    };
+  }
+
   status(): Record<string, unknown> {
+    // provider_cooldown：供管理台显示「provider 不可用，冷却中」以及人工解除入口。
+    // 只暴露仍在生效的冷却；kind/剩余秒数/原因足以让用户判断是否需要补额度或换 Key。
+    const cooldown = this.store.activeProviderCooldown();
     return {
       control: this.store.getControl(),
       current_bug: this.currentBugId,
+      // 当前阶段与该阶段实际生效的模型：管理台「处理中 N」分组标题栏直接展示，避免用户猜「现在跑到哪一步」。
+      current_stage: this.currentStageInfo(),
       jobs_total: this.store.jobCount(),
       queued: this.store.queuedCount(),
       counts: this.store.jobStateCounts(),
+      provider_cooldown: cooldown
+        ? {
+          kind: cooldown.kind,
+          reason: cooldown.reason.slice(0, 300),
+          failures: Number(cooldown.failures),
+          until_ms: cooldown.until_ms,
+          remaining_s: Math.max(0, Math.round((cooldown.until_ms - Date.now()) / 1000)),
+        }
+        : null,
     };
   }
 }

@@ -22,10 +22,80 @@ describe("business acceptance evidence", () => {
       expect(parseRepairContract({ ...contract, acceptance_cases: [{ ...contract.acceptance_cases[0], source_refs: [ref] }] }, evidence).errors.length).toBeGreaterThan(0);
     }
   });
-  it("does not silently turn unresolved business semantics into an executable plan", () => {
+  it("names the exact invalid source_ref and the reason instead of a generic message", () => {
+    const withRef = (ref: string, fields?: Record<string, unknown>) => parseRepairContract(
+      { ...contract, acceptance_cases: [{ ...contract.acceptance_cases[0], source_refs: [ref] }] }, evidence, fields,
+    ).errors.join("\n");
+    // 空工单字段
+    expect(withRef("bug:expected_result", { expected_result: "" })).toContain("bug:expected_result");
+    expect(withRef("bug:expected_result", { expected_result: "" })).toContain("为空");
+    // evidence 越界
+    expect(withRef("evidence:9")).toContain("evidence:9");
+    expect(withRef("evidence:9")).toContain("越界");
+    // 非 [观察] 项
+    expect(withRef("evidence:1")).toContain("evidence:1");
+    expect(withRef("evidence:1")).toContain("[观察]");
+    // 非法格式
+    expect(withRef("file:Invented.ts")).toContain("格式非法");
+    // 空 source_refs
+    expect(parseRepairContract({ ...contract, domain_facts: [{ ...contract.domain_facts[0], source_refs: [] }] }, evidence).errors.join("\n"))
+      .toContain("缺少 source_refs");
+  });
+  it("routes unresolved business semantics to the human exit without burning a validation retry", () => {
     const parsed = parseInvestigation(JSON.stringify({ root_cause: "路径条件错误", evidence, planned_files: ["Map.ts"], reproduction: { before: "跨地图仍发送请求" }, repair_contract: { ...contract, open_questions: ["玩家地图ID具体来自哪个字段？"] } }));
     expect(parsed.ok).toBe(false);
-    expect(parsed.validation_errors.join()).toContain("业务条件尚未确认");
+    // 不再是“格式/证据缺项”，因此不会触发自动重试
+    expect(parsed.validation_errors).toEqual([]);
+    expect(parsed.blocked_reasons.join()).toContain("业务条件尚未确认");
+    expect(parsed.open_questions).toEqual(["玩家地图ID具体来自哪个字段？"]);
+    expect(parsed.repair_contract.open_questions).toEqual(["玩家地图ID具体来自哪个字段？"]);
+  });
+  it("migrates pure execution limits to verification_limitations without blocking", () => {
+    const base = { root_cause: "路径条件错误", evidence, planned_files: ["Map.ts"], reproduction: { before: "跨地图仍发送请求" } };
+    const declared = parseInvestigation(JSON.stringify({ ...base, repair_contract: contract, verification_limitations: ["无法运行游戏内端到端验证"] }));
+    expect(declared.ok).toBe(true);
+    expect(declared.blocked_reasons).toEqual([]);
+    expect(declared.validation_errors).toEqual([]);
+    expect(declared.verification_limitations).toContain("无法运行游戏内端到端验证");
+    // 被误写进 open_questions / blocked_reasons 的纯验证限制同样迁移，不阻断
+    const migrated = parseInvestigation(JSON.stringify({ ...base, repair_contract: { ...contract, open_questions: ["无法运行游戏，缺少可运行客户端"] }, blocked_reasons: ["无法启动编辑器做资源侧复现"] }));
+    expect(migrated.ok).toBe(true);
+    expect(migrated.open_questions).toEqual([]);
+    expect(migrated.blocked_reasons).toEqual([]);
+    expect(migrated.verification_limitations.join("\n")).toContain("缺少可运行客户端");
+    expect(migrated.verification_limitations.join("\n")).toContain("无法启动编辑器");
+    // 限制不得被当成“修复前失败现象”这类已验证事实的替代品
+    expect(migrated.repair_contract.open_questions).toEqual([]);
+  });
+  it("keeps blocking on business questions while preserving the limits that came with them", () => {
+    const mixed = parseInvestigation(JSON.stringify({
+      root_cause: "路径条件错误", evidence, planned_files: ["Map.ts"], reproduction: { before: "跨地图仍发送请求" },
+      repair_contract: { ...contract, open_questions: ["玩家地图ID具体来自哪个字段？"] },
+      verification_limitations: ["无法运行游戏内端到端验证"],
+    }));
+    expect(mixed.ok).toBe(false);
+    expect(mixed.blocked_reasons.join()).toContain("业务条件尚未确认");
+    expect(mixed.verification_limitations).toContain("无法运行游戏内端到端验证");
+  });
+  it("gives an unconfirmable pre-fix baseline a human exit instead of a format-error retry", () => {
+    const parsed = parseInvestigation(JSON.stringify({
+      root_cause: "现有代码疑似已包含该修复",
+      evidence: ["[观察] Map.ts:60 已按地图ID比较", "[推断] 现有实现已覆盖该场景"],
+      planned_files: ["Map.ts"],
+      reproduction: { command: "", before: "" },
+      blocked_reasons: ["基线不可确认：当前代码疑似已包含修复，无法复现修复前失败"],
+    }));
+    expect(parsed.ok).toBe(false);
+    expect(parsed.validation_errors).toEqual([]);
+    expect(parsed.blocked_reasons.join()).toContain("基线不可确认");
+  });
+  it("keeps an unproven call chain in the retry path instead of the human exit", () => {
+    const gap = parseInvestigation(JSON.stringify({
+      root_cause: "", evidence: [], planned_files: [],
+      blocked_reasons: ["已找到 Map.ts，但未证实 OnClick 会进入预放置状态"],
+    }));
+    expect(gap.blocked_reasons).toEqual([]);
+    expect(gap.validation_errors.join()).toContain("未证实");
   });
 });
 
