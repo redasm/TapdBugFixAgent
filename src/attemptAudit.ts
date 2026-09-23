@@ -67,6 +67,41 @@ const parse = <T>(value: unknown): T => JSON.parse(String(value)) as T;
 const ratio = (a: number, b: number): number | null => b ? a / b : null;
 const accepted = (outcome: string): boolean => ["accepted_unchanged", "accepted_modified"].includes(outcome);
 
+/** 审计里**真正调用过**的一次 role/model 组合（来源：agent_input 事件）。 */
+export interface ActualModelUse {
+  /** 调用时标注的角色；null = 未标注角色的历史调用。 */
+  role: string | null;
+  /** 该次调用实际传给 pi 的模型；空串 = 未指定（pi 用自带默认）。 */
+  model: string;
+  /** 同一 role+model 的调用次数。 */
+  calls: number;
+}
+
+/** 从审计事件里提取「实际调用过的 role/model」——只认 agent_input（每次模型调用在 spawn 之前必落一条），
+ *  按首次出现顺序去重并统计调用次数。它回答的是「这次任务真的用了哪些模型」，
+ *  与 metadata.default_model / job.model（只是「没配角色模型时的回退值」）是两个口径，
+ *  因此展示时绝不能用后者冒充前者。 */
+export function actualModelUses(attempts: RepairAttempt[]): ActualModelUse[] {
+  const out: ActualModelUse[] = [];
+  const seen = new Map<string, number>();
+  for (const attempt of attempts) {
+    for (const event of attempt.events) {
+      if (event.kind !== "agent" || event.payload?.kind !== "agent_input") continue;
+      const role = typeof event.payload.role === "string" && event.payload.role ? event.payload.role : null;
+      const model = String(event.payload.model ?? "");
+      const key = `${role ?? ""}\u0000${model}`;
+      const at = seen.get(key);
+      if (at === undefined) {
+        seen.set(key, out.length);
+        out.push({ role, model, calls: 1 });
+      } else {
+        out[at].calls += 1;
+      }
+    }
+  }
+  return out;
+}
+
 export class AttemptAudit {
   constructor(private readonly db: Database.Database) {
     // Separate versioning from the older jobs schema. DDL and version update are atomic.

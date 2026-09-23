@@ -23,6 +23,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { inspect } from "node:util";
 
 // ---- 子进程边界：只提供「能正常结束、无输出」的假子进程（本探针不依赖任何外部命令） ----
@@ -52,8 +53,13 @@ const {
 } = await import("../dist/coordinator.js");
 const {
   AGENT_ROLES, piProviderModelIds, piProviderModelsProblem, roleModelIdsForProvider, parseAgentsConfig,
+  agentRoleEffectiveModel, agentRoleModelSummary,
 } = await import("../dist/agentRoles.js");
-const { PiAgent, ensurePiModels, effectivePiModel, AgentCancelledError, AgentTimeoutError } = await import("../dist/agent.js");
+const { actualModelUses } = await import("../dist/attemptAudit.js");
+const {
+  PiAgent, ensurePiModels, effectivePiModel, AgentCancelledError, AgentTimeoutError,
+  AgentInvestigationLimitError,
+} = await import("../dist/agent.js");
 const { Worker, _COORDINATOR_PLAN_TIMEOUT_S, _COORDINATOR_SUMMARY_TIMEOUT_S } = await import("../dist/worker.js");
 const { StateStore } = await import("../dist/state.js");
 const { bugFromDict } = await import("../dist/models.js");
@@ -459,6 +465,159 @@ pi:
 `);
   assert.equal(piProviderModelsProblem(idOnly), null);
   assert.deepEqual(piProviderModelIds(idOnly), ["fix-model"]);
+});
+
+// ---------------------------------------------------------------------------
+// 4) 模型展示口径：真实配置解析、写错位置的诊断、角色可见性、实际调用模型（审计 agent_input）
+// ---------------------------------------------------------------------------
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+it("unit: 真实 config.yaml 的 coordinator 在 agents.roles 下启用，并沿用 gateway/gemini-3.8-flash", () => {
+  const dir = tmpdir("tapd-probe-real-config-");
+  const cfg = loadConfig(
+    path.join(REPO_ROOT, "config.yaml"), path.join(dir, ".env"), path.join(dir, "overrides.yaml"),
+  );
+  assert.deepEqual(cfg.agents.problems, [], "真实 config.yaml 不得再有角色层告警（coordinator 写错位置）");
+  assert.deepEqual(cfg.agents.roles.coordinator, { model: "" });
+  assert.equal(effectivePiModel(cfg.pi), "gateway/gemini-3.8-flash");
+  assert.equal(agentRoleEffectiveModel(cfg, "coordinator", effectivePiModel(cfg.pi)),
+    "gateway/gemini-3.8-flash");
+  const entry = agentRoleModelSummary(cfg, effectivePiModel(cfg.pi))
+    .find((item) => item.role === "coordinator");
+  assert.deepEqual(
+    { configured: entry.configured, model: entry.model, effective: entry.effective_model, fallback: entry.uses_default_model },
+    { configured: true, model: "", effective: "gateway/gemini-3.8-flash", fallback: true },
+  );
+});
+
+it("unit: agents.coordinator（少一层 roles）必须告警并提示改写成 agents.roles.coordinator", () => {
+  const misplaced = parseAgentsConfig({ coordinator: { model: "" }, roles: {} });
+  assert.deepEqual(misplaced.roles, {}, "写错位置的条目不得被解析成角色（避免静默失效又不报错）");
+  assert.ok(misplaced.problems.join("\n").includes("agents.coordinator"));
+  assert.ok(misplaced.problems.join("\n").includes("agents.roles.coordinator"));
+  assert.deepEqual(parseAgentsConfig({ typo: 1 }).roles, {});
+
+  const dir = tmpdir("tapd-probe-misplaced-");
+  const file = path.join(dir, "config.yaml");
+  fs.writeFileSync(file, 'agents:\n  coordinator: { model: "" }\n');
+  const cfg = loadConfig(file, path.join(dir, ".env"), path.join(dir, "overrides.yaml"));
+  assert.equal(cfg.agents.roles.coordinator, undefined);
+  assert.ok(validateConfig(cfg).join("\n").includes("agents.roles.coordinator"),
+    "启动配置告警必须包含正确写法，避免再次静默失效");
+});
+
+it("chain: recovery 收尾与 coordinator 调用期间显示各自角色，跑完还原为阶段角色", async () => {
+  restorePrototypes();
+  const repoDir = tmpdir("tapd-probe-roles-visible-");
+  fs.writeFileSync(path.join(repoDir, "Login.ts"), "export const login = true;\n");
+  installP4();
+  const worker = makeWorker(repoDir, {
+    roles: { investigation: { model: "inv-model" }, coordinator: { model: "coord-model" } },
+  });
+  const bug = makeBug();
+  const seen = [];
+  PiAgent.prototype.run = async (opts) => {
+    const stage = worker.status().current_stage;
+    seen.push({ role: opts.role, stage: stage.current_stage, shown: stage.current_role, model: stage.current_model });
+    if (opts.role === "coordinator") return makeResult({ raw_output: PLAN_JSON });
+    const others = seen.filter((item) => item.role !== "coordinator").length;
+    if (others === 1) throw new AgentInvestigationLimitError("调查达到工具预算", "工具 read: Login.ts");
+    if (others === 2) return makeInvestigation("project:Login.ts");
+    return makeResult({ changed_files: ["project/Login.ts"], summary: "实施完成" });
+  };
+  try {
+    await worker.processBug(bug);
+  } finally {
+    restorePrototypes();
+  }
+
+  assert.deepEqual(seen.map((item) => [item.role, item.shown, item.model]), [
+    // coordinator 的两次只读调用：角色/模型切到 coordinator（阶段标签仍是所属阶段）
+    ["coordinator", "coordinator", "gateway/coord-model"],
+    ["investigation", "investigation", "gateway/inv-model"],
+    // recovery 收尾：模型未配置 → 沿用默认回退；角色必须显示 recovery（这正是本次修复的可见性）
+    ["recovery", "recovery", "gateway/fix-model"],
+    // 收尾结束后进入实施：角色/模型还原，不残留 recovery
+    ["implementation", "implementation", "gateway/fix-model"],
+    ["coordinator", "coordinator", "gateway/coord-model"],
+  ]);
+  assert.equal(seen[0].stage, "admission", "coordinator 计划调用落在准入之后、调查之前");
+  const idle = worker.status().current_stage;
+  assert.deepEqual(
+    { stage: idle.current_stage, role: idle.current_role, model: idle.current_model },
+    { stage: null, role: null, model: "" },
+  );
+});
+
+it("unit: actual_models 只认审计 agent_input（多角色多模型 + 调用次数），不拿默认回退模型充数", async () => {
+  const worker = makeWorker(tmpdir("tapd-probe-actual-models-"), DISABLED_COORDINATOR_ROLES);
+  const bug = makeBug();
+  worker.store.upsertJob(bug, { agent_state: "candidate", agent: "pi", model: "gateway/fix-model" });
+  // 详情页 = Tapd 实时字段 + 本地状态：固定「我的 bug 列表」让详情能取到 bug 行
+  worker.fetchMyBugs = async () => [bug];
+  const attemptId = worker.store.audit.begin({
+    bug_id: bug.id, workspace_id: "111", input: {}, metadata: { default_model: "gateway/fix-model" },
+  });
+  worker.store.audit.event(attemptId, "agent", {
+    phase: "investigation", kind: "agent_input", role: "investigation", model: "gateway/inv-model",
+  });
+  worker.store.audit.event(attemptId, "agent", {
+    phase: "implementation", kind: "agent_input", role: "recovery", model: "gateway/fix-model",
+  });
+  worker.store.audit.event(attemptId, "agent", {
+    phase: "implementation", kind: "agent_input", role: "recovery", model: "gateway/fix-model",
+  });
+  // 非 agent_input（agent_usage 等）不参与「实际调用过什么」的口径
+  worker.store.audit.event(attemptId, "agent", {
+    phase: "review", kind: "agent_usage", role: "review", model: "gateway/not-a-call",
+  });
+  worker.store.audit.event(attemptId, "finished", { state: "candidate" });
+
+  const detail = await worker.bugDetailForWeb(bug.id);
+  assert.deepEqual(detail.actual_models, [
+    { role: "investigation", model: "gateway/inv-model", calls: 1 },
+    { role: "recovery", model: "gateway/fix-model", calls: 2 },
+  ]);
+  // 默认回退模型单独给出，不冒充实际调用
+  assert.equal(detail.default_model, "gateway/fix-model");
+  assert.deepEqual(actualModelUses([]), []);
+  assert.deepEqual(actualModelUses([{ events: [] }]), []);
+  assert.deepEqual(actualModelUses([{
+    events: [{ kind: "agent", payload: { kind: "agent_input", model: "gateway/x" } }],
+  }]), [{ role: null, model: "gateway/x", calls: 1 }], "未标注角色的历史调用必须保持 role=null");
+});
+
+it("chain: GET /api/settings 展示「默认回退模型」+ 角色模型摘要，且不泄露密钥", async () => {
+  const { createApp } = await import("../dist/web/app.js");
+  const repoDir = tmpdir("tapd-probe-settings-");
+  const worker = makeWorker(repoDir, { roles: { coordinator: { model: "coord-model" } } });
+  const app = createApp(worker.config, worker.store, worker);
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/settings`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    // 字段名 effective_model 保留（兼容），但语义是「默认回退模型」，并额外给出 default_model
+    assert.equal(body.pi.default_model, "gateway/fix-model");
+    assert.equal(body.pi.effective_model, "gateway/fix-model");
+    const byRole = (role) => body.pi.agent_roles.find((item) => item.role === role);
+    assert.equal(body.pi.agent_roles.length, AGENT_ROLES.length, "所有角色都要列出（含未配置的）");
+    assert.deepEqual(
+      { configured: byRole("coordinator").configured, effective: byRole("coordinator").effective_model, fallback: byRole("coordinator").uses_default_model },
+      { configured: true, effective: "gateway/coord-model", fallback: false },
+    );
+    assert.deepEqual(
+      { configured: byRole("recovery").configured, effective: byRole("recovery").effective_model, fallback: byRole("recovery").uses_default_model },
+      { configured: false, effective: "gateway/fix-model", fallback: true },
+    );
+    // 不泄露密钥：只回传「是否已设置」，绝不回传 api_key 明文（api_key_env 只是变量名）
+    assert.ok(!("api_key" in body.pi.provider), "设置接口不得回传 api_key 明文");
+    assert.equal(typeof body.pi.provider.has_api_key, "boolean");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 // ---------------------------------------------------------------------------

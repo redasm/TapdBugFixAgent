@@ -8,16 +8,21 @@ describe("investigation continuity", () => {
   it("retains original tool evidence when a formatter returns incomplete findings", () => {
     const original = captureInvestigationProgress('工具 read: {"path":"Map.ts","offset":40}\n结果 read: enterPlacement();', parseInvestigation(""));
     const partial = JSON.stringify({ evidence: ["[观察] Map.ts:40 调用 enterPlacement"], blocked_reasons: ["未证实边缘点击是否调用 enterPlacement"] });
-    const checkpoint = captureInvestigationProgress(partial, parseInvestigation(partial), original);
+    const parsed = parseInvestigation(partial);
+    const checkpoint = captureInvestigationProgress(partial, parsed, original);
     expect(checkpoint.tool_calls).toHaveLength(1);
     expect(checkpoint.trace).toContain("结果 read: enterPlacement();");
-    expect(checkpoint.open_questions.join(" ")).toContain("未证实边缘点击");
-    const prompt = buildInvestigationContinuationPrompt("TASK\n# 上次失败证据\n" + "OLD".repeat(30000), checkpoint);
+    // 声明的证据缺口是「调查未收敛」，统一登记为 validation_errors（先补查、再自动重试），
+    // 不再进断点 open_questions（那里只放业务未决问题），更不是人工出口。
+    expect(checkpoint.open_questions).toEqual([]);
+    expect(parsed.validation_errors.join(" ")).toContain("未证实边缘点击");
+    const prompt = buildInvestigationContinuationPrompt("TASK\n# 上次失败证据\n" + "OLD".repeat(30000), checkpoint, parsed.validation_errors);
     expect(prompt).toContain("当前仍是只读阶段");
     expect(prompt).toContain("enterPlacement");
+    expect(prompt).toContain("未证实边缘点击");
     expect(prompt).not.toContain("OLD");
     const timedOut = captureInvestigationProgress("工具 read: Click.ts", parseInvestigation(""), checkpoint);
-    expect(timedOut.open_questions.join(" ")).toContain("未证实边缘点击");
+    expect(timedOut.tool_calls.join(" ")).toContain("Map.ts");
   });
 
   it("keeps validation gaps out of the checkpoint and hands them to the continuation prompt", () => {

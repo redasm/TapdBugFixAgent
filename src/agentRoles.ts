@@ -95,7 +95,19 @@ export function normalizeAgentRoleName(name: string): AgentRole | undefined {
 export function parseAgentsConfig(raw: unknown): AgentsConfig {
   const out: AgentsConfig = { roles: {}, problems: [] };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  const rolesRaw = (raw as Record<string, unknown>).roles;
+  const agentsRaw = raw as Record<string, unknown>;
+  // agents 段只支持 roles。把角色条目直接挂在 agents 下（最典型的是 agents.coordinator）
+  // 是最容易犯的错，而且过去会**静默失效**——配置看着写了，运行时既不启用也不报错。
+  // 这里必须显式告警并给出正确写法；角色条目本身仍然被忽略（不改变运行行为）。
+  for (const key of Object.keys(agentsRaw)) {
+    if (key === "roles") continue;
+    const role = normalizeAgentRoleName(key);
+    out.problems.push(role
+      ? `agents.${key} 不是受支持的写法（agents 只支持 roles），该条目已被忽略；`
+        + `请改写为 agents.roles.${role}`
+      : `agents.${key} 不是受支持的键（agents 只支持 roles），该条目已被忽略`);
+  }
+  const rolesRaw = agentsRaw.roles;
   if (rolesRaw === undefined || rolesRaw === null) return out;
   if (typeof rolesRaw !== "object" || Array.isArray(rolesRaw)) {
     out.problems.push("agents.roles 必须是「角色名: 配置」映射；当前已忽略");
@@ -169,6 +181,54 @@ export function agentRoleModel(cfg: Config, role: AgentRole): string {
   if (configured.includes("/")) return configured;
   const providerId = cfg.pi?.provider ? (cfg.pi.provider.id?.trim() || "gateway") : "";
   return providerId ? `${providerId}/${configured}` : configured;
+}
+
+/** 该角色最终真正会调用到的模型：角色模型覆盖 > pi.provider 默认模型（回退）。
+ *  解析顺序与 PiAgent.run 逐字一致（`opts.model` > 角色配置 > provider 默认），
+ *  因此「展示的模型」与「调用时传给 pi 的模型」同源。
+ *
+ *  fallbackModel 由调用方传入（通常是 agent.ts 的 effectivePiModel(cfg.pi)）：
+ *  角色层不 import agent.ts，避免 config/角色 ←→ agent 的运行时循环依赖。
+ *  注意语义：返回值只说明「按当前配置这次调用会用哪个模型」，**不代表这次调用真的发生过**；
+ *  事后核对真实调用过的模型请看审计里的 agent_input（worker 的 actual_models 口径）。 */
+export function agentRoleEffectiveModel(
+  cfg: Config, role: AgentRole, fallbackModel: string,
+): string {
+  return agentRoleModel(cfg, role) || fallbackModel.trim();
+}
+
+/** 角色模型配置摘要的一行（Web 设置页展示用；不含任何密钥）。 */
+export interface AgentRoleModelSummaryEntry {
+  role: AgentRole;
+  /** 该角色是否在 config.yaml 里被显式配置过（coordinator 只有显式配置才会被调用）。 */
+  configured: boolean;
+  /** 角色显式配置的模型（已补 provider 前缀）；空串 = 留空或未配置。 */
+  model: string;
+  /** 该角色按当前配置实际会调用的模型（model || 默认回退模型）。 */
+  effective_model: string;
+  /** true = effective_model 来自 pi.provider 默认回退，而不是角色自己的配置。 */
+  uses_default_model: boolean;
+  /** 角色单次调用时限（秒）；未配置时为 undefined（沿用调用点的阶段预算）。 */
+  timeout_s?: number;
+}
+
+/** 全部角色的模型配置摘要（固定按 AGENT_ROLES 顺序，未配置的角色也会列出并标记 configured=false）。
+ *  口径与 agentRoleEffectiveModel / agentRoleSnapshot 一致，供设置页展示「角色 -> 模型」，
+ *  避免把 pi.provider 默认模型误读成「任务实际用的模型」。 */
+export function agentRoleModelSummary(cfg: Config, fallbackModel: string): AgentRoleModelSummaryEntry[] {
+  return AGENT_ROLES.map((role) => {
+    const settings = agentRoleSettings(cfg, role);
+    const model = agentRoleModel(cfg, role);
+    const effective = agentRoleEffectiveModel(cfg, role, fallbackModel);
+    return {
+      role,
+      configured: Boolean(settings),
+      model,
+      effective_model: effective,
+      uses_default_model: Boolean(effective) && model !== effective,
+      ...(settings?.timeout_s ? { timeout_s: settings.timeout_s } : {}),
+    };
+  });
 }
 
 /** 角色时限：配置了 agents.roles.<role>.timeout_s 就用它，否则沿用调用点现有的阶段预算。

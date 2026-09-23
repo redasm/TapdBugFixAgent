@@ -77,7 +77,8 @@
   /* 分组列表 */
   .group-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--muted); background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border); }
   .group-head .count { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; font-size: 11px; }
-  /* 「处理中 N」标题栏右侧的当前运行状态（当前阶段 / 使用模型）：与左侧标题同一行、靠右。
+  /* 「处理中 N」标题栏右侧的当前运行状态（当前阶段 / 角色 / 模型）：与左侧标题同一行、靠右。
+     角色必须单独显示（recovery 收尾、coordinator 调用期间会临时切换角色）；
      模型名过长用省略号截断（title 保留完整值），窄屏隐藏标签文字、必要时整块换行，绝不撑破列表宽度。 */
   .group-stage { display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto; min-width: 0; flex: 0 1 auto; font-weight: 400; }
   .group-stage .gs-item { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
@@ -333,7 +334,8 @@
             <label>API Key（留空保持不变）</label>
             <input id="sPiKey" type="password">
           </div>
-          <div class="settings-note">有效模型: <span id="sEffectiveModel" class="mono">-</span></div>
+          <div class="settings-note">默认回退模型（pi.provider：未配 agents.roles.&lt;role&gt;.model 的角色会回落到它，<b>不代表任何一次调用真的用过它</b>）: <span id="sEffectiveModel" class="mono">-</span></div>
+          <div class="settings-note" id="sRoleModels">角色模型（agents.roles）: -</div>
         </div>
       </div>
       <div class="section">
@@ -602,9 +604,11 @@ function renderList() {
   }
 }
 
-/** 「处理中 N」分组标题栏右侧的当前运行状态：当前阶段 + 该阶段实际生效的模型。
- *  数据只来自服务端 /api/status 的 current_stage（worker 内存里的编排阶段与该阶段角色模型，
- *  字段为 current_stage_label / current_model），不在这里写死任何模型名；空值统一显示「—」。
+/** 「处理中 N」分组标题栏右侧的当前运行状态：当前阶段 + 这一刻真正在跑的角色与模型。
+ *  数据只来自服务端 /api/status 的 current_stage（worker 内存里的编排阶段、当前角色与该角色模型，
+ *  字段为 current_stage_label / current_role / current_model），不在这里写死任何模型名；空值统一显示「—」。
+ *  角色必须显示：调查/实施阶段的 recovery 收尾子调用、coordinator 的两次只读调用都会临时切换角色，
+ *  只显示模型会让人误以为「阶段角色 = 正在跑的角色」。
  *  只在 in_progress 分组标题出现（待处理、失败等分组不显示），没有处理中分组时页面上没有任何残留。
  *  每次 renderList 重建分组时重新生成 HTML（不缓存任何 DOM 引用），列表行下方已有 bug id，故这里不重复。
  *  所有插值走 escapeHtml；模型名过长由 CSS 省略号截断，title 保留完整值。 */
@@ -612,7 +616,8 @@ function groupStageHTML() {
   const stage = (SNAPSHOT.status || {}).current_stage || {};
   const items = [
     ['当前阶段', stage.current_stage_label ? String(stage.current_stage_label) : ''],
-    ['使用模型', stage.current_model ? String(stage.current_model) : ''],
+    ['角色', stage.current_role ? String(stage.current_role) : ''],
+    ['模型', stage.current_model ? String(stage.current_model) : ''],
   ];
   const cells = items.map(([label, value]) => {
     const full = `${label}：${value || '—'}`;
@@ -620,19 +625,38 @@ function groupStageHTML() {
       + `<span class="gs-k">${label}</span>`
       + `<b class="gs-v" title="${escapeHtml(full)}">${escapeHtml(value || '—')}</b></span>`;
   });
-  return `<span class="group-stage" role="status" aria-live="polite" aria-label="当前运行状态：当前阶段与使用模型">`
+  return `<span class="group-stage" role="status" aria-live="polite" aria-label="当前运行状态：当前阶段、角色与模型">`
     + cells[0] + '<span class="gs-sep" aria-hidden="true">·</span>' + cells[1]
+    + '<span class="gs-sep" aria-hidden="true">·</span>' + cells[2]
     + '</span>';
 }
 
-/** 详情抽屉的模型单元格。正在处理的 bug（带 current_stage）：以编排器当前的阶段模型为准，
- *  空串（准备/准入/机器验证等不调用模型的阶段）显示「—」——绝不能拿 job.model（上一阶段写的值）
- *  冒充正在跑的模型；未处理的 bug 才回落到 job.model（历史记录）。 */
-function modelCellHTML(job) {
+/** 详情抽屉「实际调用模型」单元格。口径严格区分「真实调用」与「配置回退」：
+ *  - 正在处理（带 current_stage）：以编排器当前的 current_role + current_model 为准，
+ *    recovery 收尾 / coordinator 调用期间会临时切换；空模型（准备/准入/机器验证等不调用模型的阶段）
+ *    显示「—」，绝不拿 job.model（默认回退模型）冒充正在跑的模型。
+ *  - 已结束：只认审计里真正落库的 agent_input（job.actual_models，可含多个角色/模型）；
+ *    没有审计记录时明确写「未记录」，并只在旁边标注默认回退模型——不再声称某个模型被调用过。 */
+function actualModelsHTML(job) {
   if (job.current_stage) {
-    return job.current_model ? escapeHtml(job.current_model) : '<span class="muted">—</span>';
+    if (!job.current_model) return '<span class="muted">—</span>';
+    const role = job.current_role ? `<span class="mono">${escapeHtml(String(job.current_role))}</span> → ` : '';
+    return role + `<span class="mono">${escapeHtml(String(job.current_model))}</span>`;
   }
-  return job.model ? escapeHtml(job.model) : '<span class="muted">(CLI 默认)</span>';
+  const actual = Array.isArray(job.actual_models) ? job.actual_models : [];
+  if (actual.length) {
+    return actual.map(u => `<div class="mono">${escapeHtml(String(u.role || '(未标注角色)'))}`
+      + ` → ${escapeHtml(String(u.model || '(pi 默认)'))}`
+      + `${Number(u.calls) > 1 ? ` ×${Number(u.calls)}` : ''}</div>`).join('');
+  }
+  return '<span class="muted">未记录（本次审计没有 agent_input 事件）</span>';
+}
+
+/** 「默认回退模型」单元格：pi.provider 的模型——没配 agents.roles.&lt;role&gt;.model 的角色会回落到它。
+ *  它只说明配置口径，不代表任何一次调用真的用过它。 */
+function defaultModelHTML(job) {
+  const value = job.default_model || job.model;
+  return value ? `<span class="mono">${escapeHtml(String(value))}</span>` : '<span class="muted">—</span>';
 }
 
 /** 详情区实时刷新不能替换正在操作的人工结论控件，否则原生 select 会立即收起。 */
@@ -746,8 +770,9 @@ function renderDetail(job) {
       <dt>优先级</dt><dd>${escapeHtml(job.priority_label || job.priority || '-')}</dd>
       <dt>Changelist</dt><dd class="mono">${job.changelist ?? '-'}</dd>
       <dt>Agent</dt><dd>${escapeHtml(job.agent || '-')}</dd>
-      <dt>模型</dt><dd>${modelCellHTML(job)}</dd>
-      ${job.current_stage ? `<dt>当前阶段</dt><dd>${escapeHtml(job.current_stage_label || job.current_stage)}</dd>` : ''}
+      <dt>实际调用模型</dt><dd>${actualModelsHTML(job)}</dd>
+      <dt>默认回退模型</dt><dd>${defaultModelHTML(job)}</dd>
+      ${job.current_stage ? `<dt>当前阶段</dt><dd>${escapeHtml(job.current_stage_label || job.current_stage)}${job.current_role ? ` · 角色 ${escapeHtml(String(job.current_role))}` : ''}</dd>` : ''}
       <dt>准入评分</dt><dd>${job.admission_score ?? '-'}</dd>
       <dt>Tapd 状态</dt><dd>${escapeHtml(job.tapd_status || '-')}</dd>
       <dt>Tapd 链接</dt><dd><a href="${escapeHtml(job.url || '')}" target="_blank" rel="noopener">在 Tapd 打开 ↗</a></dd>
@@ -994,6 +1019,24 @@ function connectSSE() {
 // ---------- 设置弹窗 ----------
 function setVal(id, v) { $(id).value = v ?? ''; }
 
+/** 设置页的两条模型口径说明：默认回退模型 + 每个角色实际会用的模型（后端已解析成最终生效值）。
+ *  角色摘要来自 /api/settings 的 pi.agent_roles（复用审计快照的同源函数），只含角色/模型/时限，无密钥。 */
+function renderSettingsModels(pi) {
+  const info = pi || {};
+  $('sEffectiveModel').textContent = info.default_model || info.effective_model || '(pi 默认模型)';
+  const rows = Array.isArray(info.agent_roles) ? info.agent_roles : [];
+  $('sRoleModels').innerHTML = '角色模型（agents.roles）: ' + (rows.length
+    ? rows.map(r => {
+        const model = r.effective_model ? String(r.effective_model) : '(未指定)';
+        const fallback = r.uses_default_model ? '<span class="muted">（默认回退）</span>' : '';
+        // coordinator 是唯一「不显式配置就不调用」的角色，未配置时必须说清楚，避免以为它在跑。
+        const off = r.configured ? '' : `<span class="muted">（未配置${r.role === 'coordinator' ? '=不调用' : ''}）</span>`;
+        const timeout = r.timeout_s ? `<span class="muted"> ${Number(r.timeout_s)}s</span>` : '';
+        return `<span class="mono">${escapeHtml(String(r.role))}</span>: ${escapeHtml(model)}${fallback}${off}${timeout}`;
+      }).join(' · ')
+    : '<span class="muted">（未取到角色模型配置，请改 config.yaml 的 agents.roles）</span>');
+}
+
 async function openSettings() {
   const s = await api('/api/settings');
   if (!s) return;
@@ -1009,7 +1052,7 @@ async function openSettings() {
   setVal('sTapdApiUser', s.tapd?.api_user);
   setVal('sTapdToken', '');
   setVal('sTapdApiPw', '');
-  $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
+  renderSettingsModels(s.pi);
   $('sPiKey').placeholder = p.has_api_key ? '已设置，留空保持不变' : '（未设置）';
   $('sP4Password').placeholder = s.p4?.password_set ? '已设置，留空保持不变' : '（未设置）';
   $('sTapdToken').placeholder = s.tapd?.access_token_set ? '已设置，留空保持不变' : '（未设置）';
@@ -1043,7 +1086,7 @@ async function saveSettings() {
   if (s) {
     $('settingsMsg').textContent = '✓ 已保存，对后续 bug 生效';
     $('settingsMsg').className = '';
-    $('sEffectiveModel').textContent = s.pi?.effective_model || '(pi 默认模型)';
+    renderSettingsModels(s.pi);
     refresh();
   } else {
     $('settingsMsg').textContent = '✗ 保存失败（见控制台）';

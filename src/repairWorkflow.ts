@@ -33,11 +33,17 @@ export interface InvestigationResult {
   diagnostic_pages: DiagnosticPageEvidence[];
   planned_files: string[];
   confidence: number;
+  /** 只保留真正的工作区/权限/安全阻塞（目标修改路径/仓库不在允许访问范围、工作区或目标仓库
+   *  缺权限而无法读写、无法在当前工作区安全修改、无法安全选择目标仓库或修改位置）；
+   *  worker 据此转 blocked_workspace 交人工处理。业务疑问、基线不可确认、无法定位入口、
+   *  证据缺口（含「工作区之外」「存在安全风险」「Bug 所属仓库无法判断」这类陈述）都不再进这里，
+   *  而是登记为 validation_errors。 */
   blocked_reasons: string[];
   validation_errors: string[];
   repair_contract: RepairContract;
-  /** 影响修复方向的业务未决问题（已从 repair_contract.open_questions 迁移出来）。
-   *  非空 = 不进入实施阶段，转 needs_info 等人工补充，且不消耗修复尝试次数。 */
+  /** 影响修复方向的业务未决问题（已从 repair_contract.open_questions 迁移出来，并同步登记为
+   *  validation_error）。非空 = 本轮调查未收敛：先走既有补充调查，仍未解决则按普通失败自动重试，
+   *  耗尽后 failed；不再转 needs_info/人工补充。 */
   open_questions: string[];
   /** 未能执行的验证（无法运行游戏/编辑器/自动化等）。只记录，不阻断，也绝不允许被写成“已验证”。 */
   verification_limitations: string[];
@@ -138,7 +144,7 @@ ${roots}
 - 第一次搜索必须从 Bug 中已有的错误文本、符号、资源名、路径片段或测试名出发，并显式限定到最可能的目录或文件类型；只有首次定向搜索无结果时才能逐步扩大一层范围，禁止一开始扫描所有目录或读取所有文件。
 - 搜索命中后只读取命中位置的上下文、对应定义、直接调用者和最近的相关测试；不要整文件反复读取，也不要为了“了解项目”批量读取无直接关系的目录、配置或历史。
 - 每个候选假设最多进行 2 轮“定向搜索 → 阅读命中证据”。连续 3 次搜索或读取没有产生新的文件、符号、调用关系或可排除证据时，立即停止扩散并基于现有证据收敛。
-- 调查工具预算使用到约 60% 时，必须停止继续扩大范围，整理 root_cause、evidence 与 planned_files；证据仍不足时输出 blocked_reasons，不得等待外层超时。
+- 调查工具预算使用到约 60% 时，必须停止继续扩大范围，整理 root_cause、evidence 与 planned_files；证据仍不足时按证据缺口如实登记（会转入补充调查与自动重试），不得等待外层超时。
 
 # 调查要求
 按以下顺序调查，不要跳到修复方案：
@@ -152,21 +158,28 @@ ${roots}
 7. 检查正常路径之外的错误、取消、超时、重试、并发、资源清理和生命周期分支；只检查与本 Bug 有关的部分。
 8. planned_files 只列解决根因和覆盖回归所需的最小文件集合，不得把“可能相关”文件全部列入。
 
-# 停止条件
-只有遇到以下情况时才停止调查并写入 blocked_reasons：
-- 已根据标题、描述、附件和合理范围的代码搜索进行调查，但仍无法定位任何相关模块、文件或符号。
-- Bug 所属仓库完全无法判断，或目标不在允许访问的工作目录中。
-- 存在安全风险，无法在当前工作区内进行最小修改。
-- 已定位相关代码，但定向核对后仍无法证实触发条件和错误调用链；记录具体待核查证据，交给下一轮沿用，不要求用户重复提供工单信息。
-- 定向核对后发现当前代码**疑似已经包含该修复**、无法确认修复前失败基线（例如仓库已处于修复后状态、原始失败现象已不可获得）：以「基线不可确认：」开头写入 blocked_reasons，并给出你实际读到的证据位置。这种情况不得编造 reproduction.before，也不得为了通过格式检查硬凑一条失败现象；它会转人工确认，不会按格式错误反复重试。
-定位到相关文件不等于证实根因。进入修复前必须说明具体触发条件、实际执行的调用链、错误状态如何产生，以及计划修改如何改变该状态。多个候选仍无法区分时记录具体缺失证据，不得为满足输出格式猜测根因或编造 planned_files；不要求必须有手工复现。
+# 停止条件与人工介入边界
+调查阶段**不得**把可推断的问题交给人：工单标题、描述、附件、评论与源码就是你判断的全部依据，必须据此做出最合理且可验证的判断。下面这些情况都不构成人工介入理由，只需按证据缺口如实登记（编排器会先做一轮定向补充调查；仍未收敛则按普通失败自动重试，重试耗尽后判 failed，不需要人工补充工单信息）：
+- 字段含义、期望行为、口径等业务语义：只要能从工单、代码、注释、测试、配置或上下文推断出最合理解释，就直接采用该解释得出结论，并在 evidence 中写明推断依据与依据位置；不要把可从源码/上下文推断的问题推给人工。
+- 已根据标题、描述、附件和合理范围的代码搜索进行调查，但仍无法定位任何相关模块、文件或符号：如实写出已搜索的范围与关键词作为证据缺口。
+- 已定位相关代码，但定向核对后仍无法证实触发条件和错误调用链：记录具体待核查证据交给下一轮沿用，不要求用户重复提供工单信息。
+- 定向核对后发现当前代码**疑似已经包含该修复**、修复前基线不可确认（例如仓库已处于修复后状态、原始失败现象已不可获得）：如实写出你实际读到的代码位置，不得编造 reproduction.before，也不得为了通过格式检查硬凑一条失败现象；**不得因此要求人工确认**，按现有证据给出最合理的结论并登记证据缺口。reproduction.before 只写实际观察到的失败或等价静态证据；「基线不可确认」本身不是失败现象，写进 before 会被判为未收敛缺口并要求补查。
+- 无法运行游戏/编辑器/自动化等纯验证限制：写入顶层 verification_limitations，不要写进 blocked_reasons。
+只有明确得出「不能安全修改」的结论时才写 blocked_reasons，且必须使用下列之一的可解析措辞（会转工作区阻塞交人工处理，不消耗修复尝试次数）：
+${WORKSPACE_SAFETY_BLOCK_GUIDANCE.map((item) => `- ${item}`).join("\n")}
+下面这些说法**不构成阻塞**（照写会被判成证据缺口，走定向补查与自动重试），必须继续调查或如实登记缺口：
+- 只写「Bug 所属仓库无法判断」：仍要按模块、路径与已读代码选择最合理的仓库继续调查；只有连同「无法安全选择目标仓库/修改位置」一起给出时才算阻塞。
+- 只写「存在安全风险」或「未确认该改动是否存在安全风险」，但没有给出「无法在当前工作区安全修改」的结论。
+- 只写「某符号定义在 project 工作区之外的同名模块中」「无法读取工作区之外的外部依赖版本」这类证据缺口。
+定位到相关文件不等于证实根因。进入修复前必须说明具体触发条件、实际执行的调用链、错误状态如何产生，以及计划修改如何改变该状态。多个候选仍无法区分时按证据缺口如实登记，不得为满足输出格式猜测根因或编造 planned_files；不要求必须有手工复现。
 ${crossRepoStop}
 ${resourceGuidance}
 
 # 输出
 若提取共用接口确需补充文件，返回 scope_amendment: {files:[具体根别名:相对路径],reason:必要性与复用证据}；编排器先进行一次只读复核再改变白名单。没有补充则为 null。修改阶段不得自行扩大范围。
 必须输出 repair_contract（业务验收条件）：用户要求、关键 ID/配置/状态含义、正常对照、现有复用点；不要用不报错代替业务结果。source_refs 只允许 bug:title、bug:description、bug:expected_result、bug:reproduction_steps 或 evidence:N（从0起的 [观察]）；引用空的工单字段、越界的序号或非 [观察] 项都会被逐条指出并退回。
-- repair_contract.open_questions 只写真正影响修复方向的业务未决问题（字段含义、期望行为、口径）。非空表示本轮不能作为可修复结论，会转人工补充而**不是**自动重试；不要把所有不确定都塞进来凑数。
+- repair_contract.open_questions 只写确实无法从工单与源码推断、且影响修复方向的业务未决问题（字段含义、期望行为、口径）；能从源码或上下文推断的必须直接给出最合理解释，不得写进来。非空表示本轮调查未收敛：编排器会先做定向补充调查，仍未解决则按普通失败自动重试（耗尽后 failed），**不会**转人工补充，也不要用它代替证据缺口。
+- blocked_reasons 只写上面列出的四类明确工作区/权限结论（目标修改路径/仓库不在允许访问范围、工作区或目标仓库缺权限而无法读写、无法在当前工作区安全修改、无法安全选择目标仓库或修改位置）；其余不确定一律按上面的规则给出最合理判断或登记证据缺口。只说「工作区之外」「存在安全风险」或「Bug 所属仓库无法判断」都不算阻塞。
 - 无法运行游戏/编辑器/自动化、缺少可运行环境等纯验证限制，写入顶层 verification_limitations 数组（不要写进 open_questions，也不要写进 blocked_reasons）。这些限制不阻断修复，但会被如实带到实施、评审与交付说明；禁止把“未执行/无法执行”写成“已验证通过”。
 repair_contract 示例（必须替换内容）：${JSON.stringify(CONTRACT_EXAMPLE)}
 最后严格输出：
@@ -195,11 +208,11 @@ ${validationErrors.length ? `
 ${validationErrors.map((item) => `- ${item}`).join("\n")}
 这些是上一轮输出缺失的结构或证据要求，不是工单缺少信息；补齐它们不需要用户补充任何内容。
 ` : ""}
-先核对已读文件中的相关符号，只补查 open_questions 指出的调用关系和证据缺口。
+先核对已读文件中的相关符号，只补查 open_questions 与尚未收敛结论指出的调用关系、业务未决问题和证据缺口；能从工单与源码推断的，直接给出最合理且可验证的判断，不再当成未决问题。
 不要重复执行已完成且已有结果的 tool_calls；只有文件内容变化或旧结果被截断时才定向重读。
 每次读取必须解决一个具体缺口。没有证据的假设继续标为未确认，禁止为凑齐输出而编造根因。
-业务未决问题继续如实写入 repair_contract.open_questions（非空会转人工补充，不会自动重试）；无法运行游戏等纯验证限制写入顶层 verification_limitations，不要写进 open_questions。
-完成后返回 FINAL_RESULT；尚不能完成时也返回已有 evidence 与 blocked_reasons 中的具体未确认问题，供下次续查。`;
+业务未决问题继续如实写入 repair_contract.open_questions（非空表示调查未收敛：会先补查，再按普通失败自动重试，不会转人工补充）；疑似已包含修复、基线不可确认同样按证据缺口如实说明，不得要求人工确认，也不要把「基线不可确认」写进 reproduction.before 当失败现象。无法运行游戏等纯验证限制写入顶层 verification_limitations，不要写进 open_questions。
+完成后返回 FINAL_RESULT；尚不能完成时也返回已有 evidence 与尚未收敛的具体问题，供下次续查（blocked_reasons ${WORKSPACE_SAFETY_BLOCK_RULES}）。`;
 
 /** An incomplete result needs directed evidence collection, not another forced guess.
  *  `toolBudget` 是编排器给出的定向补查限额；提示必须显式说明，不能只靠外层硬中断。 */
@@ -218,13 +231,13 @@ ${progress ? JSON.stringify(progress) : compactInvestigationTrace(previousOutput
 </previous_output>
 
 当前缺失项：${validationErrors.join("；") || "输出不可解析"}。
-不要再次回复“我会检查”“下一步……”等计划，也不要再做广泛搜索。使用只读工具定向核对上述缺失项，然后返回完整 FINAL_RESULT。必须用已读取的代码说明触发条件与错误调用链；只有文件名相关时不能编造根因或修改计划。证据不足时在 blocked_reasons 中具体说明缺少哪段调用关系；这不等于工单缺少信息。
+不要再次回复“我会检查”“下一步……”等计划，也不要再做广泛搜索。使用只读工具定向核对上述缺失项，然后返回完整 FINAL_RESULT。必须用已读取的代码说明触发条件与错误调用链；只有文件名相关时不能编造根因或修改计划。证据不足时如实写出缺少哪段调用关系：它作为未收敛缺口继续补齐，不等于工单缺少信息，也不会转人工。
 
 # 工具预算（硬约束）
 本次补查最多 ${toolBudget} 次工具调用，每次都必须针对上面某个缺失项，按最可能的证据来源排序执行。
-达到第 ${toolBudget} 次调用后立即停止调用工具，用已取得的证据输出完整 FINAL_RESULT；仍缺证据的项如实写入 blocked_reasons，不要为凑格式继续检索。
-业务语义上的未决问题如实写入 repair_contract.open_questions：非空表示影响修复方向的问题尚未确认，本轮不能作为可修复结论，会转人工补充而不再自动重试；不得删除、隐藏或编造这些未决问题。
-无法运行游戏/编辑器/自动化等纯验证限制写入顶层 verification_limitations，不要写进 open_questions；如果核对后发现当前代码疑似已包含该修复、无法确认修复前基线，以「基线不可确认：」开头写明原因并如实说明读到的代码位置，不要编造 reproduction.before。`;
+达到第 ${toolBudget} 次调用后立即停止调用工具，用已取得的证据输出完整 FINAL_RESULT；仍缺证据的项如实登记为未收敛缺口，不要为凑格式继续检索（blocked_reasons ${WORKSPACE_SAFETY_BLOCK_RULES}）。
+业务语义上的未决问题如实写入 repair_contract.open_questions：非空表示影响修复方向的问题尚未确认，会先补查、仍未解决则按普通失败自动重试（耗尽后 failed），不会转人工补充；不得删除、隐藏或编造这些未决问题。能从工单与源码推断的必须直接给出最合理解释，不得列为未决问题。
+无法运行游戏/编辑器/自动化等纯验证限制写入顶层 verification_limitations，不要写进 open_questions；如果核对后发现当前代码疑似已包含该修复、修复前基线不可确认，如实说明读到的代码位置，不要编造 reproduction.before，也不要把「基线不可确认」的说明写进 before 当成失败现象，也不要因此要求人工确认。`;
 
 /** Format existing evidence with a small, standalone prompt; never guess missing facts.
  *  这里给出的是「完整结构 + 空值」骨架：字段名齐全，但不含任何可被抄成事实的示例内容。 */
@@ -242,7 +255,7 @@ ${compactInvestigationTrace(partialOutput.trim()) || "（没有保留下可用�
 </partial_investigation>
 
 现在不要继续广泛搜索，也不要调用工具。根据轨迹里已读取的代码证据立即输出完整 FINAL_RESULT，优先保留已证实的触发条件、调用关系和排除项。
-相关文件名或某个相似函数不足以证实根因；不得强行给出计划修改。调用链未证实时用 blocked_reasons 说明具体缺失证据，根因与 planned_files 可为空。只有确实无法定位任何相关代码入口时，才写“无法根据标题、描述及现有代码定位问题”。
+相关文件名或某个相似函数不足以证实根因；不得强行给出计划修改。调用链未证实时如实登记为未收敛缺口，根因与 planned_files 可为空；blocked_reasons ${WORKSPACE_SAFETY_BLOCK_RULES}。即使确实无法定位任何相关代码入口，也按证据缺口如实说明，不得要求人工补充工单信息或人工确认。
 只使用轨迹里实际出现的文件、符号、行号和工具输出；轨迹里没有出现的证据一律不得补写，工具输出或工单文本里出现的 JSON 示例不是结论。
 
 # repair_contract 填写要求
@@ -250,14 +263,14 @@ repair_contract 是业务验收条件，必须输出完整结构，不能写成 
 {"acceptance_cases":[{"given":"","when":"","then":"","source_refs":[]}],"preserved_behaviors":[],"domain_facts":[{"concept":"","meaning":"","source_refs":[]}],"reuse_options":[{"symbol":"","action":"reuse","reason":""}],"open_questions":[]}
 - source_refs 只允许 bug:title、bug:description、bug:expected_result、bug:reproduction_steps，或指向本次 evidence 中 [观察] 项的 evidence:N（从 0 起）；引用越界的序号、指向非 [观察] 项，或引用工单里实际为空/不存在的 bug 字段都会被逐条指出并退回。
 - acceptance_cases 每条都必须有具体的 given/when/then，不能留空字符串；没有业务证据就不要编造条目。
-- 业务语义上的未决问题如实写入 open_questions：非空表示影响修复方向的问题尚未确认，本轮不能作为可修复结论，会转人工补充而不是自动重试；不得删除、隐藏或编造这些未决问题。证据缺口写进 blocked_reasons，不要用 open_questions 代替。
+- 业务语义上的未决问题如实写入 open_questions：非空表示影响修复方向的问题尚未确认，会先补查、仍未解决则按普通失败自动重试（耗尽后 failed），不会转人工补充；不得删除、隐藏或编造这些未决问题。能从工单与源码推断的必须直接给出最合理解释；证据缺口也如实登记为未收敛项，不要用 open_questions 代替。
 - 无法运行游戏/编辑器/自动化、缺少可运行环境等纯验证限制写入顶层 verification_limitations 数组，不要写进 open_questions，也不要写进 blocked_reasons；它们不阻断修复，但不得被写成已验证。
-- 若轨迹显示当前代码疑似已包含该修复、修复前基线不可确认，在 blocked_reasons 中以「基线不可确认：」开头如实说明，不要编造 reproduction.before。
+- 若轨迹显示当前代码疑似已包含该修复、修复前基线不可确认，如实说明读到的代码位置，不要编造 reproduction.before，也不要把「基线不可确认」的说明写进 before 当成失败现象，也不要因此要求人工确认。
 
 保留 [观察]、[推断]、[排除] 的区分。
 只输出 FINAL_RESULT: 后接一个 JSON 对象，字段为：
 {"repair_contract":{"acceptance_cases":[],"preserved_behaviors":[],"domain_facts":[],"reuse_options":[],"open_questions":[]},"scope_amendment":null,"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"verification_limitations":[],"planned_files":[],"confidence":0,"blocked_reasons":[]}
-只填写轨迹支持的内容；无法补全的字段留空并在 blocked_reasons 中记录具体缺口，禁止编造。`;
+只填写轨迹支持的内容；无法补全的字段留空并如实登记为未收敛缺口，禁止编造。`;
 
 const normalizedDiagnosticUrl = (value: string): string => {
   try {
@@ -269,27 +282,78 @@ const normalizedDiagnosticUrl = (value: string): string => {
   }
 };
 
-/** 只有明确表示“现有工单与代码无法定位入口”的原因才允许转 needs_info。 */
-const isUnlocatableReason = (reason: string): boolean => {
-  const text = reason.replace(/\s+/g, "");
-  return /无法(?:根据|从).*(?:标题|描述|现有代码).*(?:定位|找到)/.test(text)
-    || /无法定位.*(?:模块|文件|符号|代码入口|问题)/.test(text)
-    || /未找到.*(?:相关模块|相关文件|代码入口|相关符号)/.test(text);
+/** 调查未收敛的统一前缀：这些缺口先走既有的定向补充调查，仍未解决则进入普通自动重试，
+ *  耗尽后 failed；绝不再转 needs_info/人工补充。 */
+export const INVESTIGATION_UNCONVERGED_PREFIX = "调查证据尚未收敛: ";
+
+/** 「修复前基线不可确认」原文（代码疑似已包含该修复、原始失败现象拿不到）。
+ *  它是如实说明的证据缺口，不是可核查的失败基线：既不能当作 reproduction.before 展示给实施
+ *  Agent，也不能让本轮调查判为已收敛；必须转成未收敛缺口走定向补查与自动重试。
+ *  刻意从严：只有明确说出「基线/失败现象不可确认」或「现有实现疑似已包含修复」才算，
+ *  普通失败描述（哪怕带「失败」「报错」字样）不能被误判。 */
+export const isBaselineUnconfirmedText = (value: string): boolean => {
+  const text = String(value ?? "").replace(/\s+/g, "");
+  if (!text) return false;
+  return /基线不可确认/.test(text)
+    || /(?:代码|实现|当前分支|当前版本|仓库|分支).{0,16}(?:疑似|似乎|可能|已经|已)(?:经)?(?:包含|带有|完成|覆盖|修好|修复|满足|符合)/.test(text)
+    || /(?:修复前|原始|历史|改动前|失败)(?:的)?(?:基线|失败现象|复现现象|错误现象|报错).{0,12}(?:不可确认|无法确认|无法验证|不可复现|无法复现|已丢失|不可获得|不可追溯|不可取得|不存在)/.test(text)
+    || /(?:无法|不能|不可)(?:再)?(?:确认|验证|取得|获得|还原|复现|重现).{0,12}(?:修复前|原始失败|失败基线|基线)/.test(text)
+    || /已(?:经)?是(?:修复后|修复完成的|修复后的|修复过的)(?:代码|版本|分支|状态)/.test(text);
 };
 
-/** 业务未决问题与“当前代码疑似已修复/基线不可确认”的统一前缀，供管理台与人工出口识别。 */
-export const BUSINESS_QUESTION_PREFIX = "业务条件尚未确认: ";
-export const BASELINE_UNCONFIRMED_PREFIX = "基线不可确认（代码疑似已包含修复，需人工确认）: ";
+// ---------------------------------------------------------------------------
+// 工作区/权限/安全阻塞：唯一保留的人工出口
+// ---------------------------------------------------------------------------
+/** 解析器（isWorkspaceSafetyReason）只认这几类明确结论；提示词也逐条推荐同样的措辞。
+ *  两处必须保持一致：否则 Agent 照提示写的话会被判成证据缺口，反复补查。 */
+export const WORKSPACE_SAFETY_BLOCK_GUIDANCE: readonly string[] = [
+  "目标修改路径/目标仓库不在允许访问的范围内（例：目标修改路径不在允许访问的工作目录内）",
+  "当前工作区或目标仓库缺少读写权限，无法读取或写入目标文件（例：当前工作区缺少写权限，无法写入目标文件）",
+  "无法在当前工作区安全修改（例：无法在当前工作区安全修改目标文件）",
+  "无法安全选择目标仓库或修改位置（例：Bug 所属仓库无法判断，且无法安全确定目标修改位置）",
+];
 
-/** 代理明确报告“当前代码疑似已含修复、修复前基线拿不到”时的安全出口。
- *  它既不是格式错误（不能触发自动重试），也不是可以继续修改的证据：
- *  转 needs_info 交人工确认，且不消耗修复尝试次数。 */
-const isBaselineUnconfirmableReason = (reason: string): boolean => {
-  const text = reason.replace(/\s+/g, "");
-  return /(?:代码|现有实现|当前分支|仓库|基线).{0,16}(?:疑似|似乎|可能|已经|已).{0,8}(?:修复|修好|改好|符合预期|满足预期)/.test(text)
-    || /(?:修复前|原始|失败)?(?:基线|失败现象|复现现象).{0,12}(?:不可确认|无法确认|无法验证|不可复现|无法复现|已丢失|不可获得|不可追溯)/.test(text)
-    || /(?:无法|不能|不可)(?:确认|验证|取得|获得|还原).{0,12}(?:修复前|原始失败|失败基线|基线)/.test(text)
-    || /已(?:经)?是(?:修复后|修复完成的)(?:代码|版本|分支)/.test(text);
+/** 续查/收尾提示里用的紧凑版规则（与 isWorkspaceSafetyReason 同一套结论，只是措辞更短）。 */
+export const WORKSPACE_SAFETY_BLOCK_RULES =
+  "只认四类明确结论「目标修改路径/仓库不在允许访问范围」「工作区或目标仓库缺权限而无法读写」"
+  + "「无法在当前工作区安全修改」「无法安全选择目标仓库或修改位置」；"
+  + "只说「工作区之外」「存在安全风险」或「Bug 所属仓库无法判断」不算";
+
+/** 明确「目标/仓库不在允许范围」：要求「不在·超出 + 允许类限定词 + 范围类名词」这一组合。
+ *  只有「工作区之外」这种方位描述不算——它常出现在证据缺口里（外部依赖版本、同名模块）。 */
+const OUTSIDE_ALLOWED_SCOPE =
+  /(?:不在|不属于|超出|越出|超乎)[^，,。；;、]{0,6}(?:允许|授权|许可|批准|可访问|可修改|可读写|可操作)[^，,。；;、]{0,6}(?:范围|工作目录|工作区|目录|仓库|边界|白名单)/;
+/** 明确「目标自己就在工作区/仓库之外」：必须点名目标或修改位置，
+ *  避免把「某符号定义在工作区之外的同名模块中」这类证据缺口当成阻塞。 */
+const TARGET_OUTSIDE_WORKSPACE =
+  /(?:目标|计划修改|待修改|需要修改|要修改|修改位置|修改路径|目标仓库|目标文件|目标模块|目标目录)[^，,。；;、]{0,10}(?:工作目录|工作区|仓库|范围)(?:之外|以外)/;
+/** 明确「工作区/目标仓库缺权限而无法读写」。 */
+const WORKSPACE_PERMISSION_DENIED =
+  /(?:工作区|工作目录|工作区根目录|仓库|目录|当前|本次|目标|该)[^，,。；;、]{0,6}(?:缺少|没有|无|不具备|被拒绝|受限|不足|无法获得|无法使用|不可用)[^，,。；;、]{0,4}(?:读|写|读写|修改|访问|编辑|提交|操作)?权限/;
+const WORKSPACE_PERMISSION_INSUFFICIENT =
+  /(?:工作区|工作目录|仓库|目录|目标|当前|本次)[^，,。；;、]{0,6}权限[^，,。；;、]{0,4}(?:不足|受限|被拒绝|无法获得|不可用)/;
+/** 明确「无法在当前工作区安全修改」。 */
+const UNSAFE_MODIFY_IN_WORKSPACE =
+  /(?:无法|不能|不可)在(?:当前|本次)?(?:的)?(?:工作区|工作目录|工作根目录)(?:内|中|里)?(?:安全|可靠)?(?:地)?(?:进行|实施|完成|做出)?(?:最小|任何|必要)?(?:修改|改动|编辑|写入|落笔|操作)/;
+/** 明确「无法安全选择目标仓库/修改位置」。单说「Bug 所属仓库无法判断」不在此列（那是待补查的证据缺口）；
+ *  也必须点名目标/修改位置，避免把「无法可靠判断触发条件」这类证据缺口误判成阻塞。 */
+const CANNOT_CHOOSE_TARGET_SAFELY =
+  /(?:无法|不能|不可)(?:安全|可靠|准确)(?:地)?(?:选择|确定|判断|决定|区分)(?:本次|当前|目标|待修改|需要修改|要修改|计划|所属)?(?:的)?(?:仓库|工作区|工作目录|修改位置|修改路径|修改范围|目标文件|目标模块)/;
+
+/** 调查阶段仍保留的唯一人工出口：真正的工作区/权限/安全阻塞。
+ *  只有「目标修改路径/仓库不在允许范围」「工作区/目标仓库缺权限而无法读写」
+ *  「无法在当前工作区安全修改」「无法安全选择目标仓库或修改位置」这四类明确结论才命中；
+ *  业务疑问、基线不可确认、无法定位入口、证据缺口（含「工作区之外」「存在安全风险」
+ *  「Bug 所属仓库无法判断」这类陈述）都属于调查未收敛，必须走补充调查与普通自动重试。 */
+export const isWorkspaceSafetyReason = (reason: string): boolean => {
+  const text = String(reason ?? "").replace(/\s+/g, "");
+  if (!text) return false;
+  return OUTSIDE_ALLOWED_SCOPE.test(text)
+    || TARGET_OUTSIDE_WORKSPACE.test(text)
+    || WORKSPACE_PERMISSION_DENIED.test(text)
+    || WORKSPACE_PERMISSION_INSUFFICIENT.test(text)
+    || UNSAFE_MODIFY_IN_WORKSPACE.test(text)
+    || CANNOT_CHOOSE_TARGET_SAFELY.test(text);
 };
 
 export const parseInvestigation = (
@@ -341,17 +405,30 @@ export const parseInvestigation = (
     ...(reproduction.before && isVerificationLimitation(reproduction.before) ? [reproduction.before] : []),
   ])];
   const substantiveBlocks = reportedBlocks.filter((reason) => !isVerificationLimitation(reason));
-  const blockedReasons = [...new Set([
-    ...substantiveBlocks.filter(isUnlocatableReason),
-    ...substantiveBlocks.filter((reason) => !isUnlocatableReason(reason) && isBaselineUnconfirmableReason(reason))
-      .map((reason) => `${BASELINE_UNCONFIRMED_PREFIX}${reason}`),
-    // 业务未决问题不再是 validation_error：它代表“不能安全修复”，转人工补充。
-    ...parsedContract.open_questions.map((question) => `${BUSINESS_QUESTION_PREFIX}${question}`),
-  ])];
-  const unresolvedBlocks = substantiveBlocks.filter((reason) =>
-    !isUnlocatableReason(reason) && !isBaselineUnconfirmableReason(reason));
-  if (!blockedReasons.length && !plannedFiles.length && unresolvedBlocks.length) {
-    validationErrors.push(`调查证据尚未收敛: ${unresolvedBlocks.join("；")}`);
+  // 唯一保留的人工出口：真正的工作区/权限/安全阻塞（worker 转 blocked_workspace，不消耗修复尝试）。
+  const blockedReasons = [...new Set(substantiveBlocks.filter(isWorkspaceSafetyReason))];
+  // 其余调查阻塞统一转成清晰的 validation_error：业务疑问、基线不可确认、无法定位入口、
+  // 证据缺口都属于「调查尚未收敛」，先走既有的补充调查分支，仍未解决则按普通失败自动重试。
+  // 与安全阻塞并存时也必须登记：混合原因不能被静默丢掉，管理台/审计与失败原因里都要能看到。
+  const unconvergedBlocks = substantiveBlocks.filter((reason) => !isWorkspaceSafetyReason(reason));
+  if (unconvergedBlocks.length) {
+    validationErrors.push(`${INVESTIGATION_UNCONVERGED_PREFIX}${unconvergedBlocks.join("；")}`);
+  }
+  if (parsedContract.open_questions.length) {
+    validationErrors.push(
+      `${INVESTIGATION_UNCONVERGED_PREFIX}业务条件尚未确认，须依据工单与源码给出最合理且可验证的判断，`
+      + `或如实登记证据缺口: ${parsedContract.open_questions.join("；")}`,
+    );
+  }
+  // reproduction.before 只接受实际观察到的失败或等价静态证据。「修复前基线不可确认」本身是
+  // 如实的证据缺口，不能当真实验证过的失败现象：登记为未收敛缺口（先补查、再普通自动重试），
+  // 下游也不得把它当成失败基线展示；绝不为了通过格式检查编造一条 before。
+  if (reproduction.before && isBaselineUnconfirmedText(reproduction.before)) {
+    validationErrors.push(
+      `${INVESTIGATION_UNCONVERGED_PREFIX}reproduction.before 只说明了「修复前基线不可确认」，`
+      + `不是可核查的修复前失败现象，不能当作真实失败基线: ${reproduction.before}`
+      + "；请给出实际读到的静态证据或等价失败描述，不得据此宣称已复现失败，也不要编造 before",
+    );
   }
   for (const link of [...new Set(requiredDiagnosticLinks.map(normalizedDiagnosticUrl))]) {
     const page = diagnosticPages.find((item) => normalizedDiagnosticUrl(item.url) === link);
@@ -434,9 +511,12 @@ ${limitations.map((item) => `- ${item}`).join("\n")}
 - 只能在机器可执行的范围内补充验证，不要为满足完成标准而编造运行时结果；确实需要人工在游戏/编辑器内验证的，明确标为待人工验证。
 `
     : "";
-  /** reproduction.before 若只写了“无法运行游戏”这类验证限制，就不能当修复前失败现象展示。 */
+  /** reproduction.before 若只写了“无法运行游戏”这类验证限制，或只是「修复前基线不可确认」的说明，
+   *  都不能当修复前失败现象展示给实施 Agent（后者是缺口，不是真实验证过的失败基线）。 */
   const beforeIsLimitation = Boolean(investigation.reproduction.before)
     && isVerificationLimitation(investigation.reproduction.before);
+  const beforeIsUnconfirmed = Boolean(investigation.reproduction.before)
+    && isBaselineUnconfirmedText(investigation.reproduction.before);
 
   return `你是 Bug 修复 Agent。请先核对调查中的具体触发条件与调用链，然后实施最小补丁。调查结果可能包含推断，不得把推断自动当成已确认事实，也不得重新猜测一个无证据的方向。
 
@@ -464,7 +544,9 @@ ${investigation.evidence.map((item) => `- ${item}`).join("\n")}
 修复前复现命令: ${investigation.reproduction.command || "（调查阶段未找到）"}
 修复前失败现象: ${beforeIsLimitation
     ? `（调查阶段未记录可执行的失败现象；原文属于验证限制，见下方“验证限制”一节，不得当作已观察到的失败）`
-    : (investigation.reproduction.before || "（调查阶段未记录）")}
+    : beforeIsUnconfirmed
+      ? `（调查阶段未确认可核查的修复前失败现象；原文只是“修复前基线不可确认”的说明，不得当作已观察到的失败，也不要编造 before）`
+      : (investigation.reproduction.before || "（调查阶段未记录）")}
 计划修改文件:
 ${investigation.planned_files.map((file) => `- ${file}`).join("\n")}
 ${limitationSection}${amendment}${retry}${review}${playbookSection}

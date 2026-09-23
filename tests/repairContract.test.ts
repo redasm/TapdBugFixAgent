@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseInvestigation } from "../src/repairWorkflow.js";
+import {
+  WORKSPACE_SAFETY_BLOCK_GUIDANCE,
+  buildImplementationPrompt,
+  buildInvestigationPrompt,
+  isWorkspaceSafetyReason,
+  parseInvestigation,
+} from "../src/repairWorkflow.js";
 import { parseRepairContract } from "../src/repairContract.js";
 import { selectFeedbackMemories, type FeedbackMemory } from "../src/feedbackMemory.js";
 import { bugFromDict } from "../src/models.js";
@@ -41,12 +47,13 @@ describe("business acceptance evidence", () => {
     expect(parseRepairContract({ ...contract, domain_facts: [{ ...contract.domain_facts[0], source_refs: [] }] }, evidence).errors.join("\n"))
       .toContain("缺少 source_refs");
   });
-  it("routes unresolved business semantics to the human exit without burning a validation retry", () => {
+  it("turns unresolved business semantics into evidence gaps for supplementary investigation, not a human exit", () => {
     const parsed = parseInvestigation(JSON.stringify({ root_cause: "路径条件错误", evidence, planned_files: ["Map.ts"], reproduction: { before: "跨地图仍发送请求" }, repair_contract: { ...contract, open_questions: ["玩家地图ID具体来自哪个字段？"] } }));
     expect(parsed.ok).toBe(false);
-    // 不再是“格式/证据缺项”，因此不会触发自动重试
-    expect(parsed.validation_errors).toEqual([]);
-    expect(parsed.blocked_reasons.join()).toContain("业务条件尚未确认");
+    // 不再是人工出口：转成「调查证据尚未收敛」校验缺项 → 定向补查 → 普通自动重试（耗尽后 failed）
+    expect(parsed.blocked_reasons).toEqual([]);
+    expect(parsed.validation_errors.join()).toContain("调查证据尚未收敛");
+    expect(parsed.validation_errors.join()).toContain("玩家地图ID具体来自哪个字段？");
     expect(parsed.open_questions).toEqual(["玩家地图ID具体来自哪个字段？"]);
     expect(parsed.repair_contract.open_questions).toEqual(["玩家地图ID具体来自哪个字段？"]);
   });
@@ -67,17 +74,18 @@ describe("business acceptance evidence", () => {
     // 限制不得被当成“修复前失败现象”这类已验证事实的替代品
     expect(migrated.repair_contract.open_questions).toEqual([]);
   });
-  it("keeps blocking on business questions while preserving the limits that came with them", () => {
+  it("keeps business questions in the auto-retry path while preserving the limits that came with them", () => {
     const mixed = parseInvestigation(JSON.stringify({
       root_cause: "路径条件错误", evidence, planned_files: ["Map.ts"], reproduction: { before: "跨地图仍发送请求" },
       repair_contract: { ...contract, open_questions: ["玩家地图ID具体来自哪个字段？"] },
       verification_limitations: ["无法运行游戏内端到端验证"],
     }));
     expect(mixed.ok).toBe(false);
-    expect(mixed.blocked_reasons.join()).toContain("业务条件尚未确认");
+    expect(mixed.blocked_reasons).toEqual([]);
+    expect(mixed.validation_errors.join()).toContain("调查证据尚未收敛");
     expect(mixed.verification_limitations).toContain("无法运行游戏内端到端验证");
   });
-  it("gives an unconfirmable pre-fix baseline a human exit instead of a format-error retry", () => {
+  it("keeps an unconfirmable pre-fix baseline in the auto-retry path instead of the human exit", () => {
     const parsed = parseInvestigation(JSON.stringify({
       root_cause: "现有代码疑似已包含该修复",
       evidence: ["[观察] Map.ts:60 已按地图ID比较", "[推断] 现有实现已覆盖该场景"],
@@ -86,8 +94,30 @@ describe("business acceptance evidence", () => {
       blocked_reasons: ["基线不可确认：当前代码疑似已包含修复，无法复现修复前失败"],
     }));
     expect(parsed.ok).toBe(false);
-    expect(parsed.validation_errors).toEqual([]);
-    expect(parsed.blocked_reasons.join()).toContain("基线不可确认");
+    expect(parsed.blocked_reasons).toEqual([]);
+    expect(parsed.validation_errors.join()).toContain("调查证据尚未收敛");
+    expect(parsed.validation_errors.join()).toContain("基线不可确认");
+    expect(parsed.validation_errors.join()).toContain("缺少修复前失败现象");
+  });
+  it("keeps genuine workspace or permission blocks as the only investigation human exit", () => {
+    const blocked = parseInvestigation(JSON.stringify({
+      root_cause: "", evidence: [], planned_files: [],
+      blocked_reasons: [
+        "目标不在允许访问的工作目录中",
+        "存在安全风险，无法在当前工作区内进行最小修改",
+      ],
+    }));
+    expect(blocked.ok).toBe(false);
+    expect(blocked.blocked_reasons).toEqual([
+      "目标不在允许访问的工作目录中",
+      "存在安全风险，无法在当前工作区内进行最小修改",
+    ]);
+    expect(blocked.validation_errors).toEqual([]);
+    // 检测器必须只认真正的工作区/权限阻塞，不把调查缺口或基线问题误判成人工出口
+    expect(isWorkspaceSafetyReason("目标不在允许访问的工作目录中")).toBe(true);
+    expect(isWorkspaceSafetyReason("基线不可确认：无法复现修复前失败")).toBe(false);
+    expect(isWorkspaceSafetyReason("未证实 OnClick 会进入预放置状态")).toBe(false);
+    expect(isWorkspaceSafetyReason("无法根据标题、描述及现有代码定位问题")).toBe(false);
   });
   it("keeps an unproven call chain in the retry path instead of the human exit", () => {
     const gap = parseInvestigation(JSON.stringify({
@@ -96,6 +126,126 @@ describe("business acceptance evidence", () => {
     }));
     expect(gap.blocked_reasons).toEqual([]);
     expect(gap.validation_errors.join()).toContain("未证实");
+  });
+
+  it("only accepts the four explicit workspace/permission conclusions as a real safety block", () => {
+    // 正例：明确目标不在允许范围 / 明确缺权限无法读写 / 无法在当前工作区安全修改 / 无法安全选择目标
+    for (const reason of [
+      "目标修改路径不在允许访问的工作目录内",
+      "目标仓库不在允许范围内",
+      "超出本次允许访问的工作目录",
+      "当前工作区缺少写权限，无法读取或写入目标文件",
+      "目标仓库无修改权限，无法写入",
+      "当前工作区权限不足，无法读取目标文件",
+      "无法在当前工作区安全修改目标文件",
+      "存在安全风险，无法在当前工作区内进行最小修改",
+      "无法安全选择目标仓库或修改位置",
+    ]) {
+      expect(isWorkspaceSafetyReason(reason), reason).toBe(true);
+    }
+    // 反例：纯证据陈述不能被误判成工作区阻塞
+    for (const reason of [
+      "未确认该改动是否存在安全风险",
+      "证据缺口：无法读取工作区之外的外部依赖版本",
+      "该符号定义在 project 工作区之外的同名模块中，未能核对",
+      "Bug 所属仓库无法判断",
+    ]) {
+      expect(isWorkspaceSafetyReason(reason), reason).toBe(false);
+    }
+  });
+
+  it("routes the four evidence-gap statements to supplementary investigation, not the human exit", () => {
+    const gaps = [
+      "未确认该改动是否存在安全风险",
+      "证据缺口：无法读取工作区之外的外部依赖版本",
+      "该符号定义在 project 工作区之外的同名模块中，未能核对",
+      "Bug 所属仓库无法判断",
+    ];
+    const parsed = parseInvestigation(JSON.stringify({
+      root_cause: "路径条件错误",
+      evidence,
+      planned_files: ["Map.ts"],
+      reproduction: { command: "npm test -- map", before: "跨地图仍发送请求" },
+      repair_contract: contract,
+      blocked_reasons: gaps,
+    }));
+    expect(parsed.ok).toBe(false);
+    expect(parsed.blocked_reasons).toEqual([]);
+    expect(parsed.validation_errors.join()).toContain("调查证据尚未收敛");
+    for (const gap of gaps) expect(parsed.validation_errors.join(), gap).toContain(gap);
+  });
+
+  it("keeps the ordinary gaps visible when a real workspace block is mixed in", () => {
+    const parsed = parseInvestigation(JSON.stringify({
+      root_cause: "", evidence: [], planned_files: [],
+      blocked_reasons: [
+        "目标修改路径不在允许访问的工作目录内",
+        "该符号定义在 project 工作区之外的同名模块中，未能核对",
+      ],
+    }));
+    // 安全阻塞照旧转人工，但普通缺口不能被静默丢掉：必须留在 validation_errors 供展示/补查
+    expect(parsed.blocked_reasons).toEqual(["目标修改路径不在允许访问的工作目录内"]);
+    expect(parsed.validation_errors.join()).toContain("调查证据尚未收敛");
+    expect(parsed.validation_errors.join()).toContain("该符号定义在 project 工作区之外的同名模块中");
+    expect(parsed.ok).toBe(false);
+  });
+
+  it("keeps the investigation prompt wording parseable by the same classifier", () => {
+    const prompt = buildInvestigationPrompt(
+      bugFromDict({ id: "1123456780001273338", title: "自定义标记跨地图传送", description: "" }, "111"),
+      "app",
+      "C:\\repo",
+    );
+    for (const item of WORKSPACE_SAFETY_BLOCK_GUIDANCE) {
+      expect(prompt, item).toContain(item);
+      const example = item.match(/例：([^）]+)/)?.[1];
+      expect(example, item).toBeTruthy();
+      // 提示里推荐的每条措辞都必须能被解析器认成安全阻塞，否则提示与解析器不一致
+      expect(isWorkspaceSafetyReason(example!), example).toBe(true);
+    }
+    // 提示必须同时写明「Bug 所属仓库无法判断」这类陈述不构成阻塞（否则与解析器矛盾）
+    expect(prompt).toContain("Bug 所属仓库无法判断");
+    expect(prompt).toContain("不构成阻塞");
+    expect(prompt).toContain("无法安全选择目标仓库");
+  });
+
+  it("never feeds an unconfirmable pre-fix baseline text to the fixer as reproduction.before", () => {
+    const parsed = parseInvestigation(JSON.stringify({
+      root_cause: "现有代码疑似已包含该修复",
+      evidence: ["[观察] Map.ts:60 已按地图ID比较", "[推断] 现有实现已覆盖该场景"],
+      planned_files: ["Map.ts"],
+      reproduction: { command: "npm test -- map", before: "基线不可确认：当前代码疑似已包含修复，无法复现修复前失败" },
+      repair_contract: contract,
+    }));
+    // 未收敛：先定向补查，再按普通失败自动重试；不得当成可实施结论
+    expect(parsed.ok).toBe(false);
+    expect(parsed.blocked_reasons).toEqual([]);
+    expect(parsed.validation_errors.join()).toContain("调查证据尚未收敛");
+    expect(parsed.validation_errors.join()).toContain("不能当作真实失败基线");
+    // 防御性：即便下游拿到该结果，也不能把这段原文当失败现象展示，更不得编造 before
+    const prompt = buildImplementationPrompt({
+      bug: bugFromDict({ id: "1123456780001273339", title: "自定义标记跨地图传送", description: "" }, "111"),
+      repoName: "app",
+      repoPath: "C:\\repo",
+      verifyCommands: [],
+      investigation: { ...parsed, ok: true },
+      retryEvidence: "",
+      reviewerFeedback: "",
+    });
+    expect(prompt).not.toContain("修复前失败现象: 基线不可确认");
+    expect(prompt).toContain("修复前失败现象: （调查阶段未确认可核查的修复前失败现象");
+  });
+
+  it("still accepts a real observed failure as reproduction.before", () => {
+    const parsed = parseInvestigation(JSON.stringify({
+      root_cause: "路径条件错误",
+      evidence,
+      planned_files: ["Map.ts"],
+      reproduction: { command: "npm test -- map", before: "FAIL Map.spec.ts: 跨地图仍发送请求" },
+      repair_contract: contract,
+    }));
+    expect(parsed.ok).toBe(true);
+    expect(parsed.validation_errors).toEqual([]);
   });
 });
 

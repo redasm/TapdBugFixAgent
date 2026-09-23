@@ -34,11 +34,12 @@ childProcess.execFile = (file, args, options, callback) => {
 };
 
 const {
-  BASELINE_UNCONFIRMED_PREFIX,
-  BUSINESS_QUESTION_PREFIX,
+  INVESTIGATION_UNCONVERGED_PREFIX,
+  WORKSPACE_SAFETY_BLOCK_GUIDANCE,
   buildImplementationPrompt,
   buildInvestigationContinuationPrompt,
   buildInvestigationPrompt,
+  isWorkspaceSafetyReason,
   parseInvestigation,
 } = await import("../dist/repairWorkflow.js");
 const { parseRepairContract, isVerificationLimitation } = await import("../dist/repairContract.js");
@@ -46,7 +47,7 @@ const { captureInvestigationProgress } = await import("../dist/investigationProg
 const { buildReviewPrompt } = await import("../dist/review.js");
 const { buildDescription } = await import("../dist/descgen.js");
 const { bugFromDict } = await import("../dist/models.js");
-const { Worker } = await import("../dist/worker.js");
+const { Worker, isLegacyInvestigationNeedsInfo } = await import("../dist/worker.js");
 const { StateStore } = await import("../dist/state.js");
 const { DEFAULT_PRIORITY_WEIGHT } = await import("../dist/config.js");
 const { PiAgent } = await import("../dist/agent.js");
@@ -78,11 +79,12 @@ const bug = bugFromDict({ id: "1123456780001257090", name: "自定义标记跨�
 // ---------------------------------------------------------------------------
 // 1) 分流矩阵
 // ---------------------------------------------------------------------------
-it("分流：业务未决问题 -> blocked/needs_info，且不进入 validation_errors", () => {
+it("分流：业务未决问题 -> 调查未收敛校验缺项（补查+自动重试），不是人工出口", () => {
   const parsed = investigationOf({ repair_contract: { ...contract, open_questions: ["玩家地图ID具体来自哪个字段？"] } });
   assert.equal(parsed.ok, false);
-  assert.deepEqual(parsed.validation_errors, [], "业务问题不得混进校验缺项（否则会触发自动重试）");
-  assert.ok(parsed.blocked_reasons.join().includes(BUSINESS_QUESTION_PREFIX), "必须走阻断/人工出口");
+  assert.deepEqual(parsed.blocked_reasons, [], "调查阶段不得再有业务问题的人工出口");
+  assert.ok(parsed.validation_errors.join().includes(INVESTIGATION_UNCONVERGED_PREFIX), "必须走补查+自动重试的校验缺项");
+  assert.ok(parsed.validation_errors.join().includes("玩家地图ID具体来自哪个字段？"));
   assert.deepEqual(parsed.open_questions, ["玩家地图ID具体来自哪个字段？"]);
 });
 
@@ -106,15 +108,15 @@ it("分流：误写进 open_questions / blocked_reasons 的验证限制被迁移
   assert.ok(migrated.verification_limitations.join("\n").includes("无法启动编辑器"));
 });
 
-it("分流：混合时业务问题仍阻断，限制保留", () => {
+it("分流：业务问题与验证限制并存时，问题转补查缺口、限制保留", () => {
   const mixed = investigationOf({
     repair_contract: { ...contract, open_questions: ["玩家地图ID具体来自哪个字段？"] },
     verification_limitations: ["无法运行游戏，仅有截图证据"],
   });
   assert.equal(mixed.ok, false);
-  assert.ok(mixed.blocked_reasons.join().includes(BUSINESS_QUESTION_PREFIX));
+  assert.deepEqual(mixed.blocked_reasons, []);
+  assert.ok(mixed.validation_errors.join().includes(INVESTIGATION_UNCONVERGED_PREFIX));
   assert.ok(mixed.verification_limitations.join().includes("仅有截图证据"));
-  assert.deepEqual(mixed.validation_errors, []);
 });
 
 it("分流：证据缺口仍是校验缺项（自动重试），不能被当成环境限制", () => {
@@ -129,7 +131,7 @@ it("分流：业务问题+环境词仍算业务问题（可阻断）", () => {
   assert.equal(isVerificationLimitation("无法运行游戏验证"), true);
 });
 
-it("分流：基线不可确认 -> 人工出口，不是格式错误", () => {
+it("分流：基线不可确认 -> 调查未收敛校验缺项，不是人工出口", () => {
   const parsed = parseInvestigation(JSON.stringify({
     root_cause: "现有代码疑似已包含该修复",
     evidence: ["[观察] Map.ts:60 已按地图ID比较", "[推断] 现有实现已覆盖该场景"],
@@ -138,8 +140,100 @@ it("分流：基线不可确认 -> 人工出口，不是格式错误", () => {
     blocked_reasons: ["基线不可确认：当前代码疑似已包含修复，无法复现修复前失败"],
   }));
   assert.equal(parsed.ok, false);
-  assert.deepEqual(parsed.validation_errors, [], "不得因为缺 reproduction.before 而当格式错误重试");
-  assert.ok(parsed.blocked_reasons.join().includes(BASELINE_UNCONFIRMED_PREFIX));
+  assert.deepEqual(parsed.blocked_reasons, []);
+  assert.ok(parsed.validation_errors.join().includes(INVESTIGATION_UNCONVERGED_PREFIX));
+  assert.ok(parsed.validation_errors.join().includes("基线不可确认"), "原因原文必须保留供补查");
+});
+
+it("分流：只有真正的工作区/权限阻塞才是调查阶段的人工出口", () => {
+  const blocked = parseInvestigation(JSON.stringify({
+    root_cause: "", evidence: [], planned_files: [],
+    blocked_reasons: ["目标不在允许访问的工作目录中", "存在安全风险，无法在当前工作区内进行最小修改"],
+  }));
+  assert.equal(blocked.ok, false);
+  assert.deepEqual(blocked.blocked_reasons, [
+    "目标不在允许访问的工作目录中",
+    "存在安全风险，无法在当前工作区内进行最小修改",
+  ]);
+  assert.deepEqual(blocked.validation_errors, []);
+  assert.equal(isWorkspaceSafetyReason("目标不在允许访问的工作目录中"), true);
+  assert.equal(isWorkspaceSafetyReason("基线不可确认：无法复现修复前失败"), false);
+  assert.equal(isWorkspaceSafetyReason("无法根据标题、描述及现有代码定位问题"), false);
+});
+
+it("分流：四类普通证据陈述不得被误判为安全阻塞，四类明确安全结论必须阻塞", () => {
+  const positives = [
+    "目标修改路径不在允许访问的工作目录内",
+    "目标仓库不在允许范围内",
+    "当前工作区缺少写权限，无法读取或写入目标文件",
+    "目标仓库无修改权限，无法写入",
+    "无法在当前工作区安全修改目标文件",
+    "存在安全风险，无法在当前工作区内进行最小修改",
+    "无法安全选择目标仓库或修改位置",
+  ];
+  const negatives = [
+    "未确认该改动是否存在安全风险",
+    "证据缺口：无法读取工作区之外的外部依赖版本",
+    "该符号定义在 project 工作区之外的同名模块中，未能核对",
+    "Bug 所属仓库无法判断",
+  ];
+  for (const reason of positives) assert.equal(isWorkspaceSafetyReason(reason), true, reason);
+  for (const reason of negatives) assert.equal(isWorkspaceSafetyReason(reason), false, reason);
+
+  // 反例必须走补查缺口，而不是人工出口
+  const gaps = investigationOf({ repair_contract: contract, blocked_reasons: negatives });
+  assert.equal(gaps.ok, false);
+  assert.deepEqual(gaps.blocked_reasons, []);
+  for (const reason of negatives) {
+    assert.ok(gaps.validation_errors.join().includes(reason), reason);
+  }
+  assert.ok(gaps.validation_errors.join().includes(INVESTIGATION_UNCONVERGED_PREFIX));
+
+  // 混合原因：安全阻塞保留，普通缺口不得被静默丢掉（保留在 validation_errors 供展示）
+  const mixed = parseInvestigation(JSON.stringify({
+    root_cause: "", evidence: [], planned_files: [],
+    blocked_reasons: [
+      "目标修改路径不在允许访问的工作目录内",
+      "该符号定义在 project 工作区之外的同名模块中，未能核对",
+    ],
+  }));
+  assert.deepEqual(mixed.blocked_reasons, ["目标修改路径不在允许访问的工作目录内"]);
+  assert.ok(mixed.validation_errors.join().includes("该符号定义在 project 工作区之外的同名模块中"));
+
+  // 提示词与解析器一致：提示里推荐的每条措辞都必须能被解析器认成安全阻塞
+  const prompt = buildInvestigationPrompt(bug, "app", "C:\\repo");
+  for (const item of WORKSPACE_SAFETY_BLOCK_GUIDANCE) {
+    assert.ok(prompt.includes(item), item);
+    const example = item.match(/例：([^）]+)/)?.[1];
+    assert.ok(example, item);
+    assert.equal(isWorkspaceSafetyReason(example), true, example);
+  }
+  assert.ok(prompt.includes("Bug 所属仓库无法判断"));
+  assert.ok(prompt.includes("不构成阻塞"));
+});
+
+it("分流：基线不可确认原文不得当 reproduction.before（保持未收敛，自动补查/重试）", () => {
+  const parsed = parseInvestigation(JSON.stringify({
+    ...base,
+    repair_contract: contract,
+    reproduction: { command: "npm test -- map", before: "基线不可确认：当前代码疑似已包含修复，无法复现修复前失败" },
+  }));
+  assert.equal(parsed.ok, false, "基线不可确认文本不能让调查判为已收敛");
+  assert.deepEqual(parsed.blocked_reasons, []);
+  assert.ok(parsed.validation_errors.join().includes(INVESTIGATION_UNCONVERGED_PREFIX));
+  assert.ok(parsed.validation_errors.join().includes("不能当作真实失败基线"));
+
+  const implPrompt = buildImplementationPrompt({
+    bug, repoName: "app", repoPath: "C:\\repo", verifyCommands: [],
+    investigation: { ...parsed, ok: true }, retryEvidence: "", reviewerFeedback: "",
+  });
+  assert.ok(!implPrompt.includes("修复前失败现象: 基线不可确认"), "这类原文不得作为修复前失败现象喂给实施");
+  assert.ok(implPrompt.includes("修复前失败现象: （调查阶段未确认可核查的修复前失败现象"));
+
+  // 真实观察到的失败仍可正常作为 before
+  const real = investigationOf({ repair_contract: contract, reproduction: { command: "npm test -- map", before: "FAIL Map.spec.ts: 跨地图仍发送请求" } });
+  assert.equal(real.ok, true);
+  assert.deepEqual(real.validation_errors, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -173,6 +267,20 @@ it("checkpoint：open_questions 不混入 validation_errors，缺项单独进入
   assert.ok(!buildInvestigationContinuationPrompt("TASK", checkpoint).includes("上一轮未通过校验的项"));
 });
 
+it("checkpoint：声明的证据缺口走 validation_errors，不再进 open_questions", () => {
+  const parsed = parseInvestigation(JSON.stringify({
+    root_cause: "", evidence: ["[观察] Map.ts:40 调用 enterPlacement"], planned_files: [],
+    blocked_reasons: ["未证实边缘点击是否调用 enterPlacement"],
+  }));
+  assert.deepEqual(parsed.blocked_reasons, []);
+  assert.ok(parsed.validation_errors.join(" ").includes("未证实边缘点击"));
+  const checkpoint = captureInvestigationProgress("工具 read: Map.ts", parsed);
+  assert.deepEqual(checkpoint.open_questions, [], "缺口不再是业务未决问题，也不进断点");
+  assert.ok(checkpoint.findings.join(" ").includes("Map.ts:40"), "已有观察必须保留");
+  const prompt = buildInvestigationContinuationPrompt("TASK", checkpoint, parsed.validation_errors);
+  assert.ok(prompt.includes("未证实边缘点击"), "缺口必须通过校验缺项小节传给继续调查");
+});
+
 it("checkpoint：验证限制随断点保留，不静默丢失", () => {
   const first = captureInvestigationProgress("工具 read: Map.ts", investigationOf({
     repair_contract: contract, verification_limitations: ["无法运行游戏，仅有截图证据"],
@@ -193,7 +301,8 @@ it("调查提示：明确沙箱无 shell / 无 p4 / 无 git，且不再要求历
   assert.ok(!prompt.includes('git -C "根的绝对路径"'));
   assert.ok(prompt.includes("verification_limitations"));
   assert.ok(prompt.includes("基线不可确认"));
-  assert.ok(prompt.includes("会转人工补充"));
+  assert.ok(prompt.includes("不得因此要求人工确认"));
+  assert.ok(prompt.includes("耗尽后 failed"));
 });
 
 // ---------------------------------------------------------------------------
@@ -370,49 +479,158 @@ async function runScenario({ results, opened = [DEPOT_MAP], repoDir }) {
   return { worker, bug, calls };
 }
 
-it("链路：业务未决问题 -> needs_info，不消耗修复尝试次数，也不会调用实施 Agent", async () => {
+it("链路：业务未决问题先走补充调查；补查收敛后进入实施，不会转 needs_info", async () => {
   const repoDir = makeRepoDir();
   const { worker, bug, calls } = await runScenario({
     repoDir,
-    results: [() => makeResult({ raw_output: investigationOutput({
-      repair_contract: { ...JSON.parse(CONTRACT_JSON), open_questions: ["标记地图ID与玩家地图ID分别来自哪个配置字段？"] },
-    }) })],
+    results: [
+      () => makeResult({ raw_output: investigationOutput({
+        repair_contract: { ...JSON.parse(CONTRACT_JSON), open_questions: ["标记地图ID与玩家地图ID分别来自哪个配置字段？"] },
+      }) }),
+      // 补充调查轮把业务条件按工单+源码收敛成可验证结论
+      () => makeResult({ raw_output: investigationOutput() }),
+      () => makeResult({ changed_files: ["project:Map.ts"], summary: "改用地图ID比较" }),
+    ],
   });
-  assert.equal(worker.store.getJob(bug.id)?.agent_state, "needs_info");
-  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 0, "人工出口不得消耗修复重试");
-  assert.equal(calls.length, 1, "只调用只读调查一次：不进入补充核查/实施");
-  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes(BUSINESS_QUESTION_PREFIX));
-  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes("不消耗修复尝试次数"));
+  assert.equal(calls.length, 3, "调查 → 定向补查 → 实施，不被 needs_info 中断");
+  assert.deepEqual(calls[1].tools, ["read", "grep", "find", "ls"], "第二轮必须是只读补充调查");
+  assert.ok(calls[1].prompt.includes(INVESTIGATION_UNCONVERGED_PREFIX), "补查提示必须带上未收敛缺口");
+  assert.equal(worker.store.getJob(bug.id)?.agent_state, "candidate");
 });
 
-it("人工出口不会被启动对账自动放回队列（无死循环）", async () => {
+it("链路：未收敛调查不会被启动对账改写成人工出口", async () => {
   const repoDir = makeRepoDir();
   const { worker, bug } = await runScenario({
     repoDir,
-    results: [() => makeResult({ raw_output: investigationOutput({
-      repair_contract: { ...JSON.parse(CONTRACT_JSON), open_questions: ["标记地图ID与玩家地图ID分别来自哪个配置字段？"] },
-    }) })],
+    results: [
+      () => makeResult({ raw_output: investigationOutput({
+        repair_contract: { ...JSON.parse(CONTRACT_JSON), open_questions: ["标记地图ID与玩家地图ID分别来自哪个配置字段？"] },
+      }) }),
+      () => makeResult({ raw_output: investigationOutput({
+        repair_contract: { ...JSON.parse(CONTRACT_JSON), open_questions: ["标记地图ID与玩家地图ID分别来自哪个配置字段？"] },
+      }) }),
+    ],
   });
-  assert.equal(worker.store.getJob(bug.id)?.agent_state, "needs_info");
+  const state = worker.store.getJob(bug.id)?.agent_state;
+  assert.notEqual(state, "needs_info", "调查阶段不得再有 needs_info 出口");
+  assert.equal(state, "pending", "普通失败 → 待自动重试");
+  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 1);
   worker.reconcileStaleInProgress();
-  assert.equal(worker.store.getJob(bug.id)?.agent_state, "needs_info", "业务问题的 needs_info 不得被启动对账放回队列");
-  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 0);
+  assert.equal(worker.store.getJob(bug.id)?.agent_state, "pending");
+  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 1);
 });
 
-it("链路：基线不可确认 -> needs_info（人工出口），不按格式错误重试", async () => {
+it("链路：基线不可确认 -> 普通失败自动重试，不按人工出口处理", async () => {
   const repoDir = makeRepoDir();
   const { worker, bug, calls } = await runScenario({
     repoDir,
-    results: [() => makeResult({ raw_output: investigationOutput({
-      root_cause: "现有代码疑似已包含该修复",
-      reproduction: { command: "", before: "" },
-      blocked_reasons: ["基线不可确认：当前代码疑似已包含地图ID比较，无法复现修复前失败"],
-    }) })],
+    results: [
+      () => makeResult({ raw_output: investigationOutput({
+        root_cause: "现有代码疑似已包含该修复",
+        reproduction: { command: "", before: "" },
+        blocked_reasons: ["基线不可确认：当前代码疑似已包含地图ID比较，无法复现修复前失败"],
+      }) }),
+      () => makeResult({ raw_output: investigationOutput({
+        root_cause: "现有代码疑似已包含该修复",
+        reproduction: { command: "", before: "" },
+        blocked_reasons: ["基线不可确认：当前代码疑似已包含地图ID比较，无法复现修复前失败"],
+      }) }),
+    ],
   });
-  assert.equal(worker.store.getJob(bug.id)?.agent_state, "needs_info");
+  assert.equal(calls.length, 2, "主调查 + 一轮定向补查，不做人工确认");
+  assert.equal(worker.store.getJob(bug.id)?.agent_state, "pending");
+  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 1);
+  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes("基线不可确认"));
+  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes(INVESTIGATION_UNCONVERGED_PREFIX));
+});
+
+it("链路：reproduction.before 写成「基线不可确认」时保持未收敛，不喂给实施当失败现象", async () => {
+  const repoDir = makeRepoDir();
+  const unconfirmedBefore = () => makeResult({ raw_output: investigationOutput({
+    root_cause: "现有代码疑似已包含该修复",
+    reproduction: { command: "npm test -- map", before: "基线不可确认：当前代码疑似已包含地图ID比较，无法复现修复前失败" },
+  }) });
+  const { worker, bug, calls } = await runScenario({ repoDir, results: [unconfirmedBefore, unconfirmedBefore] });
+  assert.equal(calls.length, 2, "主调查 + 一轮定向补查，不得直接进入实施阶段");
+  const job = worker.store.getJob(bug.id);
+  assert.equal(job?.agent_state, "pending");
+  assert.equal(Number(job?.attempts ?? 0), 1);
+  assert.ok(String(job?.failure_reason).includes("不能当作真实失败基线"));
+  assert.ok(String(job?.failure_reason).includes(INVESTIGATION_UNCONVERGED_PREFIX));
+  for (const call of calls) {
+    assert.ok(!String(call.prompt).includes("修复前失败现象: 基线不可确认"), "这类原文不得作为修复前失败现象");
+  }
+});
+
+it("链路：安全阻塞与普通缺口混合时阻塞照旧，缺口保留在失败原因里", async () => {
+  const repoDir = makeRepoDir();
+  const blocked = () => makeResult({ raw_output: `FINAL_RESULT: ${JSON.stringify({
+    repair_contract: null, root_cause: "", evidence: [], planned_files: [],
+    blocked_reasons: [
+      "目标修改路径不在允许访问的工作目录内",
+      "该符号定义在 project 工作区之外的同名模块中，未能核对",
+    ],
+  })}` });
+  const { worker, bug, calls } = await runScenario({ repoDir, results: [blocked] });
+  assert.equal(calls.length, 1, "有安全阻塞就不做补查（交人工处理）");
+  const job = worker.store.getJob(bug.id);
+  assert.equal(job?.agent_state, "blocked_workspace");
+  assert.equal(Number(job?.attempts ?? 0), 0);
+  const reason = String(job?.failure_reason ?? "");
+  assert.ok(reason.includes("目标修改路径不在允许访问的工作目录内"));
+  assert.ok(reason.includes("调查证据尚未收敛"), "混合原因里的普通缺口必须保留供展示");
+  assert.ok(reason.includes("该符号定义在 project 工作区之外的同名模块中"));
+});
+
+it("链路：无法定位代码入口同样走补查与自动重试，不转 needs_info", async () => {
+  const repoDir = makeRepoDir();
+  const unlocatable = () => makeResult({ raw_output: `FINAL_RESULT: ${JSON.stringify({
+    repair_contract: JSON.parse(CONTRACT_JSON),
+    root_cause: "", evidence: [], planned_files: [],
+    blocked_reasons: ["无法根据标题、描述及现有代码定位问题"],
+  })}` });
+  const { worker, bug, calls } = await runScenario({ repoDir, results: [unlocatable, unlocatable] });
+  assert.equal(calls.length, 2, "主调查 + 一轮定向补查");
+  assert.equal(worker.store.getJob(bug.id)?.agent_state, "pending");
+  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 1);
+  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes(INVESTIGATION_UNCONVERGED_PREFIX));
+  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes("无法根据标题"));
+});
+
+it("链路：重试耗尽后判 failed，仍不进入人工出口", async () => {
+  const repoDir = makeRepoDir();
+  const neverConverges = () => makeResult({ raw_output: investigationOutput({
+    repair_contract: { ...JSON.parse(CONTRACT_JSON), open_questions: ["标记地图ID与玩家地图ID分别来自哪个配置字段？"] },
+  }) });
+  restorePrototypes();
+  const worker = makeWorker(repoDir);
+  worker.config.max_attempts = 1;
+  const bug = makeBug();
+  worker.__bugs = [bug];
+  installP4([]);
+  const calls = [];
+  PiAgent.prototype.run = async (opts) => { calls.push(opts); return neverConverges(); };
+  await worker.processBug(bug);
+  restorePrototypes();
+  assert.equal(calls.length, 2, "仍先做一轮定向补查");
+  assert.equal(worker.store.getJob(bug.id)?.agent_state, "failed");
+  assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 1);
+  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes(INVESTIGATION_UNCONVERGED_PREFIX));
+});
+
+it("链路：只有真正的工作区/权限阻塞才转 blocked_workspace（不消耗修复尝试）", async () => {
+  const repoDir = makeRepoDir();
+  const { worker, bug, calls } = await runScenario({
+    repoDir,
+    results: [() => makeResult({ raw_output: `FINAL_RESULT: ${JSON.stringify({
+      repair_contract: null, root_cause: "", evidence: [], planned_files: [],
+      blocked_reasons: ["目标不在允许访问的工作目录中"],
+    })}` })],
+  });
+  assert.equal(calls.length, 1, "工作区阻塞不做补查，也不转 needs_info");
+  assert.equal(worker.store.getJob(bug.id)?.agent_state, "blocked_workspace");
   assert.equal(Number(worker.store.getJob(bug.id)?.attempts ?? 0), 0);
-  assert.equal(calls.length, 1);
-  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes(BASELINE_UNCONFIRMED_PREFIX));
+  assert.ok(String(worker.store.getJob(bug.id)?.failure_reason).includes("目标不在允许访问的工作目录中"));
 });
 
 it("链路：纯验证限制（截图场景）不阻断，限制进入实施/评审输入与交付描述", async () => {
@@ -541,6 +759,87 @@ it("链路：继续调查提示收到上一轮 validation_errors，断点 open_q
   assert.ok(resumed.includes("上一轮未通过校验的项"));
   assert.ok(resumed.includes("未读取标记创建调用者"));
   assert.ok(resumed.includes("不是工单缺少信息"));
+});
+
+// ---------------------------------------------------------------------------
+// 7) 旧 needs_info 迁移：只恢复旧调查出口，精确、幂等、两条启动路径
+// ---------------------------------------------------------------------------
+it("迁移判定：只认旧调查出口的固定外壳，绝不命中准入层原因", () => {
+  assert.equal(isLegacyInvestigationNeedsInfo("只读 Agent 明确无法定位问题: 无法根据标题、描述及现有代码定位问题"), true);
+  assert.equal(isLegacyInvestigationNeedsInfo("只读 Agent 明确无法定位问题:无法定位相关模块"), true, "冒号后空格差异不影响");
+  assert.equal(isLegacyInvestigationNeedsInfo("只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: 业务条件尚未确认: 标记地图ID来自哪个字段？"), true);
+  assert.equal(isLegacyInvestigationNeedsInfo("只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: 基线不可确认（代码疑似已包含修复，需人工确认）: 现有代码疑似已包含修复"), true);
+  assert.equal(isLegacyInvestigationNeedsInfo("只读 Agent 明确无法定位问题"), false, "不带冒号与正文的同名短语不是旧外壳");
+  assert.equal(isLegacyInvestigationNeedsInfo("只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: 其它缺口"), false);
+  assert.equal(isLegacyInvestigationNeedsInfo("问题描述过短；缺少复现步骤或可复现信号；缺少预期结果"), false);
+  assert.equal(isLegacyInvestigationNeedsInfo("涉及需人工处理的资源或工具: 协议"), false);
+  assert.equal(isLegacyInvestigationNeedsInfo("Agent 调用超时(1800s): pi"), false);
+  assert.equal(isLegacyInvestigationNeedsInfo(""), false);
+});
+
+it("迁移：只恢复旧调查出口误标的 needs_info，不碰准入层与已有产物（幂等、不解除冷却）", async () => {
+  const repoDir = makeRepoDir();
+  const worker = makeWorker(repoDir);
+  const HUMAN_SHELL = "只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: ";
+  const legacy = (id, failure_reason, extra = {}) => {
+    const old = bugFromDict({ id, name: "历史 needs_info 任务", description: "描述" }, "111");
+    worker.store.upsertJob(old, {
+      agent_state: "needs_info", failure_reason, finished_at: "2026-09-03 21:00:00", ...extra,
+    });
+    return old;
+  };
+  const unlocatable = legacy("1123456780001254400", "只读 Agent 明确无法定位问题: 无法根据标题、描述及现有代码定位问题");
+  const business = legacy("1123456780001254401", `${HUMAN_SHELL}业务条件尚未确认: 标记地图ID来自哪个字段？`);
+  const baseline = legacy("1123456780001254402", `${HUMAN_SHELL}基线不可确认（代码疑似已包含修复，需人工确认）: 当前代码疑似已包含修复`);
+  const admission = legacy("1123456780001254403", "问题描述过短；缺少复现步骤或可复现信号；缺少预期结果");
+  const noColonShell = legacy("1123456780001254404", "只读 Agent 明确无法定位问题");
+  const withCandidate = legacy("1123456780001254405", "只读 Agent 明确无法定位问题: 无法定位相关模块", { changelist: 822967 });
+  const spentAttempts = legacy("1123456780001254406", "只读 Agent 明确无法定位问题: 无法定位相关模块", { attempts: 1 });
+  worker.store.setProviderCooldown({ until_ms: Date.now() + 600_000, kind: "quota", reason: "额度", failures: 2 });
+
+  assert.equal(worker.recoverLegacyInvestigationNeedsInfo(), 3, "只恢复三类旧调查出口");
+  for (const restored of [unlocatable, business, baseline]) {
+    assert.equal(worker.store.getJob(restored.id)?.agent_state, "pending");
+    assert.equal(worker.store.getJob(restored.id)?.failure_reason, null);
+    assert.equal(worker.store.getJob(restored.id)?.finished_at, null);
+    assert.ok(worker.store.listEvents(restored.id).some((e) => String(e.msg).includes("原失败原因")), "必须留审计事件");
+  }
+  for (const untouched of [admission, noColonShell, withCandidate, spentAttempts]) {
+    assert.equal(worker.store.getJob(untouched.id)?.agent_state, "needs_info", untouched.id);
+  }
+  assert.equal(worker.store.getJob(withCandidate.id)?.changelist, 822967);
+  assert.notEqual(worker.store.activeProviderCooldown(), null, "迁移不得解除 provider 全局冷却");
+  assert.equal(worker.recoverLegacyInvestigationNeedsInfo(), 0, "幂等：重复调用不再恢复");
+
+  // runBatch 启动路径同样执行迁移（limit=0 只跑启动对账，不领取任务）
+  const viaBatch = legacy("1123456780001254407", "只读 Agent 明确无法定位问题: 未找到相关模块");
+  assert.equal(await worker.runBatch(0), 0);
+  assert.equal(worker.store.getJob(viaBatch.id)?.agent_state, "pending");
+
+  // runLoop 启动路径同样执行迁移
+  const viaLoop = legacy("1123456780001254408", "只读 Agent 明确无法定位问题: 未找到相关代码入口");
+  worker.startLoop();
+  await worker.shutdown();
+  assert.equal(worker.store.getJob(viaLoop.id)?.agent_state, "pending");
+});
+
+it("迁移：单次限流 5 个，剩余任务由后续启动继续迁移", () => {
+  const repoDir = makeRepoDir();
+  const worker = makeWorker(repoDir);
+  for (let i = 0; i < 7; i += 1) {
+    const id = `11234567800012594${String(i).padStart(2, "0")}`;
+    const old = bugFromDict({ id, name: "历史 needs_info 任务", description: "描述" }, "111");
+    worker.store.upsertJob(old, {
+      agent_state: "needs_info",
+      failure_reason: `只读 Agent 明确无法定位问题: 未找到相关模块（第 ${i} 个）`,
+      finished_at: "2026-09-03 21:00:00",
+    });
+  }
+  assert.equal(worker.recoverLegacyInvestigationNeedsInfo(), 5);
+  assert.equal(worker.store.listJobs("needs_info").length, 2);
+  assert.equal(worker.recoverLegacyInvestigationNeedsInfo(), 2);
+  assert.equal(worker.store.listJobs("needs_info").length, 0);
+  assert.equal(worker.recoverLegacyInvestigationNeedsInfo(), 0);
 });
 
 // ---------------------------------------------------------------------------

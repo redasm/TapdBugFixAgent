@@ -13,6 +13,7 @@ import {
   type SettingsOverrides,
 } from "../config.js";
 import { effectivePiModel, effectivePiProviderId } from "../agent.js";
+import { agentRoleModelSummary } from "../agentRoles.js";
 import type { StateStore } from "../state.js";
 import type { Worker } from "../worker.js";
 
@@ -33,13 +34,20 @@ const _VALID_ACTIONS = new Set(["start", "stop", "pause", "resume"]);
 function settingsForWeb(config: Config): Record<string, unknown> {
   const p = config.pi.provider;
   const tapd = config.tapd as Record<string, unknown>;
+  /** 默认回退模型口径：没配 agents.roles.<role>.model 的角色会回落到它。
+   *  字段名 effective_model 保留（前端/脚本已依赖），但它的含义只是「默认回退」，
+   *  不是「任务实际用的模型」——实际调用过的 role/model 只在任务详情的 actual_models 里。 */
+  const defaultModel = effectivePiModel(config.pi);
   return {
     review: {
       enabled: config.review.enabled,
       max_fix_rounds: config.review.max_fix_rounds,
     },
     pi: {
-      effective_model: effectivePiModel(config.pi),
+      effective_model: defaultModel,
+      default_model: defaultModel,
+      // 角色模型配置摘要（后端已解析成最终生效值，未配置的角色也列出）：不含任何密钥。
+      agent_roles: agentRoleModelSummary(config, defaultModel),
       provider: p
         ? {
             id: effectivePiProviderId(config.pi),

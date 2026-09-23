@@ -394,7 +394,7 @@ describe("two-stage repair workflow", () => {
     expect(prompt).toContain("候选假设");
     expect(prompt).toContain("排除依据");
     expect(prompt).toContain("先阅读相关测试");
-    expect(prompt).toContain("停止调查并写入 blocked_reasons");
+    expect(prompt).toContain("# 停止条件与人工介入边界");
     expect(prompt).not.toContain("工具调用次数不设固定上限");
     expect(prompt).toContain("fd <name> <目录>");
     expect(prompt).toContain("rg --files");
@@ -409,10 +409,12 @@ describe("two-stage repair workflow", () => {
     expect(prompt).not.toContain("p4 filelog");
     expect(prompt).not.toContain("p4 annotate");
     expect(prompt).not.toContain('git -C "根的绝对路径"');
-    // 验证限制与业务问题的分流必须在提示里写清
+    // 验证限制与业务问题的分流必须在提示里写清；调查阶段不得再有转人工出口
     expect(prompt).toContain("verification_limitations");
-    expect(prompt).toContain("会转人工补充");
     expect(prompt).toContain("基线不可确认");
+    expect(prompt).toContain("不得因此要求人工确认");
+    expect(prompt).toContain("耗尽后 failed");
+    expect(prompt).toContain("blocked_reasons 只写");
   });
 
   it("调查 Prompt 强制读取 CrashSight 和 Sentry 外部诊断链接", () => {

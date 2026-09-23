@@ -79,7 +79,8 @@ const refError = (ref: string, evidence: string[], bugFields?: Record<string, un
 export interface RepairContractParse {
   contract: RepairContract;
   errors: string[];
-  /** 真正影响修复方向的业务问题：非空表示本轮不能作为可修复结论（阻断，转人工补充）。 */
+  /** 真正影响修复方向的业务问题：非空表示本轮调查未收敛。由 parseInvestigation 登记为
+   *  「调查证据尚未收敛」的 validation_error（先补查、再普通自动重试），不在这里混成契约结构错误。 */
   open_questions: string[];
   /** 从 open_questions 迁移出的验证限制：只记录“没能执行哪些验证”，不阻断、也不能写成已通过。 */
   verification_limitations: string[];
@@ -132,8 +133,9 @@ export function parseRepairContract(
   if (!contract.domain_facts.length || contract.domain_facts.some(f => !f.concept || !f.meaning)) errors.push("缺少关键业务概念及含义");
   if (!contract.reuse_options.length || contract.reuse_options.some(r => !r.symbol || !r.reason || !["reuse", "extract", "not_applicable"].includes(r.action))) errors.push("缺少经过核查的接口复用方案");
   if (!Array.isArray(raw.open_questions)) errors.push("缺少 open_questions 数组");
-  // 刻意不把 open_questions 写进 errors：业务未决问题走 blocked/needs_info 人工出口，
-  // 不能混进「格式不完整」的自动重试，也不消耗修复尝试次数。
+  // 刻意不把 open_questions 写进 errors：它们不是契约结构错误，而是「调查未收敛」——
+  // parseInvestigation 会把它们登记成独立的 validation_error，走补充调查与普通自动重试，
+  // 不再转 needs_info/人工补充。
   return {
     contract,
     errors: [...new Set(errors)],

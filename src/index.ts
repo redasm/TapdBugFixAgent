@@ -10,6 +10,7 @@
 
 import { loadConfig, priorityRank, validateConfig, webToken } from "./config.js";
 import { effectivePiModel } from "./agent.js";
+import { agentRoleModelSummary } from "./agentRoles.js";
 import { enabledMcpServerNames } from "./mcpServers.js";
 import { DEFAULT_DB_PATH, StateStore } from "./state.js";
 import { Worker } from "./worker.js";
@@ -69,7 +70,15 @@ function make(configPath: string, dbPath: string): { config: ReturnType<typeof l
   for (const problem of validateConfig(config)) console.log(`[配置警告] ${problem}`);
   const model = effectivePiModel(config.pi) || "(Pi 默认模型)";
   const mcpNames = enabledMcpServerNames(config.mcp_servers);
-  console.log(`[启动] Agent backend=pi, model=${model}`);
+  // 口径：这只是「没配 agents.roles.<role>.model 的角色会回落到哪个模型」，
+  // 不是「本次任务实际会调用的模型」——实际调用以审计 agent_input 为准（任务详情可见）。
+  console.log(`[启动] Agent backend=pi, 默认回退模型=${model}`);
+  const roleModels = agentRoleModelSummary(config, effectivePiModel(config.pi))
+    .filter((entry) => entry.configured)
+    .map((entry) => `${entry.role}=${entry.effective_model || "(空=沿用默认回退模型)"}`
+      + `${entry.uses_default_model ? "(回退)" : ""}`
+      + `${entry.timeout_s ? ` timeout=${entry.timeout_s}s` : ""}`);
+  console.log(`[启动] 角色模型=${roleModels.length ? roleModels.join(", ") : "(未配置任何角色覆盖；coordinator 因此不启用)"}`);
   const p4IgnorePaths = config.workspaces.flatMap((workspace) => workspace.repos.flatMap((repo) => repo.ignore_paths ?? []));
   console.log(`[启动] P4 server=${String(config.p4.port ?? "(默认)")}, client=${String(config.p4.client ?? "(默认)")}, user=${String(config.p4.user ?? "(默认)")}, ignore_paths=${p4IgnorePaths.length ? p4IgnorePaths.join(", ") : "(无)"}`);
   for (const repo of config.workspaces.flatMap((workspace) => workspace.repos)) {

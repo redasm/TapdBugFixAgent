@@ -52,6 +52,7 @@ import {
   SUPPLEMENTARY_COMMAND_BUDGET,
   Worker,
   derivedRecoveryTimeoutS,
+  isLegacyInvestigationNeedsInfo,
   isRecoverableProviderBlock,
   mainInvestigationTimeoutS,
   mergeInvestigationEvidence,
@@ -2698,6 +2699,138 @@ describe("worker 控制与取消", () => {
     expect(w.store.getJob(limited.id)?.failure_reason).toBeNull();
   });
 
+  it("旧 needs_info 判定：只认旧调查出口的固定外壳，绝不命中准入层原因", () => {
+    // 三种旧调查出口：无法定位入口 / 人工外壳 + 业务前缀 / 人工外壳 + 基线前缀
+    expect(isLegacyInvestigationNeedsInfo("只读 Agent 明确无法定位问题: 无法根据标题、描述及现有代码定位问题")).toBe(true);
+    expect(isLegacyInvestigationNeedsInfo("只读 Agent 明确无法定位问题:无法定位相关模块")).toBe(true); // 冒号后空格差异不影响
+    expect(isLegacyInvestigationNeedsInfo("只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: 业务条件尚未确认: 标记地图ID来自哪个字段？")).toBe(true);
+    expect(isLegacyInvestigationNeedsInfo("只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: 基线不可确认（代码疑似已包含修复，需人工确认）: 现有代码疑似已包含修复")).toBe(true);
+    // 准入层 / 其它 needs_info 原因绝不被迁移
+    expect(isLegacyInvestigationNeedsInfo("问题描述过短；缺少复现步骤或可复现信号；缺少预期结果")).toBe(false);
+    expect(isLegacyInvestigationNeedsInfo("涉及需人工处理的资源或工具: 协议")).toBe(false);
+    expect(isLegacyInvestigationNeedsInfo("Agent 调用超时(1800s): pi")).toBe(false);
+    // 不带冒号与正文的同名短语不是旧外壳（旧出口始终是「外壳: 正文」）
+    expect(isLegacyInvestigationNeedsInfo("只读 Agent 明确无法定位问题")).toBe(false);
+    expect(isLegacyInvestigationNeedsInfo("只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: 其它缺口")).toBe(false);
+    expect(isLegacyInvestigationNeedsInfo("")).toBe(false);
+  });
+
+  it("启动迁移：只恢复旧调查出口误标的 needs_info，不碰准入层与已有产物", () => {
+    // 迁移要求 workspace 配置仍有效：这个 case 的 bug 必须落在已配置的工作区上。
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const bug = (id: string, workspace_id = "111") => makeBug({ id, workspace_id });
+    const unlocatable = bug("1123456780001254300");
+    const business = bug("1123456780001254301");
+    const baseline = bug("1123456780001254302");
+    const admission = bug("1123456780001254303");
+    const noColonShell = bug("1123456780001254304");
+    const withCandidate = bug("1123456780001254305");
+    const spentAttempts = bug("1123456780001254306");
+    const unknownWorkspace = bug("1123456780001254307", "999");
+    const HUMAN_SHELL = "只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: ";
+    w.store.upsertJob(unlocatable, {
+      agent_state: "needs_info",
+      failure_reason: "只读 Agent 明确无法定位问题: 无法根据标题、描述及现有代码定位问题",
+      finished_at: "2026-09-03 21:00:00",
+    });
+    w.store.upsertJob(business, {
+      agent_state: "needs_info",
+      failure_reason: `${HUMAN_SHELL}业务条件尚未确认: 标记地图ID来自哪个配置字段？`,
+      finished_at: "2026-09-03 21:00:00",
+    });
+    w.store.upsertJob(baseline, {
+      agent_state: "needs_info",
+      failure_reason: `${HUMAN_SHELL}基线不可确认（代码疑似已包含修复，需人工确认）: 当前代码疑似已包含修复`,
+      finished_at: "2026-09-03 21:00:00",
+    });
+    // 准入层 needs_info（描述过短/缺少复现信号）绝不能恢复
+    w.store.upsertJob(admission, {
+      agent_state: "needs_info",
+      failure_reason: "问题描述过短；缺少复现步骤或可复现信号；缺少预期结果",
+      finished_at: "2026-09-03 21:00:00",
+    });
+    // 不带冒号与正文的同名短语不是旧外壳（旧出口始终是「外壳: 正文」）
+    w.store.upsertJob(noColonShell, {
+      agent_state: "needs_info",
+      failure_reason: "只读 Agent 明确无法定位问题",
+      finished_at: "2026-09-03 21:00:00",
+    });
+    // 已有候选产物 / 已消耗过修复尝试的记录不能当没发生过
+    w.store.upsertJob(withCandidate, {
+      agent_state: "needs_info",
+      failure_reason: "只读 Agent 明确无法定位问题: 无法定位相关模块",
+      changelist: 822967,
+      finished_at: "2026-09-03 21:00:00",
+    });
+    w.store.upsertJob(spentAttempts, {
+      agent_state: "needs_info",
+      failure_reason: "只读 Agent 明确无法定位问题: 无法定位相关模块",
+      attempts: 1,
+      finished_at: "2026-09-03 21:00:00",
+    });
+    // workspace 已不在配置中的记录原地保留（放回队列也跑不了）
+    w.store.upsertJob(unknownWorkspace, {
+      agent_state: "needs_info",
+      failure_reason: "只读 Agent 明确无法定位问题: 无法定位相关模块",
+      finished_at: "2026-09-03 21:00:00",
+    });
+    // 迁移不得解除 provider 全局冷却
+    w.store.setProviderCooldown({ until_ms: Date.now() + 600_000, kind: "quota", reason: "额度", failures: 2 });
+
+    expect(w.recoverLegacyInvestigationNeedsInfo()).toBe(3);
+    for (const restored of [unlocatable, business, baseline]) {
+      expect(w.store.getJob(restored.id)?.agent_state).toBe("pending");
+      expect(w.store.getJob(restored.id)?.failure_reason).toBeNull();
+      expect(w.store.getJob(restored.id)?.finished_at).toBeNull();
+      // 每个恢复的任务都留一条带原失败原因的审计事件
+      const events = w.store.listEvents(restored.id).filter((e) => String(e.msg).includes("原失败原因"));
+      expect(events).toHaveLength(1);
+      expect(String(events[0].msg)).toContain("只读");
+    }
+    for (const untouched of [admission, noColonShell, withCandidate, spentAttempts, unknownWorkspace]) {
+      expect(w.store.getJob(untouched.id)?.agent_state, untouched.id).toBe("needs_info");
+      expect(w.store.getJob(untouched.id)?.failure_reason).not.toBeNull();
+    }
+    expect(w.store.getJob(withCandidate.id)?.changelist).toBe(822967);
+    expect(w.store.activeProviderCooldown()).not.toBeNull(); // 不解除冷却
+
+    // 幂等：再跑一次不会重复恢复，也不会重复记事件
+    expect(w.recoverLegacyInvestigationNeedsInfo()).toBe(0);
+    expect(w.store.listEvents(unlocatable.id).filter((e) => String(e.msg).includes("原失败原因"))).toHaveLength(1);
+  });
+
+  it("启动迁移：单次限流 5 个，后续启动继续迁移剩余任务", () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    for (let i = 0; i < 7; i += 1) {
+      const id = `1123456780001259${String(i).padStart(3, "0")}`;
+      w.store.upsertJob(makeBug({ id, workspace_id: "111" }), {
+        agent_state: "needs_info",
+        failure_reason: `只读 Agent 明确无法定位问题: 未找到相关模块（第 ${i} 个）`,
+        finished_at: "2026-09-03 21:00:00",
+      });
+    }
+    expect(w.recoverLegacyInvestigationNeedsInfo()).toBe(5);
+    expect(w.store.listJobs("needs_info")).toHaveLength(2);
+    expect(w.recoverLegacyInvestigationNeedsInfo()).toBe(2); // 下一次启动继续迁移
+    expect(w.store.listJobs("needs_info")).toHaveLength(0);
+    expect(w.recoverLegacyInvestigationNeedsInfo()).toBe(0);
+  });
+
+  it("runLoop 与 runBatch 两条启动路径都会执行旧 needs_info 迁移", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const legacyReason = "只读 Agent 明确无法定位问题: 无法根据标题、描述及现有代码定位问题";
+    const loopBug = makeBug({ id: "1123456780001254350", workspace_id: "111" });
+    const batchBug = makeBug({ id: "1123456780001254351", workspace_id: "111" });
+    w.store.upsertJob(loopBug, { agent_state: "needs_info", failure_reason: legacyReason });
+    w.startLoop();
+    await w.shutdown();
+    expect(w.store.getJob(loopBug.id)?.agent_state).toBe("pending");
+
+    w.store.upsertJob(batchBug, { agent_state: "needs_info", failure_reason: legacyReason });
+    expect(await w.runBatch(0)).toBe(0); // 只跑启动迁移，不领取任务
+    expect(w.store.getJob(batchBug.id)?.agent_state).toBe("pending");
+  });
+
   it("启动时恢复旧关键词拦截任务，保留已有候选和实际失败原因", () => {
     const w = makeWorker();
     const blocked = makeBug({ id: "1123456780001271798" });
@@ -3850,54 +3983,156 @@ describe("worker 两阶段修复协议", () => {
     expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("required MCP 预检失败");
   });
 
-  it("只读 Agent 明确无法从标题描述及代码定位时才转 needs_info", async () => {
+  it("只读调查无法定位入口时走定向补查与自动重试，不转 needs_info", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
     const bug = makeBug();
+    stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
-    vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({
+    const run = vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({
       raw_output: 'FINAL_RESULT: {"repair_contract":{"acceptance_cases":[{"given":"已进入目标功能","when":"触发工单操作","then":"返回预期结果且不再出现目标异常","source_refs":["evidence:0"]}],"preserved_behaviors":["正常输入继续完成原业务操作"],"domain_facts":[{"concept":"操作状态","meaning":"本次操作的业务结果","source_refs":["evidence:0"]}],"reuse_options":[{"symbol":"目标操作入口","action":"reuse","reason":"沿用原入口及错误处理路径"}],"open_questions":[]},"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"diagnostic_pages":[],"planned_files":[],"confidence":0,"blocked_reasons":["无法根据标题、描述及现有代码定位问题"]}',
     }));
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
 
     await w.processBug(bug);
 
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("needs_info");
-    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
+    expect(run).toHaveBeenCalledTimes(2); // 主调查 + 一轮定向补查，而不是直接转人工
+    expect(run.mock.calls[1][0].tools).toEqual(["read", "grep", "find", "ls"]);
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("pending"); // 普通失败 → 自动重试
+    expect(Number(job?.attempts ?? 0)).toBe(1);
+    expect(String(job?.failure_reason)).toContain("调查证据尚未收敛");
+    expect(String(job?.failure_reason)).toContain("无法根据标题、描述及现有代码定位问题");
   });
 
-  it("业务未决问题走人工出口：needs_info、不消耗修复尝试、不进入实施阶段", async () => {
+  it("只读调查目标不在允许访问的工作目录内时转工作区阻塞，不消耗修复尝试", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
+    stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
-    const calls: Array<Record<string, unknown>> = [];
-    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
-      calls.push(opts as unknown as Record<string, unknown>);
-      return makeResult({
-        raw_output: `FINAL_RESULT: ${JSON.stringify({
-          repair_contract: { ...contractFixture, open_questions: ["标记地图ID与玩家地图ID分别来自哪个字段？"] },
-          root_cause: "传送校验用资源路径比较",
-          evidence: ["[观察] Map.ts:1 资源路径比较", "[推断] 路径相同但地图ID不同时误放行"],
-          reproduction: { command: "", before: "跨地图仍发送请求" },
-          planned_files: ["Map.ts"],
-          confidence: 0.8,
-          blocked_reasons: [],
-        })}`,
-      });
-    });
+    const run = vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({
+      raw_output: 'FINAL_RESULT: {"repair_contract":null,"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"planned_files":[],"blocked_reasons":["目标不在允许访问的工作目录中"]}',
+    }));
     vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
 
     await w.processBug(bug);
 
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("needs_info");
-    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
-    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("业务条件尚未确认");
-    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("不消耗修复尝试次数");
-    expect(calls).toHaveLength(1); // 只做一次只读调查，不自动重试、不进入实施
+    expect(run).toHaveBeenCalledOnce(); // 工作区/权限阻塞不做补查，也不转 needs_info
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("blocked_workspace");
+    expect(Number(job?.attempts ?? 0)).toBe(0);
+    expect(String(job?.failure_reason)).toContain("目标不在允许访问的工作目录中");
   });
 
-  it("基线不可确认走人工出口，不被当成缺 reproduction.before 的格式错误重试", async () => {
+  it("安全阻塞与普通缺口混合时：照旧转工作区阻塞，但缺口不得被静默丢掉", async () => {
     const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
     const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const run = vi.spyOn(PiAgent.prototype, "run").mockResolvedValue(makeResult({
+      raw_output: 'FINAL_RESULT: {"repair_contract":null,"root_cause":"","evidence":[],"reproduction":{"command":"","before":""},"planned_files":[],"blocked_reasons":["目标修改路径不在允许访问的工作目录内","该符号定义在 project 工作区之外的同名模块中，未能核对"]}',
+    }));
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+
+    await w.processBug(bug);
+
+    expect(run).toHaveBeenCalledOnce(); // 有安全阻塞就不做补查（交人工处理）
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("blocked_workspace");
+    expect(Number(job?.attempts ?? 0)).toBe(0);
+    const reason = String(job?.failure_reason ?? "");
+    expect(reason).toContain("目标修改路径不在允许访问的工作目录内");
+    // 混合原因里的普通缺口必须保留供展示，不能被 blocked_reasons 覆盖掉
+    expect(reason).toContain("调查证据尚未收敛");
+    expect(reason).toContain("该符号定义在 project 工作区之外的同名模块中");
+    expect(String(job?.investigation)).toContain("该符号定义在 project 工作区之外的同名模块中");
+  });
+
+  it("业务未决问题先走补充调查；补查收敛后进入实施，而不是 needs_info", async () => {
+    const repo = tmpdir();
+    fs.writeFileSync(path.join(repo, "Map.ts"), "export const compare = (a: string, b: string) => a === b;\n");
+    const w = makeWorker([{ name: "r", path: repo, verify_cmds: [] }]);
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      if (calls.length === 1) {
+        return makeResult({
+          raw_output: `FINAL_RESULT: ${JSON.stringify({
+            repair_contract: { ...contractFixture, open_questions: ["标记地图ID与玩家地图ID分别来自哪个字段？"] },
+            root_cause: "传送校验用资源路径比较",
+            evidence: ["[观察] Map.ts:1 资源路径比较", "[推断] 路径相同但地图ID不同时误放行"],
+            reproduction: { command: "", before: "跨地图仍发送请求" },
+            planned_files: ["project:Map.ts"],
+            confidence: 0.8,
+            blocked_reasons: [],
+          })}`,
+        });
+      }
+      if (calls.length === 2) return makeInvestigation("project:Map.ts");
+      return makeResult({ changed_files: ["project:Map.ts"], summary: "改用地图ID比较" });
+    });
+    vi.spyOn(P4Client.prototype, "sync").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "opened")
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ depot: "//depot/Map.ts", action: "edit", changelist: "default", type: "text" }]);
+    vi.spyOn(P4Client.prototype, "reconcilePreview").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "diffUnified").mockResolvedValue("--- a/Map.ts\n+++ b/Map.ts\n-old\n+fixed");
+    vi.spyOn(P4Client.prototype, "createPending").mockResolvedValue(4324);
+    vi.spyOn(P4Client.prototype, "edit").mockResolvedValue("");
+    vi.spyOn(P4Client.prototype, "revertUnchanged").mockResolvedValue("");
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(3); // 调查 → 定向补查 → 实施（未被 needs_info 中断）
+    expect(calls[1].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(String(calls[1].prompt)).toContain("调查证据尚未收敛");
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state, `failure_reason=${String(job?.failure_reason ?? "")}`).toBe("candidate");
+  });
+
+  it("open_questions 补查后仍不收敛时按普通失败自动重试，耗尽后 failed", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 2;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+    const run = vi.spyOn(PiAgent.prototype, "run").mockImplementation(async () => makeResult({
+      raw_output: `FINAL_RESULT: ${JSON.stringify({
+        repair_contract: { ...contractFixture, open_questions: ["标记地图ID与玩家地图ID分别来自哪个字段？"] },
+        root_cause: "传送校验用资源路径比较",
+        evidence: ["[观察] Map.ts:1 资源路径比较", "[推断] 路径相同但地图ID不同时误放行"],
+        reproduction: { command: "", before: "跨地图仍发送请求" },
+        planned_files: ["project:Map.ts"],
+        confidence: 0.8,
+        blocked_reasons: [],
+      })}`,
+    }));
+
+    await w.processBug(bug);
+
+    expect(run).toHaveBeenCalledTimes(2); // 主调查 + 一轮补查，不进入人工出口
+    const retrying = w.store.getJob(bug.id);
+    expect(retrying?.agent_state).toBe("pending");
+    expect(Number(retrying?.attempts ?? 0)).toBe(1);
+    expect(String(retrying?.failure_reason)).toContain("调查证据尚未收敛");
+
+    await w.processBug(bug); // 第二次尝试同样不收敛 → 重试耗尽
+
+    const failed = w.store.getJob(bug.id);
+    expect(failed?.agent_state).toBe("failed");
+    expect(Number(failed?.attempts ?? 0)).toBe(2);
+    expect(String(failed?.failure_reason)).toContain("调查证据尚未收敛");
+  });
+
+  it("基线不可确认按普通失败自动重试，不转人工确认", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 3;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
     vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
@@ -3918,10 +4153,47 @@ describe("worker 两阶段修复协议", () => {
 
     await w.processBug(bug);
 
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("needs_info");
-    expect(Number(w.store.getJob(bug.id)?.attempts ?? 0)).toBe(0);
-    expect(String(w.store.getJob(bug.id)?.failure_reason)).toContain("基线不可确认");
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2); // 主调查 + 一轮补查，不做人工确认
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("pending");
+    expect(Number(job?.attempts ?? 0)).toBe(1);
+    expect(String(job?.failure_reason)).toContain("基线不可确认");
+    expect(String(job?.failure_reason)).toContain("调查证据尚未收敛");
+  });
+
+  it("reproduction.before 写成「基线不可确认」时保持未收敛自动重试，绝不喂给实施当失败现象", async () => {
+    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    w.config.max_attempts = 3;
+    const bug = makeBug();
+    stubMyBugs(w, [bug]);
+    stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(PiAgent.prototype, "run").mockImplementation(async (opts) => {
+      calls.push(opts as unknown as Record<string, unknown>);
+      return makeResult({
+        raw_output: `FINAL_RESULT: ${JSON.stringify({
+          repair_contract: contractFixture,
+          root_cause: "现有代码疑似已包含该修复",
+          evidence: ["[观察] Map.ts:1 已按地图ID比较", "[推断] 现有实现已覆盖该场景"],
+          reproduction: { command: "npm test -- map", before: "基线不可确认：当前代码疑似已包含修复，无法复现修复前失败" },
+          planned_files: ["Map.ts"],
+          confidence: 0.5,
+          blocked_reasons: [],
+        })}`,
+      });
+    });
+    vi.spyOn(P4Client.prototype, "opened").mockResolvedValue([]);
+
+    await w.processBug(bug);
+
+    expect(calls).toHaveLength(2); // 主调查 + 一轮定向补查：不得直接进入实施阶段
+    const job = w.store.getJob(bug.id);
+    expect(job?.agent_state).toBe("pending");
+    expect(Number(job?.attempts ?? 0)).toBe(1);
+    expect(String(job?.failure_reason)).toContain("调查证据尚未收敛");
+    expect(String(job?.failure_reason)).toContain("不能当作真实失败基线");
+    // 实施 Agent（若被调用）不得收到这段原文作为修复前失败现象
+    for (const call of calls) expect(String(call.prompt)).not.toContain("修复前失败现象: 基线不可确认");
   });
 
   it("实施 Agent 的纯验证限制登记为验证限制，不判失败也不重试", async () => {

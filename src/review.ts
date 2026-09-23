@@ -1,7 +1,7 @@
 /** 独立只读评审协议：基于目标、调查证据、机器验证和完整 diff 输出可执行 findings。 */
 
 import { effectivePiModel, extractFinalJson } from "./agent.js";
-import { agentRoleModel } from "./agentRoles.js";
+import { agentRoleEffectiveModel } from "./agentRoles.js";
 import type { Config } from "./config.js";
 import type { Bug } from "./models.js";
 import type { InvestigationResult } from "./repairWorkflow.js";
@@ -12,7 +12,7 @@ import { formatRepairContract } from "./repairContract.js";
  *  旧的 review.model 已移除；需要独立评审模型时只配置 agents.roles.review.model。
  *  允许只写裸模型名（由 agentRoleModel 自动补 provider 前缀），空值 = 沿用 pi.provider 默认。 */
 export function reviewerModel(config: Config): string {
-  return agentRoleModel(config, "review") || effectivePiModel(config.pi);
+  return agentRoleEffectiveModel(config, "review", effectivePiModel(config.pi));
 }
 
 export type FindingSeverity = "low" | "medium" | "high";

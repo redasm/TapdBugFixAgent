@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { defaultSearchPaths } from "./search.js";
 import { formatVerificationCommand } from "./verificationCommands.js";
-import { evidenceHash, hasPatchEvidence } from "./attemptAudit.js";
+import { actualModelUses, evidenceHash, hasPatchEvidence, type RepairAttempt } from "./attemptAudit.js";
 import { sourceEvidence, runtimeEvidence } from "./sourceEvidence.js";
 import { scopeAmendment, validateAmendedScope, reviewScopeAmendment, reviewScopeAmendmentForWritten } from "./scopeAmendment.js";
 import { buildBugContext } from "./quality.js";
@@ -57,8 +57,6 @@ import {
   mcpServerNamesMatchingText,
 } from "./mcpServers.js";
 import {
-  BASELINE_UNCONFIRMED_PREFIX,
-  BUSINESS_QUESTION_PREFIX,
   buildImplementationPrompt,
   buildInvestigationPrompt,
   buildInvestigationContinuationPrompt,
@@ -78,8 +76,9 @@ import { isVerificationLimitation } from "./repairContract.js";
 import { createTapdClient, type TapdBackend, TapdError } from "./tapd.js";
 import type { AgentMediaInput } from "./media.js";
 import {
+  agentRoleEffectiveModel,
   agentRoleEnabled,
-  agentRoleModel,
+  agentRoleModelSummary,
   agentRoleSnapshot,
   agentRoleTimeoutS,
   type AgentRole,
@@ -165,6 +164,41 @@ export function isRecoverableProviderBlock(failureReason: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// 旧 needs_info 迁移（仅限旧调查出口）
+// ---------------------------------------------------------------------------
+/** 旧调查出口写进 needs_info 的固定外壳（3b86b2e 及其之前）：
+ *  `(needsHuman ? HUMAN_SHELL : UNLOCATABLE_SHELL) + ": " + blocked_reasons.join("；")`。
+ *  这两个常量是「只恢复旧调查出口」的唯一依据，绝不能放宽成一个泛化的 needs_info 匹配——
+ *  准入层（描述过短/缺少复现信号/资源关键词）产生的 needs_info 原因文本完全不同。
+ *  常量刻意止于冒号（不含后续空格）：既能容忍空格差异，又不会命中不带冒号与正文的同名短语。 */
+export const LEGACY_NEEDS_INFO_HUMAN_SHELL =
+  "只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）:";
+export const LEGACY_NEEDS_INFO_UNLOCATABLE_SHELL = "只读 Agent 明确无法定位问题:";
+/** 旧版本给「业务未决问题 / 基线不可确认」加的前缀：人工外壳必须同时带其中之一才算旧调查出口。 */
+export const LEGACY_NEEDS_INFO_BUSINESS_PREFIX = "业务条件尚未确认:";
+export const LEGACY_NEEDS_INFO_BASELINE_PREFIX =
+  "基线不可确认（代码疑似已包含修复，需人工确认）:";
+
+/** 旧调查出口的 needs_info 判定（精确、幂等的前提）。
+ *  只认两种形态：
+ *   1) 「只读 Agent 明确无法定位问题: …」外壳（旧版把「无法定位入口」当人工补充出口）；
+ *   2) 「只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）: …」外壳，
+ *      且正文里带有 BUSINESS / BASELINE 前缀（只有这两类才会走那个人工分支）。
+ *  刻意不匹配：不带冒号与正文的同名短语、以及任何准入层原因。 */
+export function isLegacyInvestigationNeedsInfo(failureReason: unknown): boolean {
+  const reason = String(failureReason ?? "");
+  if (reason.startsWith(LEGACY_NEEDS_INFO_UNLOCATABLE_SHELL)) return true;
+  if (!reason.startsWith(LEGACY_NEEDS_INFO_HUMAN_SHELL)) return false;
+  const detail = reason.slice(LEGACY_NEEDS_INFO_HUMAN_SHELL.length);
+  return detail.includes(LEGACY_NEEDS_INFO_BUSINESS_PREFIX)
+    || detail.includes(LEGACY_NEEDS_INFO_BASELINE_PREFIX);
+}
+
+/** 单次启动最多迁移的旧调查出口 needs_info 数量：限流避免一次性大迁移拖住启动，
+ *  没处理完的部分在后续启动（runLoop / runBatch 都会调用）继续迁移。 */
+export const LEGACY_NEEDS_INFO_MIGRATION_LIMIT = 5;
+
+// ---------------------------------------------------------------------------
 // 当前阶段（管理台展示用）
 // ---------------------------------------------------------------------------
 /** 处理流程中可被管理台展示的阶段。取值与 processBug 内部的 phase 变量逐字一致
@@ -185,7 +219,7 @@ const _STAGE_LABEL: Record<WorkerStage, string> = {
 };
 
 /** 该阶段实际调用 Agent 时生效的角色：模型必须与「调用时真正传给 pi 的模型」同一来源，
- *  因此统一走 agentRoleModel(role) || effectivePiModel()（与 PiAgent.run 的解析顺序一致）。
+ *  因此统一走 agentRoleEffectiveModel(role, effectivePiModel())（与 PiAgent.run 的解析顺序一致）。
  *  验证阶段由编排器自己跑构建/测试，不调用模型，返回 null 由调用方回落。 */
 const stageAgentRole = (stage: WorkerStage): AgentRole | null => stage === "correction"
   ? "recovery"
@@ -256,9 +290,6 @@ const withPreopenedP4Files = (prompt: string): string => prompt
 
 /** 工作区中存在无法安全归属当前 Bug 的改动；这是操作阻塞，不应消耗模型修复次数。 */
 class WorkspaceBlockedError extends Error {}
-
-/** 调查在有限预算内无法收敛；保留证据并等待人工补充，不重复跑相同搜索。 */
-class InvestigationBlockedError extends Error {}
 
 const isConcretePlannedFile = (value: string): boolean => {
   const normalized = value.replace(/\\/g, "/").trim();
@@ -402,7 +433,11 @@ export class Worker {
   private lastProviderCooldownUntil = 0;
   /** 当前处理阶段（管理台「处理中 N」分组标题栏展示「当前阶段」；null = 未领取任务）。 */
   private currentStage: WorkerStage | null = null;
-  /** 当前阶段实际生效的模型（随阶段切换与角色配置实时更新，不在管理台里写死）。 */
+  /** 当前阶段实际生效的**角色**（stageAgentRole 的解析结果，或阶段内的临时角色切换，
+   *  如 recovery 收尾 / coordinator 的两次只读调用）；null = 该阶段不调用模型。 */
+  private currentStageRole: AgentRole | null = null;
+  /** 当前阶段实际生效的模型（随阶段切换与角色配置实时更新，不在管理台里写死）。
+   *  它表示「按当前配置这一次调用会用哪个模型」，不是「任务已经用过的模型」。 */
   private currentStageModel = "";
 
   private async mediaInputsForBug(bug: Bug): Promise<AgentMediaInput[]> {
@@ -560,6 +595,61 @@ export class Worker {
     return recovered;
   }
 
+  /** job 指向的 workspace 仍在当前配置里、且该工作区仍有仓库可修。
+   *  旧 needs_info 迁移只把任务放回队列；配置里已经没有对应工作区（或没有仓库）时放回去也跑不了，
+   *  原地保留交人工判断，避免制造注定失败的重试。 */
+  private workspaceStillConfigured(job: Record<string, unknown>): boolean {
+    const workspaceId = String(job.workspace_id ?? "").trim();
+    if (!workspaceId) return false;
+    const workspace = this.config.workspaces.find(
+      (item) => String(item.workspace_id) === workspaceId,
+    );
+    return Boolean(workspace && workspace.repos.length);
+  }
+
+  /** 恢复旧调查出口误标成 needs_info 的任务（幂等）。
+   *
+   *  旧版本把「业务条件尚未确认 / 基线不可确认 / 无法定位入口」写成 needs_info 终态（人工补充出口）；
+   *  新版本这三类都属于「调查未收敛」——应回到队列走定向补查 + 普通自动重试。迁移必须精确：
+   *   1) failure_reason 精确匹配旧调查出口的固定外壳（见 isLegacyInvestigationNeedsInfo）；
+   *   2) attempts=0——已经消耗过修复尝试的记录不能当没发生过；
+   *   3) 没有 changelist——已有候选产物的记录不能当没发生过；
+   *   4) job 的 workspace 仍在配置中且仍有仓库可修（见 workspaceStillConfigured）。
+   *  刻意不做的事：绝不碰准入层的 needs_info（原因文本完全不同，不会被外壳匹配到）；
+   *  不解除 provider 全局冷却（迁移只是回到队列，provider 是否可用仍由冷却决定）；
+   *  不直接改数据库（只走 store API），恢复前把原失败原因写进事件留痕，便于审计回溯。
+   *  单次上限 LEGACY_NEEDS_INFO_MIGRATION_LIMIT（限流），剩余部分由后续启动继续迁移。 */
+  recoverLegacyInvestigationNeedsInfo(limit = LEGACY_NEEDS_INFO_MIGRATION_LIMIT): number {
+    const cap = Math.max(1, Math.floor(Number(limit)) || 1);
+    let recovered = 0;
+    for (const job of this.store.listJobs("needs_info")) {
+      if (recovered >= cap) break;
+      const reason = String(job.failure_reason ?? "");
+      if (!isLegacyInvestigationNeedsInfo(reason)) continue;
+      if (Number(job.attempts ?? 0) !== 0) continue;
+      if (job.changelist !== null && job.changelist !== undefined) continue;
+      if (!this.workspaceStillConfigured(job)) continue;
+      const id = String(job.bug_id);
+      this.store.updateJob(id, {
+        agent_state: "pending",
+        failure_reason: null,
+        started_at: null,
+        finished_at: null,
+      });
+      this.store.addEvent(
+        "旧版本误标为需补充信息的调查未收敛任务已恢复为待处理（未消耗修复尝试、未解除 provider 冷却）；"
+          + `原失败原因: ${reason.slice(0, 300)}`,
+        "info",
+        id,
+      );
+      recovered += 1;
+    }
+    if (recovered) {
+      this.store.addEvent(`对账：已恢复 ${recovered} 个旧调查出口误标的需补充信息任务`, "info");
+    }
+    return recovered;
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve(), ms);
@@ -578,6 +668,8 @@ export class Worker {
 
   private async runLoop(): Promise<void> {
     this.reconcileStaleInProgress(); // 进程级对账：清理上个进程遗留的 in_progress 僵尸
+    // 旧调查出口误标的 needs_info 启动迁移（限流；未处理完的部分由后续启动继续迁移）。
+    this.recoverLegacyInvestigationNeedsInfo();
     while (!this.stopRequested) {
       if (this.store.getControl() === "running") {
         const cooldown = this.store.activeProviderCooldown();
@@ -797,6 +889,8 @@ export class Worker {
   async runBatch(limit?: number): Promise<number> {
     // CLI 一次性批处理也要能自愈历史误判的 provider 阻塞（幂等，只动 blocked_workspace）。
     this.recoverMisclassifiedProviderBlocks();
+    // 旧调查出口误标的 needs_info 同样在批处理启动路径迁移（幂等、限流）。
+    this.recoverLegacyInvestigationNeedsInfo();
     const n = limit ?? this.config.max_bugs_per_run;
     let count = 0;
     while (count < n) {
@@ -1237,7 +1331,9 @@ export class Worker {
     const auditAttemptId = this.store.audit.begin({
       bug_id: bug.id, workspace_id: bug.workspace_id, input: buildBugContext(bug),
       metadata: {
-        model: effectivePiModel(this.config.pi), review_model: reviewerModel(this.config),
+        // 口径澄清：这里记的是「没配角色模型时的默认回退模型」，**不是**本次任务实际调用的模型。
+        // 真正调用过的 role/model 只以本尝试的 agent_input 事件为准（web 详情的 actual_models）。
+        default_model: effectivePiModel(this.config.pi), review_model: reviewerModel(this.config),
         agent_roles: agentRoleSnapshot(this.config),
         review_enabled: this.config.review.enabled, quality: this.config.quality,
         agent_timeout_s: this.config.agent_timeout_s, max_attempts: this.config.max_attempts,
@@ -1299,9 +1395,12 @@ export class Worker {
         return;
       }
 
-      // 处理开始时就把 agent / 模型写进 job，web 列表与详情可实时看到
-      const model = effectivePiModel(this.config.pi);
-      this.store.updateJob(bug.id, { agent: "pi", model });
+      // 处理开始时把 agent / 默认回退模型写进 job，web 列表与详情可实时看到。
+      // job.model 这一列的语义是「没配角色模型时各角色会回落到哪个模型」（= pi.provider 默认模型），
+      // 它**不是**本次任务实际调用过的模型：实际调用的 role/model 只能从审计的 agent_input 读出
+      // （见 bugDetailForWeb 的 actual_models / role_models），前端据此展示，不再拿它冒充实际模型。
+      const defaultModel = effectivePiModel(this.config.pi);
+      this.store.updateJob(bug.id, { agent: "pi", model: defaultModel });
 
       const generatedP4Ignore = ensureP4IgnoreFile(repo.path, repo.ignore_paths ?? []);
       if (generatedP4Ignore) this.config.p4.ignore = generatedP4Ignore;
@@ -1484,7 +1583,7 @@ export class Worker {
         prompt_hash: evidenceHash(investigationPrompt), roots: workspaceRoots,
         context_key: contextKey, tools: investigationMcpServers,
         role: "investigation",
-        model: agentRoleModel(this.config, "investigation") || effectivePiModel(this.config.pi),
+        model: agentRoleEffectiveModel(this.config, "investigation", effectivePiModel(this.config.pi)),
       });
       const investigationRunOptions = {
         repoDir: repo.path,
@@ -1717,16 +1816,14 @@ export class Worker {
       if (!investigation.ok) {
         const reason = [...investigation.blocked_reasons, ...investigation.validation_errors].join("；");
         if (investigation.blocked_reasons.length) {
-          // 两类人工出口都不消耗修复尝试次数：业务未决问题 / 现有代码疑似已包含修复、
-          // 修复前基线不可确认。两者都不能被当成“输出格式不完整”去自动重试。
-          const needsHuman = investigation.blocked_reasons.some((item) =>
-            item.startsWith(BUSINESS_QUESTION_PREFIX) || item.startsWith(BASELINE_UNCONFIRMED_PREFIX));
-          throw new InvestigationBlockedError(
-            (needsHuman
-              ? "只读调查无法在无人工确认的情况下继续（不消耗修复尝试次数）"
-              : "只读 Agent 明确无法定位问题")
-            + ": " + investigation.blocked_reasons.join("；"),
-          );
+          // 调查阶段唯一保留的阻塞出口：真正的工作区/权限/安全阻塞（目标修改路径/仓库不在允许范围、
+          // 工作区或目标仓库缺权限、无法在当前工作区安全修改、无法安全选择目标仓库/修改位置）。
+          // 转 blocked_workspace 交人工处理，且不消耗修复尝试次数。
+          // 业务疑问、基线不可确认、无法定位入口、证据缺口都已改为 validation_errors：
+          // 先走补充调查，仍未收敛则按普通失败自动重试、耗尽后 failed，不再需要人工补充。
+          // 混合安全阻塞与普通缺口时，validation_errors 必须一并带进失败原因（否则普通缺口会被静默丢掉）：
+          // 单看 blocked_reasons 会让人工以为只有工作区问题，看不到还需补查的证据缺口。
+          throw new WorkspaceBlockedError("只读调查报告工作区/权限阻塞: " + reason);
         }
         throw new Error("调查结果格式不完整，将使用新上下文自动重试: " + (reason || "输出不可解析"));
       }
@@ -2467,18 +2564,6 @@ export class Worker {
           finished_at: nowStr(),
         });
         this.store.addEvent(`工作区阻塞: ${reason}`, "warn", bug.id);
-      } else if (failure instanceof InvestigationBlockedError) {
-        const reason = failure.message.slice(0, 1000);
-        this.store.updateJob(bug.id, {
-          agent_state: "needs_info",
-          failure_reason: reason,
-          finished_at: nowStr(),
-        });
-        this.store.addEvent(
-          `只读调查已转人工处理（未消耗修复尝试次数）: ${reason}`,
-          "warn",
-          bug.id,
-        );
       } else if (failure instanceof AgentCancelledError || failure instanceof P4CancelledError) {
         // 人工暂停/关闭/重试/跳过中断了本次尝试。只有状态仍是 in_progress（全局暂停/
         // 关闭）才回退 pending；人工重试/跳过已先把状态改成 pending/skipped，尊重人工
@@ -2856,6 +2941,9 @@ export class Worker {
   // ------------------------------------------------------------------
   private jobRow(bug: Bug, includeDesc = false): Record<string, unknown> {
     const job = this.store.getJob(bug.id) ?? {};
+    /** 默认回退模型：没配 agents.roles.<role>.model 的角色会回落到它。
+     *  不是「任务实际用的模型」——实际调用过的 role/model 只在详情里按审计展示。 */
+    const defaultModel = effectivePiModel(this.config.pi);
     const item: Record<string, unknown> = {
       bug_id: String(bug.id), // 大整数（>2^53）跨 JSON 会丢精度，必须字符串传输
       workspace_id: bug.workspace_id,
@@ -2870,7 +2958,12 @@ export class Worker {
       agent_state: job.agent_state,
       changelist: job.changelist !== undefined && job.changelist !== null ? Number(job.changelist) : null,
       agent: job.agent,
+      // 兼容字段：历史上这里写的是一次尝试开始时的 pi.provider 默认模型。语义见 default_model。
       model: job.model,
+      default_model: defaultModel,
+      // 角色模型配置摘要（后端已解析成最终生效值）：前端据此展示「哪个角色用哪个模型」，
+      // 而不是把默认回退模型当成任务实际模型。空数组 = 未配置任何角色覆盖也照样列全角色。
+      role_models: agentRoleModelSummary(this.config, defaultModel),
       started_at: job.started_at,
       finished_at: job.finished_at,
       failure_reason: job.failure_reason,
@@ -2925,6 +3018,10 @@ export class Worker {
     detail.repair_attempts = this.store.audit.attempts(bugId);
     detail.repair_candidates = this.store.audit.candidates(bugId);
     detail.candidate_feedback = this.store.audit.feedback(bugId);
+    // 实际调用过的 role/model：只取自审计的 agent_input（每次模型调用在 spawn 前必落一条），
+    // 因此它证明「这次任务真的调用过什么」，而不是「按配置本该用什么」。
+    // 空数组（本地无审计记录/极旧数据）时前端只能显示「默认回退模型」并明确标注未记录实际调用。
+    detail.actual_models = actualModelUses(detail.repair_attempts as RepairAttempt[]);
     if (job) {
       Object.assign(detail, job); // 本地处理字段优先（files 等保持 JSON 字符串，前端自行 parse）
       detail.bug_id = String(detail.bug_id);
@@ -3097,9 +3194,10 @@ export class Worker {
   /** 模型解析唯一入口：该角色的模型覆盖（裸名自动补 provider 前缀），未配置则回落
    *  pi.provider 默认模型——与 PiAgent.run 的解析顺序一致（调用用的模型 == 展示的模型）。
    *  角色缺失（准备/准入/机器验证等编排阶段）返回空串：这些阶段不调用模型，
-   *  管理台按「—」展示，不沿用上一阶段的模型假装在跑模型。 */
+   *  管理台按「—」展示，不沿用上一阶段的模型假装在跑模型。
+   *  注意：它只回答「按当前配置这一次调用会用哪个模型」，不代表该模型已经被调用过。 */
   private modelForRole(role: AgentRole | null): string {
-    return role ? (agentRoleModel(this.config, role) || effectivePiModel(this.config.pi)) : "";
+    return role ? agentRoleEffectiveModel(this.config, role, effectivePiModel(this.config.pi)) : "";
   }
 
   /** coordinator 角色的统一调用封装：只读、无工具、严格 JSON、失败降级。
@@ -3129,6 +3227,10 @@ export class Worker {
       });
       return null;
     };
+    // coordinator 调用期间把展示用的角色/模型切到 coordinator（阶段标签不变），跑完立刻还原：
+    // 它的两个调用点分别落在「准入评估」之后与交付之前，不切换的话状态条只会显示所属阶段的
+    // 角色（例如准备/准入那种不调用模型的空角色），看不出这一刻跑的是 coordinator。
+    this.setStageModelForRole("coordinator");
     try {
       const result = await new PiAgent(this.config).run({
         prompt: opts.prompt,
@@ -3156,28 +3258,35 @@ export class Worker {
       if (error instanceof AgentTimeoutError) return degrade(`超过 ${opts.timeoutS}s 时限`);
       if (error instanceof AgentInvestigationLimitError) return degrade("达到工具预算");
       return degrade(`调用失败: ${(error as Error).message}`);
+    } finally {
+      this.restoreStageModel();
     }
   }
 
-  /** 设置「当前阶段」并同步该阶段实际生效的模型。
+  /** 设置「当前阶段」并同步该阶段实际生效的角色与模型。
    *  - 阶段信息只保存在内存里（与 currentBugId 同一生命周期），不新增 DB 列：
    *    重新启动后当前阶段本就重新开始计算，历史值没有意义。 */
   private applyStage(stage: WorkerStage): void {
     this.currentStage = stage;
-    this.currentStageModel = this.modelForRole(stageAgentRole(stage));
+    this.currentStageRole = stageAgentRole(stage);
+    this.currentStageModel = this.modelForRole(this.currentStageRole);
   }
 
-  /** 阶段内的临时模型切换（不改阶段标签）：用于调查/实施阶段的 role:"recovery" 收尾子调用——
-   *  状态条上的「当前阶段」仍是调查/实施，但「模型」必须显示那一刻真正在跑的 recovery 模型。 */
+  /** 阶段内的临时角色切换（不改阶段标签）：用于调查/实施阶段的 role:"recovery" 收尾子调用，
+   *  以及 coordinator 的两次只读调用——状态条上的「当前阶段」仍是所属阶段，
+   *  但「角色 / 模型」必须显示那一刻真正在跑的那个角色与模型。
+   *  角色与模型同时切换：只换模型会让「模型」与「角色」互相矛盾（例如显示 recovery 模型却标调查角色）。 */
   private setStageModelForRole(role: AgentRole): void {
     if (!this.currentStage) return; // 阶段已清空（异常/结束时迟到的切换）：不复活展示状态
+    this.currentStageRole = role;
     this.currentStageModel = this.modelForRole(role);
   }
 
-  /** 把阶段模型还原成该阶段自身的模型（applyStage 的模型部分），供临时切换后调用。 */
+  /** 把角色与模型还原成该阶段自身的（applyStage 的角色/模型部分），供临时切换后调用。 */
   private restoreStageModel(): void {
     if (!this.currentStage) return;
-    this.currentStageModel = this.modelForRole(stageAgentRole(this.currentStage));
+    this.currentStageRole = stageAgentRole(this.currentStage);
+    this.currentStageModel = this.modelForRole(this.currentStageRole);
   }
 
   /** 一次尝试结束（成功/失败/取消/异常）后清空「当前阶段」，管理台回到「—」占位。
@@ -3185,16 +3294,26 @@ export class Worker {
    *  阶段展示生命周期都完整，不会残留上一单的阶段与模型。 */
   private clearStage(): void {
     this.currentStage = null;
+    this.currentStageRole = null;
     this.currentStageModel = "";
   }
 
-  /** 当前阶段 + 该阶段模型（管理台「处理中 N」分组标题栏展示用）。关键名刻意带 current_ 前缀，避免与任务行字段
-   *  （stage / label / model 等）在 JSON 合并时互相覆盖；未领取任务时 stage 为 null。 */
-  currentStageInfo(): { current_stage: WorkerStage | null; current_stage_label: string; current_model: string } {
+  /** 当前阶段 + 该阶段实际生效的角色与模型（管理台「处理中 N」分组标题栏展示用）。
+   *  关键名刻意带 current_ 前缀，避免与任务行字段（stage / label / model 等）在 JSON 合并时互相覆盖；
+   *  未领取任务时 stage/role 为 null、model 为空串。
+   *  `current_role` 是「这一刻正在跑的角色」：正常阶段 = 该阶段角色，recovery 收尾 = recovery，
+   *  coordinator 调用期间 = coordinator；不调用模型的阶段（准备/准入/机器验证）= null。 */
+  currentStageInfo(): {
+    current_stage: WorkerStage | null;
+    current_stage_label: string;
+    current_role: AgentRole | null;
+    current_model: string;
+  } {
     const stage = this.currentStage;
     return {
       current_stage: stage,
       current_stage_label: stage ? _STAGE_LABEL[stage] : "",
+      current_role: this.currentStageRole,
       current_model: this.currentStageModel,
     };
   }
