@@ -18,11 +18,13 @@ import {
   agentRoleTimeoutS,
   parseAgentsConfig,
 } from "../src/agentRoles.js";
+import type { AgentRole } from "../src/agentRoles.js";
 import { actualModelUses } from "../src/attemptAudit.js";
 import { DEFAULT_PRIORITY_WEIGHT, loadConfig, validateConfig } from "../src/config.js";
 import type { Config, RepoConfig } from "../src/config.js";
 import {
-  AgentCancelledError, AgentInvestigationLimitError, AgentTimeoutError, PiAgent, effectivePiModel,
+  AgentCancelledError, AgentInvestigationLimitError, AgentTimeoutError, PiAgent, ProviderUnavailableError,
+  effectivePiModel,
 } from "../src/agent.js";
 import { P4Client } from "../src/p4.js";
 import { StateStore } from "../src/state.js";
@@ -315,33 +317,24 @@ agents:
     expect(parseAgentsConfig({ roles: { coordinator: { model: "" } } }).problems).toEqual([]);
   });
 
-  it("真实 config.yaml：coordinator 在 agents.roles 下启用，模型沿用 gateway/gemini-3.8-flash", () => {
-    const cfg = loadRepoConfig("config.yaml");
-    // 位置正确：不再是 agents.coordinator，因此没有任何角色层告警
+  // 只读入库的 config.example.yaml：config.yaml 是 gitignore 的本机配置，内容因人而异，不能作为断言依据。
+  it("config.example.yaml：coordinator 与其它角色同级（示例不得再写成 agents.coordinator）", () => {
+    const cfg = loadRepoConfig("config.example.yaml");
+    // 位置正确：不是 agents.coordinator，因此没有任何角色层告警
     expect(cfg.agents!.problems).toEqual([]);
     expect(cfg.agents!.roles.coordinator).toEqual({ model: "" });
     // 启用判定读的就是「角色条目是否存在且解析出有效字段」
     expect(Boolean(cfg.agents!.roles.coordinator)).toBe(true);
     // model 留空 = 沿用 pi.provider 默认模型；该默认模型必须真的来自配置而不是被写死
     expect(agentRoleModel(cfg, "coordinator")).toBe("");
-    expect(effectivePiModel(cfg.pi)).toBe("gateway/gemini-3.8-flash");
-    expect(agentRoleEffectiveModel(cfg, "coordinator", effectivePiModel(cfg.pi)))
-      .toBe("gateway/gemini-3.8-flash");
+    const defaultModel = effectivePiModel(cfg.pi);
+    expect(defaultModel).toBeTruthy();
+    expect(agentRoleEffectiveModel(cfg, "coordinator", defaultModel)).toBe(defaultModel);
     // 摘要口径：coordinator 标为「已配置，但走默认回退模型」
-    expect(agentRoleModelSummary(cfg, effectivePiModel(cfg.pi)).find((e) => e.role === "coordinator"))
+    expect(agentRoleModelSummary(cfg, defaultModel).find((e) => e.role === "coordinator"))
       .toMatchObject({
-        configured: true, model: "",
-        effective_model: "gateway/gemini-3.8-flash", uses_default_model: true,
+        configured: true, model: "", effective_model: defaultModel, uses_default_model: true,
       });
-  });
-
-  it("config.example.yaml：coordinator 与其它角色同级（示例不得再写成 agents.coordinator）", () => {
-    const cfg = loadRepoConfig("config.example.yaml");
-    expect(cfg.agents!.problems).toEqual([]);
-    expect(cfg.agents!.roles.coordinator).toEqual({ model: "" });
-    // 示例里的 provider 是占位模型；coordinator 留空即沿用该默认回退值
-    expect(agentRoleEffectiveModel(cfg, "coordinator", effectivePiModel(cfg.pi)))
-      .toBe(effectivePiModel(cfg.pi));
   });
 
   it("agentRoleSnapshot 区分「显式启用但沿用默认模型」与「未配置」", () => {
@@ -657,11 +650,16 @@ describe("coordinator 角色调用点", () => {
     // 建议正文不得落进审计（正文只作为附加段落进 prompt / 交付描述）
     expect(JSON.stringify(events)).not.toContain("Login.ts 的点击处理");
     // Worker 保留硬决策：阶段推进仍由状态机决定，coordinator 不影响最终状态
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+    // （stubVerify 给出验证通过、未启用 review，分类为 verified）
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("verified");
   });
 
-  it("plan 失败（超时 / 非法 JSON）降级：调查照常执行，prompt 里没有建议段", async () => {
-    for (const failure of [new AgentTimeoutError("coordinator 超时", ""), null]) {
+  it("plan 失败（超时 / 非法 JSON / provider 400）降级：调查照常执行，prompt 里没有建议段", async () => {
+    const provider400 = new ProviderUnavailableError(
+      "Pi provider error: 400 maxOutputTokens value of 131072 but the supported range is from 1 to 65537",
+      "transient",
+    );
+    for (const failure of [new AgentTimeoutError("coordinator 超时", ""), provider400, null]) {
       const repo = tmpdir();
       fs.writeFileSync(path.join(repo, "Login.ts"), "export const login = true;\n");
       const w = makeWorker(repo, { agents: { roles: { coordinator: { model: "" } }, problems: [] } });
@@ -680,9 +678,9 @@ describe("coordinator 角色调用点", () => {
           }
           return makeResult({ raw_output: summaryJson() });
         }
-        return calls.filter((call) => call.role === "investigation").length
-          ? makeResult({ changed_files: ["project:Login.ts"], summary: "实施完成" })
-          : makeInvestigation("project:Login.ts");
+        return opts.role === "investigation"
+          ? makeInvestigation("project:Login.ts")
+          : makeResult({ changed_files: ["project:Login.ts"], summary: "实施完成" });
       });
 
       await w.processBug(bug);
@@ -690,10 +688,12 @@ describe("coordinator 角色调用点", () => {
       expect(calls.some((call) => call.role === "investigation")).toBe(true);
       const investigationPrompt = String(calls.find((call) => call.role === "investigation")!.prompt);
       expect(investigationPrompt).not.toContain("调查计划建议");
-      expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+      expect(w.store.getJob(bug.id)?.agent_state).toBe("verified");
       const events = w.store.audit.attempts(bug.id).at(-1)!.events as Array<{ kind: string; payload: Record<string, unknown> }>;
       expect(events.find((event) => event.kind === "coordinator_plan")!.payload)
         .toMatchObject({ degraded: true });
+      // coordinator 的 provider 故障只影响它自己：不得开全局冷却拖停整个队列
+      expect(w.store.activeProviderCooldown()).toBeFalsy();
       vi.restoreAllMocks();
     }
   });
@@ -711,9 +711,7 @@ describe("coordinator 角色调用点", () => {
         if (!planSeen) { planSeen = true; return makeResult({ raw_output: planJson() }); }
         throw new AgentTimeoutError("coordinator 汇总超时", "");
       }
-      const seen = vi.mocked(PiAgent.prototype.run).mock.calls
-        .filter(([item]) => item.role === "investigation").length;
-      return seen === 0
+      return opts.role === "investigation"
         ? makeInvestigation("project:Login.ts")
         : makeResult({ changed_files: ["project:Login.ts"], summary: "实施完成：按 planned_files 做最小修复" });
     });
@@ -723,7 +721,7 @@ describe("coordinator 角色调用点", () => {
     const description = String(w.store.getJob(bug.id)?.generated_description ?? "");
     expect(description).toContain("实施完成：按 planned_files 做最小修复");
     expect(description).not.toContain("协调者补充说明");
-    expect(w.store.getJob(bug.id)?.agent_state).toBe("candidate");
+    expect(w.store.getJob(bug.id)?.agent_state).toBe("verified");
   });
 
   it("summary 不能覆盖测试 / 文件 / review 事实（自述通过也不改分类与文件清单）", async () => {
@@ -755,9 +753,7 @@ describe("coordinator 角色调用点", () => {
           reuse_and_lifecycle: "pass", unverified_items: [], note: "已检查", findings: [],
         }) });
       }
-      const investigation = vi.mocked(PiAgent.prototype.run).mock.calls
-        .filter(([item]) => item.role === "investigation").length === 0;
-      return investigation
+      return opts.role === "investigation"
         ? makeInvestigation("project:Login.ts")
         : makeResult({ changed_files: ["project:Login.ts"], summary: "实施完成" });
     });
@@ -768,9 +764,14 @@ describe("coordinator 角色调用点", () => {
     // 硬事实不受 coordinator 文字影响：分类、文件清单、交付描述里的真实改动都保持原样
     const job = w.store.getJob(bug.id)!;
     expect(job.agent_state).toBe("review_pending");
-    expect(String(job.files)).toContain("project:Login.ts");
+    // job.files 记的是「根别名:depot 路径」：仍是真实打开的那一个文件，不受「改了 9 个文件」影响
+    expect(JSON.parse(String(job.files))).toEqual(["project://depot/Login.ts"]);
     expect(String(job.generated_description)).toContain("实施完成");
-    expect(String(job.generated_description)).not.toContain("改了 9 个文件");
+    // coordinator 的文字只出现在带免责声明的「协调者补充说明」附加段里，不混进前面的事实部分
+    const description = String(job.generated_description);
+    const coordinatorSection = description.indexOf("协调者补充说明");
+    expect(coordinatorSection).toBeGreaterThan(description.indexOf("实施完成"));
+    expect(description.slice(0, coordinatorSection)).not.toContain("改了 9 个文件");
   });
 
   it("未配置 agents.roles.coordinator 时不新增任何调用（与改造前逐字一致）", async () => {
@@ -862,8 +863,14 @@ describe("管理台当前阶段与阶段模型", () => {
     const bug = makeBug();
     const stages: Array<Record<string, unknown>> = [];
     const recordStage = (): Record<string, unknown> => ({ ...w.status().current_stage as Record<string, unknown> });
+    // worker 不显式传 model，由 PiAgent.run 按「显式 model > agents.roles.<role> > pi.provider 默认」解析；
+    // run 被 mock 掉，这里按同一顺序还原「真实会调用的模型」。
+    const calledModel = (opts: { role?: string; model?: unknown }): string =>
+      String(opts.model ?? "").trim()
+      || (opts.role ? agentRoleModel(w.config, opts.role as AgentRole) : "")
+      || effectivePiModel(w.config.pi);
     spyAgentRun(async (opts) => {
-      if (opts.role !== "coordinator") stages.push({ ...recordStage(), role: opts.role, model_arg: opts.model ?? "" });
+      if (opts.role !== "coordinator") stages.push({ ...recordStage(), role: opts.role, model_arg: calledModel(opts) });
       if (stages.length === 1) return makeInvestigation("project:Login.ts");
       return makeResult({ changed_files: ["project:Login.ts"], summary: "完成修复" });
     });
@@ -1005,8 +1012,9 @@ describe("管理台当前阶段与阶段模型", () => {
       ["investigation", "investigation", "只读调查", "investigation", "gateway/inv-model"],
       // recovery 收尾：阶段标签仍是「只读调查」，角色与模型都已切到真正在跑的 recovery
       ["recovery", "investigation", "只读调查", "recovery", "gateway/recovery-model"],
-      // 收尾结束回到实施阶段：角色与模型都还原为实施角色（不是残留的 recovery）
-      ["implementation", "implementation", "实施编码", "implementation", "gateway/impl-model"],
+      // 收尾结束回到实施阶段：角色还原为实施角色（不是残留的 recovery）；
+      // 本用例未配置 implementation 模型，因此回落 pi.provider 默认模型
+      ["implementation", "implementation", "实施编码", "implementation", "gateway/fix-model"],
     ]);
     expect(w.status().current_stage).toMatchObject({ current_stage: null, current_role: null, current_model: "" });
   });
@@ -1051,8 +1059,8 @@ describe("管理台当前阶段与阶段模型", () => {
       ["investigation", "investigation", "只读调查", "gateway/inv-model"],
       // 补充核查达预算后的 recovery 收尾：阶段标签不变，模型切到真正在跑的 recovery 模型
       ["recovery", "investigation", "只读调查", "gateway/recovery-model"],
-      // 收尾结束进入实施阶段：模型还原为实施角色模型
-      ["implementation", "implementation", "实施编码", "gateway/impl-model"],
+      // 收尾结束进入实施阶段：模型还原为实施阶段模型（未配置 implementation，回落 pi.provider 默认模型）
+      ["implementation", "implementation", "实施编码", "gateway/fix-model"],
     ]);
     expect(w.status().current_stage).toMatchObject({ current_stage: null, current_model: "" });
   });

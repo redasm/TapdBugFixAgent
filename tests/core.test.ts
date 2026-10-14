@@ -173,6 +173,10 @@ function tmpdir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "tapd-test-"));
 }
 
+/** 只经由 mock 访问的假仓库根：必须保证本机不存在。根目录不存在时 planned_files 存在性检查会跳过，
+ *  这批用例依赖这一点；不能写死 C:\tmp 这类真实路径，否则本机一旦有该目录，用例就随环境失败。 */
+const FAKE_REPO_ROOT = path.join(os.tmpdir(), `tapd-test-missing-root-${process.pid}-${Date.now()}`);
+
 /** 建一个带一个 workspace（repos 可注入）的 worker。 */
 function makeWorker(repos: RepoConfig[] = []): Worker {
   const store = new StateStore(":memory:");
@@ -2428,7 +2432,7 @@ describe("worker web 合并", () => {
 // ---------------------------------------------------------------------------
 describe("本地任务（Tapd 列表外）可见可处理", () => {
   it("fetchActionable 纳入本地 pending（Tapd 直拉补全描述）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, []); // Tapd「我的」列表拉不到它
     stubTapd(w, new FakeTapd([bug])); // 但按 id 直拉能拉到
@@ -2440,7 +2444,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("Tapd 直拉也失败时用本地快照入队（不阻断）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, []);
     stubTapd(w, new FakeTapd([])); // 直拉也失败
@@ -2453,7 +2457,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("快照 tapd_status 已终态（resolved）的本地 pending 不复活", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287", status: "resolved" });
     stubMyBugs(w, []);
     stubTapd(w, new FakeTapd([bug]));
@@ -2463,7 +2467,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("回归：Tapd 确认无此单（直拉返回空壳）→ 本地 pending 自动转 skipped，不入队", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, []);
     // REST/MCP 对不存在的单返回「只有 id 的空壳」（无标题无状态）
@@ -2481,7 +2485,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("回归：直拉抛错（接口波动）→ 保持 pending 用快照入队，不误杀", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, []);
     stubTapd(w, {
@@ -2495,7 +2499,7 @@ describe("本地任务（Tapd 列表外）可见可处理", () => {
   });
 
   it("回归：列表拉取失败且直拉返回空壳时保持 pending，不误判单据不存在", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubTapd(w, {
       listBugs: async () => { throw new Error("fetch failed"); },
@@ -2717,7 +2721,7 @@ describe("worker 控制与取消", () => {
 
   it("启动迁移：只恢复旧调查出口误标的 needs_info，不碰准入层与已有产物", () => {
     // 迁移要求 workspace 配置仍有效：这个 case 的 bug 必须落在已配置的工作区上。
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = (id: string, workspace_id = "111") => makeBug({ id, workspace_id });
     const unlocatable = bug("1123456780001254300");
     const business = bug("1123456780001254301");
@@ -2800,7 +2804,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("启动迁移：单次限流 5 个，后续启动继续迁移剩余任务", () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     for (let i = 0; i < 7; i += 1) {
       const id = `1123456780001259${String(i).padStart(3, "0")}`;
       w.store.upsertJob(makeBug({ id, workspace_id: "111" }), {
@@ -2817,7 +2821,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("runLoop 与 runBatch 两条启动路径都会执行旧 needs_info 迁移", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const legacyReason = "只读 Agent 明确无法定位问题: 无法根据标题、描述及现有代码定位问题";
     const loopBug = makeBug({ id: "1123456780001254350", workspace_id: "111" });
     const batchBug = makeBug({ id: "1123456780001254351", workspace_id: "111" });
@@ -2852,7 +2856,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("agent 被取消时 bug 回到 pending，不算失败", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, [bug]);
 
@@ -2879,7 +2883,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("P4 扫描被暂停或关闭取消时 bug 回到 pending，不记为失败", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, [bug]);
     vi.spyOn(P4Client.prototype, "opened").mockRejectedValue(new P4CancelledError("人工取消 P4"));
@@ -2893,7 +2897,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("回归：人工跳过正在处理的 bug，中断后不把 skipped 覆盖回 pending", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, [bug]);
     const oldEvt = w.cancelEvent;
@@ -2923,7 +2927,7 @@ describe("worker 控制与取消", () => {
   });
 
   it("重试正在处理的 bug：中断当前尝试并换新取消令牌", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001254287" });
     w.store.upsertJob(bug, { agent_state: "in_progress" });
     w.store.updateJob(bug.id, { attempts: 2, failure_reason: "旧失败" });
@@ -3202,7 +3206,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("启用 MCP 后资源 Bug 可准入，所有 Agent 阶段自动获得 MCP", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.mcp_servers = parseMcpServers({
       prefab_mcp2: {
         command: "python",
@@ -3243,7 +3247,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("default changelist 存在无法归属的遗留文件时停止，绝不混入当前 Bug", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -3262,7 +3266,7 @@ describe("worker 两阶段修复协议", () => {
 
   it("存在未 p4 edit 的本地改动时停止，避免 reconcile 后混入当前 Bug", async () => {
     const w = makeWorker([{
-      name: "r", path: "C:\\tmp", verify_cmds: [], preflight_reconcile: "always",
+      name: "r", path: FAKE_REPO_ROOT, verify_cmds: [], preflight_reconcile: "always",
     }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3281,7 +3285,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("先以只读工具调查，再把根因证据交给写入阶段", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -3320,7 +3324,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("调查首轮只有开场白时在同一 Agent 补充一轮并继续修复", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -3349,7 +3353,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("补查轮使用有限工具预算；补查超时后按已有证据做一次无工具收尾并保留两段轨迹", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.agent_timeout_s = 1800; // fixture 默认 900 会派生 300s；本用例场景是大仓库大 bug 的 1800s 预算
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -3390,7 +3394,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("调查补充轮仍不完整时自动重试，不误标 needs_info", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3410,7 +3414,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("P4 精确同步超时后进入工作区阻塞且不消耗 Bug 重试次数", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3433,7 +3437,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("P4 持续断线进入工作区阻塞且不消耗 Bug 重试次数", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3452,7 +3456,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("Pi 完成调查与修复并记录实际模型", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.pi.provider = { id: "test", model_id: "fix-model" };
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
@@ -3491,7 +3495,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("编码阶段 900 秒未落笔时保留 1800 秒总上限，并只做一次 180 秒定向收尾", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -3595,7 +3599,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("调查和收尾均超时后，重试仍包含原始调查证据", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -3615,7 +3619,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("编码达到预算但已有真实 diff 时继续验证并隔离到人工评审，不冒充成功", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -3760,7 +3764,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("Agent 超时后强制收敛，仍失败则自动重试而不是 needs_info", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -3777,7 +3781,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("调查达到工具预算后用已有轨迹强制收敛，不误标 needs_info", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
     const calls: Array<Record<string, unknown>> = [];
@@ -3811,7 +3815,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("混合轨迹里的完整 FINAL_RESULT 不得直接触发实施，必须经无工具收尾重新产出", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.agent_timeout_s = 1800; // fixture 默认 900 会派生 300s；本用例场景是大仓库大 bug 的 1800s 预算
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3850,7 +3854,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("主超时→收尾不完整→补查超时→第二次收尾有效：四轮预算明确且不落回历史故障", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.agent_timeout_s = 1800;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3948,7 +3952,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("补查被人工取消时不做无工具收尾，保持中断语义", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -3965,7 +3969,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("补查遇到基础设施异常时转工作区阻塞且不消耗重试，不额外调用收尾", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -3984,7 +3988,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("只读调查无法定位入口时走定向补查与自动重试，不转 needs_info", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -4006,7 +4010,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("只读调查目标不在允许访问的工作目录内时转工作区阻塞，不消耗修复尝试", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -4025,7 +4029,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("安全阻塞与普通缺口混合时：照旧转工作区阻塞，但缺口不得被静默丢掉", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -4094,7 +4098,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("open_questions 补查后仍不收敛时按普通失败自动重试，耗尽后 failed", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -4129,7 +4133,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("基线不可确认按普通失败自动重试，不转人工确认", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 3;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -4162,7 +4166,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("reproduction.before 写成「基线不可确认」时保持未收敛自动重试，绝不喂给实施当失败现象", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 3;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -4231,7 +4235,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("空白验证命令作为配置错误转人工评审，不调用 Reviewer", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.review.enabled = true;
     w.config.workspaces[0].repos[0].verify_cmds = ["   "];
     const bug = makeBug();
@@ -4267,7 +4271,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("Agent 修改 planned_files 之外的文件时拒绝自动候选，但保留到人工评审 changelist", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -4298,7 +4302,7 @@ describe("worker 两阶段修复协议", () => {
   });
 
   it("修复 Agent 同时报告改动和阻塞时拒绝生成候选", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -4611,7 +4615,7 @@ describe("worker 两阶段修复协议", () => {
   }, 10000);
 
   it("准入不通过时不调用 Agent，并记录需要补充的信息", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.quality.admission.min_score = 55;
     w.config.quality.admission.require_reproduction_signal = true;
     const bug = makeBug({ name: "功能异常", description: "", module: "" });
@@ -4692,7 +4696,7 @@ describe("worker 自动重试", () => {
   });
 
   it("人工取消后仍登记本次 default 文件，下一次只精确撤销该文件", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug({ id: "1123456780001260396" });
     w.store.upsertJob(bug, { agent_state: "in_progress" });
     const p4 = new P4Client("C:\\tmp", {}, undefined, w.cancelEvent);
@@ -4731,7 +4735,7 @@ describe("worker 自动重试", () => {
   });
 
   it("结束清点失败时不把已有遗留记录覆盖为空", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     w.store.upsertJob(bug, {
       last_attempt_files: dumps(["//depot/known.ts"]),
@@ -4747,7 +4751,7 @@ describe("worker 自动重试", () => {
   });
 
   it("最终验证失败但已有代码改动时保留到 pending changelist", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     w.store.upsertJob(bug);
     w.store.updateJob(bug.id, { agent_state: "in_progress" });
@@ -4774,7 +4778,7 @@ describe("worker 自动重试", () => {
   });
 
   it("Reviewer 基础设施异常时立即保留已验证候选，不遗留在 default", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     w.store.upsertJob(bug);
@@ -4803,7 +4807,7 @@ describe("worker 自动重试", () => {
   });
 
   it("未耗尽重试次数回 pending，耗尽才 failed；重试前撤销遗留 default 文件", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug({ id: "1123456780001254287" });
     stubMyBugs(w, [bug]);
@@ -4849,7 +4853,7 @@ describe("worker 自动重试", () => {
   });
 
   it("max_attempts=1（默认）首次失败即 failed，不重试", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -4864,7 +4868,7 @@ describe("worker 自动重试", () => {
   });
 
   it("Tapd 失败评论只在最后一次失败回写，含总尝试次数", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 3;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -4890,7 +4894,7 @@ describe("worker 自动重试", () => {
   });
 
   it("回归：修复成功只发 Tapd 评论，绝不自动修改单子状态（状态由人工 review/submit 后自行处理）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     const comments: string[] = [];
@@ -4921,7 +4925,7 @@ describe("worker 自动重试", () => {
     expect(statusUpdates).toEqual([]); // 一次 updateBug 都不许有
   });
 
-  it("成功后清空重试证据与遗留文件记录", async () => {    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+  it("成功后清空重试证据与遗留文件记录", async () => {    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -4975,7 +4979,7 @@ describe("worker 自动重试", () => {
   });
 
   it("回归：FINAL_RESULT 解析失败但 p4 有打开文件时按事实采纳，不再误判失败（bug 1256834 实例）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {}, updateBug: async () => {} } as unknown as FakeTapd);
@@ -5018,7 +5022,7 @@ describe("worker 自动重试", () => {
   });
 
   it("回归：遗留文件已被并入编号 changelist 时不盲撤（避免误杀其它 bug 的 pending 改动）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -5157,7 +5161,7 @@ describe("ensurePiModels", () => {
     expect(root.providers.custom.baseUrl).toBe("https://gateway");
   });
 
-  it("未配置 provider / 缺 base_url / 无 model_id 时不写文件", () => {
+  it("未配置 provider / 缺 base_url 时不写文件；无 model_id 时仍注册 provider，models 为空", () => {
     const dir = tmpdir();
     const file = path.join(dir, "models.json");
 
@@ -5170,11 +5174,15 @@ describe("ensurePiModels", () => {
     );
     expect(fs.existsSync(file)).toBe(false);
 
+    // 无 model_id（也没有角色模型）：provider 照样注册（base_url/api_key 生效），只是没有可用模型，
+    // 由 pi 报错，编排器在启动告警里提示。
     ensurePiModels(
-      { provider: { id: "custom", base_url: "https://g" } }, // 无 model_id
+      { provider: { id: "custom", base_url: "https://g" } },
       file,
     );
-    expect(fs.existsSync(file)).toBe(false);
+    const root = JSON.parse(fs.readFileSync(file, "utf-8"));
+    expect(root.providers.custom.baseUrl).toBe("https://g");
+    expect(root.providers.custom.models).toEqual([]);
   });
 
   it("损坏的原文件不炸：从空结构重建", () => {
@@ -5474,7 +5482,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("provider 429 额度耗尽：转 provider_unavailable、不消耗修复尝试、不标工作区阻塞、写持久冷却", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -5505,7 +5513,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("transient provider 故障：连续失败时退避翻倍且有界；冷却期内入口不再开始尝试", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -5552,7 +5560,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("不在 Tapd「我的」列表里的 provider_unavailable 单，冷却结束后仍会被重新领取", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, []); // Tapd 列表为空（改派/翻页遗漏）：只能靠本地记录恢复
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -5611,7 +5619,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("全局冷却阻止同批工单级联调用同一个不可用 provider", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const first = makeBug({ id: "1123456780001254287" });
     const second = makeBug({ id: "1123456780001254288" });
     stubMyBugs(w, [first, second]);
@@ -5659,7 +5667,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("人工重试提前解除 provider 冷却并清零退避", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -5736,7 +5744,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("required MCP 预检等编排基础设施错误仍按工作区阻塞处理，不被误当成 provider 故障", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     w.config.max_attempts = 2;
     const bug = makeBug();
     stubMyBugs(w, [bug]);
@@ -5789,7 +5797,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("人工重试（明确解除冷却）后，迟到的 provider 错误不得重开冷却（generation 防迟到）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -5826,7 +5834,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("provider 故障且 P4 清点真实失败（严格清点）：归工作区阻塞，provider 冷却照常开启", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);
@@ -5869,7 +5877,7 @@ describe("provider 不可用分类、全局冷却与历史误阻塞恢复", () =
   });
 
   it("迟到的 provider 错误不覆盖人工跳过设置的状态（skip 仍保留全局健康冷却）", async () => {
-    const w = makeWorker([{ name: "r", path: "C:\\tmp", verify_cmds: [] }]);
+    const w = makeWorker([{ name: "r", path: FAKE_REPO_ROOT, verify_cmds: [] }]);
     const bug = makeBug();
     stubMyBugs(w, [bug]);
     stubTapd(w, { addComment: async () => {} } as unknown as FakeTapd);

@@ -3206,9 +3206,11 @@ export class Worker {
    *    因此它不可能产生任何副作用，也看不到 prompt 之外的信息。
    *  - 一次调用、一次解析：不重试、不缓存。超时 / 非零退出 / 输出不是严格 JSON /
    *    字段类型不符，统一记一条 warn 进度并返回 null（调用方按「本次没有建议」继续）。
-   *  - **取消必须传播**：AgentCancelledError（人工暂停/关闭）与 ProviderUnavailableError
-   *    （provider 故障，编排器要据此开全局冷却）原样向上抛，绝不降级成「没有建议」——
-   *    否则一单会在被取消后继续跑完整流程。
+   *  - **只有取消必须传播**：AgentCancelledError（人工暂停/关闭）原样向上抛，绝不降级成
+   *    「没有建议」——否则一单会在被取消后继续跑完整流程。
+   *  - ProviderUnavailableError 也降级：coordinator 可能用独立模型（或回退到与主流程不同的模型），
+   *    它的 provider 故障（含 max_tokens 超限这类 400 配置错误）不能拖垮整单、更不能开全局冷却；
+   *    若 provider 真的整体不可用，紧接着的调查调用会再次命中并由主流程开冷却。
    *  - 它的产物只用于 prompt/描述的附加文字，任何返回值都不会改变编排决策。 */
   private async runCoordinator<T>(opts: {
     prompt: string;
@@ -3254,7 +3256,10 @@ export class Worker {
       if (!parsed) return degrade("输出不是严格 JSON 或字段不符合约定");
       return parsed;
     } catch (error) {
-      if (error instanceof AgentCancelledError || error instanceof ProviderUnavailableError) throw error;
+      if (error instanceof AgentCancelledError) throw error;
+      if (error instanceof ProviderUnavailableError) {
+        return degrade(`provider 不可用（${error.kind}，仅影响 coordinator，不开全局冷却）: ${error.message.slice(0, 300)}`);
+      }
       if (error instanceof AgentTimeoutError) return degrade(`超过 ${opts.timeoutS}s 时限`);
       if (error instanceof AgentInvestigationLimitError) return degrade("达到工具预算");
       return degrade(`调用失败: ${(error as Error).message}`);
