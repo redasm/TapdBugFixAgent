@@ -708,6 +708,10 @@ export class Worker {
 
   /** 清空已缓存的 tapd 客户端，让设置页改动的 tapd 凭据/backend 立即生效（下次拉取重建）。 */
   resetTapdClients(): void {
+    // 必须真的关闭旧连接：只丢引用的话，MCP 后端的 stdio 子进程会一直留着，每次重新同步多一个。
+    for (const client of Object.values(this.clients)) {
+      void client.close?.().catch(() => {});
+    }
     this.clients = {};
     this.lastFetch = 0;
     this.lastFetchResult = null;

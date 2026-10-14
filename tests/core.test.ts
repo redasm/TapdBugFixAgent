@@ -60,6 +60,7 @@ import {
   requireExistingPlannedFiles,
 } from "../src/worker.js";
 import { TapdMcpClient } from "../src/tapdMcp.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { reviewerModel } from "../src/review.js";
 import {
   configuredManualKeywords,
@@ -78,15 +79,20 @@ const mcpMockState = vi.hoisted(() => ({
   callResult: { content: [] as Array<Record<string, unknown>> },
   calledTools: [] as string[],
   closed: 0,
+  connects: 0,
+  /** 依次让 callTool 抛出的错误（取完为止），用于模拟超时/断连。 */
+  callErrors: [] as unknown[],
 }));
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
   Client: class {
-    async connect(): Promise<void> {}
+    async connect(): Promise<void> { mcpMockState.connects += 1; }
     async listTools(): Promise<{ tools: unknown[] }> {
       return { tools: mcpMockState.tools };
     }
     async callTool(input: { name: string }): Promise<unknown> {
       mcpMockState.calledTools.push(input.name);
+      const error = mcpMockState.callErrors.shift();
+      if (error) throw error;
       return mcpMockState.callResult;
     }
     async close(): Promise<void> { mcpMockState.closed += 1; }
@@ -5272,6 +5278,64 @@ describe("TapdMcpClient 首次调用可发现工具", () => {
   });
 });
 
+describe("TapdMcpClient 超时/断连后不复用卡死的连接", () => {
+  beforeEach(() => {
+    mcpMockState.tools = [
+      { name: "tapd_get_bugs", description: "查询缺陷列表", inputSchema: { type: "object", properties: { workspace_id: { type: "number" } } } },
+      { name: "tapd_get_image_url", description: "获取图片 URL", inputSchema: { type: "object", properties: { workspace_id: { type: "number" }, image_path: { type: "string" } } } },
+    ];
+    mcpMockState.callResult = { content: [{ type: "text", text: JSON.stringify([{ id: "1001", title: "测试缺陷" }]) }] };
+    mcpMockState.callErrors = [];
+    mcpMockState.closed = 0;
+    mcpMockState.connects = 0;
+  });
+
+  it.each([
+    ["超时", new McpError(ErrorCode.RequestTimeout, "Request timed out")],
+    ["断连", new McpError(ErrorCode.ConnectionClosed, "Connection closed")],
+  ])("普通调用%s：关闭旧连接（结束子进程），下一次调用自动重连", async (_label, error) => {
+    const client = new TapdMcpClient("12345678", { transport: "stdio" });
+    mcpMockState.callErrors = [error];
+    await expect(client.listBugs("me")).rejects.toThrow();
+    expect(mcpMockState.closed).toBe(1);
+
+    const bugs = await client.listBugs("me");
+    expect(bugs.map((bug) => bug.id)).toEqual(["1001"]);
+    expect(mcpMockState.connects).toBe(2);
+  });
+
+  it("媒体等短时限调用超时不掐断连接（并行解析允许个别超时）", async () => {
+    const client = new TapdMcpClient("12345678", { transport: "stdio" });
+    mcpMockState.callErrors = [new McpError(ErrorCode.RequestTimeout, "Request timed out")];
+    const bug = makeBug({ description: '<p>现象</p><img src="/tfl/captures/a.png">' });
+
+    await client.resolveMediaInputs(bug);
+    await client.listBugs("me");
+
+    expect(mcpMockState.closed).toBe(0);
+    expect(mcpMockState.connects).toBe(1);
+  });
+
+  it("工具自身报错（非连接问题）不重连", async () => {
+    const client = new TapdMcpClient("12345678", { transport: "stdio" });
+    mcpMockState.callErrors = [new McpError(ErrorCode.InvalidParams, "bad params")];
+    await expect(client.listBugs("me")).rejects.toThrow(/bad params/);
+    await client.listBugs("me");
+    expect(mcpMockState.closed).toBe(0);
+    expect(mcpMockState.connects).toBe(1);
+  });
+
+  it("重新同步时 resetTapdClients 会关闭旧连接，而不是只丢引用（否则遗留 MCP 子进程）", async () => {
+    const w = makeWorker();
+    w.config.tapd = { backend: "mcp", mcp: { transport: "stdio" } };
+    const client = (w as unknown as { tapd: (ws: unknown) => TapdMcpClient }).tapd(w.config.workspaces[0]);
+    await client.listBugs("me");
+
+    w.resetTapdClients();
+    await vi.waitFor(() => expect(mcpMockState.closed).toBe(1));
+  });
+});
+
 describe("web 前端 bug_id 内插引号", () => {
   const html = fs.readFileSync(
     path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "web", "static", "index.html"),
@@ -5350,8 +5414,16 @@ describe("web 前端 bug_id 内插引号", () => {
   });
 
   it("api() 捕获网络错误并给出可见提示（回归：服务器重启窗口期点击毫无反馈）", () => {
-    expect(html).toMatch(/catch \(e\) \{\s*\n?\s*\/\/ 服务器不可达/);
+    expect(html).toMatch(/catch \(e\) \{[\s\S]{0,600}\/\/ 服务器不可达[\s\S]{0,200}toast\('无法连接服务器/);
     expect(html).toContain("function toast(");
+  });
+
+  it("api() 有超时并明确提示（回归：服务端冻结时「同步中…」永远不结束且无任何报错）", () => {
+    expect(html).toMatch(/async function api\(path, method='GET', body, timeoutMs=API_TIMEOUT_MS\)/);
+    expect(html).toMatch(/setTimeout\(\(\) => ctrl\.abort\(\), timeoutMs\)/);
+    expect(html).toMatch(/if \(ctrl\.signal\.aborted\) \{\s*toast\(`服务器/);
+    // 重新同步要逐个 workspace 真实重拉 Tapd，单独给更长时限
+    expect(html).toMatch(/api\('\/api\/resync', 'POST', \{\}, 600000\)/);
   });
 
   it("401 有补救入口：提示输入 token、记住并带参重载（回归：token 不匹配时 alert 死胡同）", () => {

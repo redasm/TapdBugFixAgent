@@ -25,6 +25,8 @@ export interface TapdBackend {
   updateBug(bugId: string, fields: Record<string, unknown>): Promise<unknown>;
   addComment(bugId: string, content: string): Promise<unknown>;
   resolveMediaInputs?(bug: Bug, options?: { signal?: AbortSignal }): Promise<AgentMediaInput[]>;
+  /** 释放底层连接（MCP 后端会结束 stdio 子进程）；REST 后端无需实现。 */
+  close?(): Promise<void>;
 }
 
 function sleep(ms: number): Promise<void> {

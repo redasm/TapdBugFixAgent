@@ -18,6 +18,7 @@ import { createTapdClient } from "./tapd.js";
 import { TapdMcpClient } from "./tapdMcp.js";
 import type { Bug } from "./models.js";
 import { evaluateFiles, parseRunSpec } from "./evaluationCli.js";
+import { disableConsoleQuickEdit } from "./windowsConsole.js";
 
 interface CliArgs {
   cmd: string;
@@ -162,6 +163,13 @@ async function cmdServe(args: CliArgs): Promise<number> {
     console.log("提示: 未配置 WEB_TOKEN，管理台无鉴权（仅建议本机使用）");
   }
   console.log("默认处于「关闭」状态，请在管理台点击「开启」开始自动处理。Ctrl+C 退出。");
+  // 不等待：结果出来后补一行日志即可，不拖慢启动
+  void disableConsoleQuickEdit().then((result) => {
+    if (result === "disabled") console.log("[启动] 已关闭本控制台的快速编辑模式（避免误点窗口进入「选择」状态而冻结服务）");
+    else if (result === "failed") {
+      console.log("[启动] 未能关闭控制台快速编辑模式：请勿点击本窗口内容；若服务无响应，检查窗口标题是否以「选择」开头并按 Esc");
+    }
+  });
   const server = app.listen(port, host, () => {
     console.log(`listening on ${host}:${port}`);
   });

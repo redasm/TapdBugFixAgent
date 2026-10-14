@@ -15,6 +15,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { bugFromDict } from "./models.js";
 import type { Bug } from "./models.js";
@@ -28,6 +29,9 @@ import {
 const _BUG_HINTS = ["bug", "defect", "缺陷", "bugtrace", "bug_trace"];
 const MCP_CONNECT_TIMEOUT_MS = 20_000;
 const MEDIA_TOOL_TIMEOUT_MS = 15_000;
+const MCP_STDERR_TAIL_CHARS = 4000;
+/** 普通工具调用的时限。只有这一档超时才说明连接/子进程失去响应（媒体等短时限调用超时不算）。 */
+const MCP_CALL_TIMEOUT_MS = 120_000;
 
 // 已确认的官方 mcp-server-tapd / @xihe-lab/tapd-mcp-server 工具名（可被 config 覆盖）
 const _DEFAULT_TOOL_MAP: Record<string, string> = {
@@ -229,6 +233,7 @@ export class TapdMcpClient {
   private client: Client | undefined;
   private tools: Record<string, Tool> = {};
   private connecting: Promise<void> | undefined;
+  private stderrTail = "";
 
   constructor(workspaceId: string, mcpCfg: Record<string, unknown> = {}) {
     this.workspaceId = String(workspaceId);
@@ -290,33 +295,79 @@ export class TapdMcpClient {
 
   private async doConnect(): Promise<void> {
     const transport = this.makeTransport();
+    // stdio 子进程的 stderr 必须持续读走：SDK 把它接进 PassThrough，没人消费时背压会一路
+    // 传回子进程，stderr 管道写满后子进程阻塞，之后每个请求都只能等到超时。只保留尾部用于报错。
+    if (transport instanceof StdioClientTransport) {
+      transport.stderr?.on("data", (chunk: Buffer | string) => {
+        this.stderrTail = (this.stderrTail + String(chunk)).slice(-MCP_STDERR_TAIL_CHARS);
+      });
+    }
     const client = new Client({ name: "tapd-bugfix-agent", version: "0.2.0" });
-    await client.connect(transport, {
-      timeout: MCP_CONNECT_TIMEOUT_MS,
-      maxTotalTimeout: MCP_CONNECT_TIMEOUT_MS,
-    });
-    const result = await client.listTools(undefined, {
-      timeout: MCP_CONNECT_TIMEOUT_MS,
-      maxTotalTimeout: MCP_CONNECT_TIMEOUT_MS,
-    });
-    this.tools = {};
-    for (const t of result.tools ?? []) this.tools[t.name] = t;
+    // 子进程退出 / 连接断开：丢弃缓存的 client，下一次调用重新连接。
+    client.onclose = () => {
+      if (this.client === client) this.client = undefined;
+    };
+    try {
+      await client.connect(transport, {
+        timeout: MCP_CONNECT_TIMEOUT_MS,
+        maxTotalTimeout: MCP_CONNECT_TIMEOUT_MS,
+      });
+      const result = await client.listTools(undefined, {
+        timeout: MCP_CONNECT_TIMEOUT_MS,
+        maxTotalTimeout: MCP_CONNECT_TIMEOUT_MS,
+      });
+      this.tools = {};
+      for (const t of result.tools ?? []) this.tools[t.name] = t;
+    } catch (exc) {
+      // 握手失败时子进程可能已经启动：关掉它，避免每次重连都遗留一个进程。
+      await client.close().catch(() => {});
+      throw this.withStderr(exc);
+    }
     this.client = client;
+  }
+
+  /** 关闭连接并结束 stdio 子进程。之后的调用会重新连接。 */
+  async close(): Promise<void> {
+    const client = this.client;
+    this.client = undefined;
+    await client?.close().catch(() => {});
   }
 
   private async call(
     name: string,
     arguments_: Record<string, unknown>,
-    timeoutMs = 120000,
+    timeoutMs = MCP_CALL_TIMEOUT_MS,
     signal?: AbortSignal,
   ): Promise<{ text: string; data: unknown; isError: boolean }> {
     await this.connect();
-    const result = await this.client!.callTool(
-      { name, arguments: arguments_ },
-      undefined,
-      { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal },
-    );
-    return normalizeToolResult(result);
+    const client = this.client!;
+    try {
+      const result = await client.callTool(
+        { name, arguments: arguments_ },
+        undefined,
+        { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal },
+      );
+      return normalizeToolResult(result);
+    } catch (exc) {
+      // 断连、或普通调用整段超时后不能继续复用这条连接：子进程可能已卡死，复用只会让之后
+      // 每次调用都超时。关掉它（同时结束子进程），下一次调用自动重连。媒体这类短时限调用
+      // 并行且允许个别超时，不能因此掐断同批的其它调用。
+      const lostConnection = exc instanceof McpError && (exc.code === ErrorCode.ConnectionClosed
+        || (exc.code === ErrorCode.RequestTimeout && timeoutMs >= MCP_CALL_TIMEOUT_MS));
+      if (lostConnection) {
+        if (this.client === client) await this.close();
+        throw this.withStderr(exc);
+      }
+      throw exc;
+    }
+  }
+
+  /** 把子进程最近的 stderr 附到错误上，便于定位 MCP 服务端自身的问题。 */
+  private withStderr(exc: unknown): unknown {
+    const tail = this.stderrTail.trim();
+    if (!tail || !(exc instanceof Error)) return exc;
+    exc.message += `（MCP stderr 尾部: ${tail.slice(-500)}）`;
+    return exc;
   }
 
   private toolFor(op: string): string {
